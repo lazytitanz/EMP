@@ -3832,7 +3832,7 @@ document.body.addEventListener("click", (event) => {
 
 document.addEventListener("contextmenu", (event) => {
   const row = event.target.closest(".track-row");
-  const allowed = state.view === "album" || state.view === "playlist" || state.view === "search";
+  const allowed = state.view === "album" || state.view === "artist" || state.view === "playlist" || state.view === "search";
   if (!row || !allowed) {
     return;
   }

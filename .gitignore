@@ -1,0 +1,115 @@
+## EMP
+## Visual Studio, .NET, and local junk that should not be committed.
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# Visual Studio / Rider / VS Code / Cursor
+.vs/
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+.ionide/
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+.artifacts/
+
+# MSBuild and compiler leftovers
+*.ilk
+*.meta
+*.obj
+*.idb
+*.iobj
+*.pch
+*.pdb
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+!Directory.Build.rsp
+*.log
+*.tlog
+*.tmp
+*.tmp_proj
+*.cache
+*.binlog
+
+# NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+project.lock.json
+project.fragment.lock.json
+*.nuget.props
+*.nuget.targets
+
+# Test and coverage
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+coverage*.json
+coverage*.xml
+coverage*.info
+BenchmarkDotNet.Artifacts/
+
+# Publish and installers
+publish/
+*.pubxml
+*.publishproj
+*.[Pp]ublish.xml
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.appxupload
+*.msi
+*.msix
+
+# WebView2 user data created at runtime
+EBWebView/
+*.webview2/
+
+# Extracted album artwork (generated when the library is scanned)
+www/artwork/
+**/www/artwork/
+
+# Local app data copies and designer backups
+UpgradeLog*.XML
+UpgradeLog*.htm
+Backup*/
+_UpgradeReport_Files/
+
+# OS and editor junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*~
+~$*
+
+# Secrets
+*.env
+*.pfx
+*.snk
+*.publishsettings

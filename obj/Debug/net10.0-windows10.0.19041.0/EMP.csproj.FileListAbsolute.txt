@@ -57,3 +57,4 @@ C:\Users\evanl\source\repos\EMP\EMP\obj\Debug\net10.0-windows10.0.19041.0\EMP.pd
 C:\Users\evanl\source\repos\EMP\EMP\obj\Debug\net10.0-windows10.0.19041.0\EMP.genruntimeconfig.cache
 C:\Users\evanl\source\repos\EMP\EMP\obj\Debug\net10.0-windows10.0.19041.0\ref\EMP.dll
 C:\Users\evanl\source\repos\EMP\EMP\bin\Debug\net10.0-windows10.0.19041.0\www\js\eq-presets.js
+C:\Users\evanl\source\repos\EMP\EMP\obj\Debug\net10.0-windows10.0.19041.0\EMP.sourcelink.json
