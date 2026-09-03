@@ -3219,6 +3219,10 @@ function ensureOverflowRoot() {
         <i class="bi bi-pencil"></i>
         <span>Name &amp; details</span>
       </button>
+      <button class="ctx-item ctx-item-danger" type="button" data-playlist-delete>
+        <i class="bi bi-trash3"></i>
+        <span>Delete Playlist</span>
+      </button>
     </div>
   `;
   document.body.appendChild(overflowRoot);
@@ -3232,6 +3236,10 @@ function ensureOverflowRoot() {
       closeOverflowMenu();
       openPlaylistDetailsModal();
     }
+    if (event.target.closest("[data-playlist-delete]")) {
+      closeOverflowMenu();
+      openDeletePlaylistModal();
+    }
   });
   overflowRoot.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -3243,6 +3251,11 @@ function ensureOverflowRoot() {
 function openOverflowMenu(anchor) {
   closeContextMenu();
   const root = ensureOverflowRoot();
+  const deleteBtn = root.querySelector("[data-playlist-delete]");
+  const playlist = playlistById(state.playlistId);
+  if (deleteBtn) {
+    deleteBtn.hidden = !!(playlist && isLikedPlaylist(playlist));
+  }
   root.hidden = false;
   positionOverflowMenu(anchor);
 }
@@ -3317,6 +3330,69 @@ function openPlaylistDetailsModal() {
   if (!name.disabled) {
     name.select();
   }
+}
+
+let deleteModal = null;
+
+function ensureDeleteModal() {
+  if (deleteModal) {
+    return deleteModal;
+  }
+
+  deleteModal = document.createElement("div");
+  deleteModal.className = "details-modal-root";
+  deleteModal.hidden = true;
+  deleteModal.innerHTML = `
+    <div class="details-modal delete-modal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
+      <div class="details-modal-head">
+        <h2 id="deleteModalTitle">Delete Playlist</h2>
+        <button class="details-modal-close" type="button" data-delete-close aria-label="Close">
+          <i class="bi bi-x-lg"></i>
+        </button>
+      </div>
+      <p class="delete-modal-msg">This will delete the current playlist. This action cannot be undone.</p>
+      <div class="delete-modal-foot">
+        <button class="delete-modal-cancel" type="button" data-delete-close>Cancel</button>
+        <button class="delete-modal-confirm" type="button" data-delete-confirm>Delete</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(deleteModal);
+
+  deleteModal.addEventListener("click", (event) => {
+    if (event.target === deleteModal || event.target.closest("[data-delete-close]")) {
+      closeDeleteModal();
+    }
+    if (event.target.closest("[data-delete-confirm]")) {
+      const playlistId = deleteModal.dataset.playlistId;
+      closeDeleteModal();
+      deletePlaylist(playlistId);
+    }
+  });
+
+  return deleteModal;
+}
+
+function openDeletePlaylistModal() {
+  const playlist = playlistById(state.playlistId);
+  if (!playlist || isLikedPlaylist(playlist)) {
+    return;
+  }
+  const root = ensureDeleteModal();
+  root.dataset.playlistId = playlist.id;
+  root.hidden = false;
+}
+
+function closeDeleteModal() {
+  if (deleteModal) {
+    deleteModal.hidden = true;
+  }
+}
+
+function deletePlaylist(playlistId) {
+  state.playlists = state.playlists.filter((p) => p.id !== playlistId);
+  writeSession();
+  navigate({ view: "home" });
 }
 
 function contextPlaylistListHtml() {

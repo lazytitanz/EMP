@@ -2358,6 +2358,62 @@ img.details-cover {
   transform: scale(1.04);
 }
 
+.ctx-item-danger {
+  color: #f15e5e;
+}
+
+.ctx-item-danger:hover {
+  color: #ff7b7b;
+}
+
+.delete-modal {
+  width: min(400px, calc(100vw - 32px));
+}
+
+.delete-modal-msg {
+  margin: 0 0 24px;
+  color: var(--emp-muted);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.delete-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.delete-modal-cancel {
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--emp-text);
+  font-weight: 700;
+  font-size: 0.95rem;
+  padding: 12px 32px;
+  cursor: pointer;
+}
+
+.delete-modal-cancel:hover {
+  transform: scale(1.04);
+}
+
+.delete-modal-confirm {
+  border: 0;
+  border-radius: 999px;
+  background: #e64040;
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.95rem;
+  padding: 12px 32px;
+  cursor: pointer;
+}
+
+.delete-modal-confirm:hover {
+  background: #f15050;
+  transform: scale(1.04);
+}
+
 @media (max-width: 900px) {
   .album-hero-cover,
   img.album-hero-cover {

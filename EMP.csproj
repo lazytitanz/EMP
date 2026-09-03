@@ -9,6 +9,7 @@
     <RootNamespace>EMP</RootNamespace>
     <AssemblyName>EMP</AssemblyName>
     <ApplicationIcon>www\img\music.ico</ApplicationIcon>
+    <GeneratePackageOnBuild>False</GeneratePackageOnBuild>
   </PropertyGroup>
 
   <ItemGroup>
