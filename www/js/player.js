@@ -876,10 +876,115 @@ function formatCollectionDuration(seconds) {
   return `${secs} sec`;
 }
 
+const accentColorCache = new Map();
+
+function extractVibrantColor(imgSrc) {
+  if (accentColorCache.has(imgSrc)) {
+    return Promise.resolve(accentColorCache.get(imgSrc));
+  }
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      const size = 64;
+      canvas.width = size;
+      canvas.height = size;
+      ctx.drawImage(img, 0, 0, size, size);
+      const data = ctx.getImageData(0, 0, size, size).data;
+
+      const pixels = [];
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        const lightness = (max + min) / 2;
+        const saturation = max === 0 ? 0 : (max - min) / max;
+        if (saturation > 0.15 && lightness > 30 && lightness < 220) {
+          pixels.push([r, g, b]);
+        }
+      }
+
+      if (pixels.length === 0) {
+        for (let i = 0; i < data.length; i += 4) {
+          pixels.push([data[i], data[i + 1], data[i + 2]]);
+        }
+      }
+
+      const color = medianCutPalette(pixels, 4)[0];
+      const boost = boostSaturation(color, 1.35);
+      const result = `rgb(${boost[0]}, ${boost[1]}, ${boost[2]})`;
+      accentColorCache.set(imgSrc, result);
+      resolve(result);
+    };
+    img.onerror = () => resolve(null);
+    img.src = imgSrc;
+  });
+}
+
+function medianCutPalette(pixels, depth) {
+  if (depth === 0 || pixels.length <= 1) {
+    const avg = [0, 0, 0];
+    for (const p of pixels) {
+      avg[0] += p[0]; avg[1] += p[1]; avg[2] += p[2];
+    }
+    const n = pixels.length || 1;
+    return [[Math.round(avg[0] / n), Math.round(avg[1] / n), Math.round(avg[2] / n)]];
+  }
+
+  let maxRange = 0, maxChannel = 0;
+  for (let ch = 0; ch < 3; ch++) {
+    let lo = 255, hi = 0;
+    for (const p of pixels) {
+      if (p[ch] < lo) lo = p[ch];
+      if (p[ch] > hi) hi = p[ch];
+    }
+    if (hi - lo > maxRange) {
+      maxRange = hi - lo;
+      maxChannel = ch;
+    }
+  }
+
+  pixels.sort((a, b) => a[maxChannel] - b[maxChannel]);
+  const mid = Math.floor(pixels.length / 2);
+  const left = medianCutPalette(pixels.slice(0, mid), depth - 1);
+  const right = medianCutPalette(pixels.slice(mid), depth - 1);
+  const all = [...left, ...right];
+
+  all.sort((a, b) => {
+    const satA = (Math.max(...a) - Math.min(...a)) / (Math.max(...a) || 1);
+    const satB = (Math.max(...b) - Math.min(...b)) / (Math.max(...b) || 1);
+    return satB - satA;
+  });
+  return all;
+}
+
+function boostSaturation([r, g, b], factor) {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  if (max === 0) return [r, g, b];
+  const mid = (max + min) / 2;
+  return [
+    Math.round(Math.min(255, Math.max(0, mid + (r - mid) * factor))),
+    Math.round(Math.min(255, Math.max(0, mid + (g - mid) * factor))),
+    Math.round(Math.min(255, Math.max(0, mid + (b - mid) * factor))),
+  ];
+}
+
 function setStageAccent(color, depth = 320) {
   mainStage.style.background = color
     ? `linear-gradient(180deg, ${color} 0%, var(--emp-bg) ${depth}px)`
     : "";
+}
+
+async function setStageAccentFromArt(coverUrl, fallbackColor, depth = 320) {
+  if (coverUrl) {
+    const color = await extractVibrantColor(coverUrl);
+    if (color) {
+      setStageAccent(color, depth);
+      return;
+    }
+  }
+  setStageAccent(fallbackColor, depth);
 }
 
 function matchesQuery(text, query) {
@@ -1514,6 +1619,7 @@ function renderAlbum(albumId) {
     .sort((left, right) => (left.trackNumber || 0) - (right.trackNumber || 0) || compareText(left.title, right.title));
   const totalDuration = tracks.reduce((sum, track) => sum + (Number(track.duration) || 0), 0);
   setStageAccent(album.color, 420);
+  setStageAccentFromArt(album.coverUrl, album.color, 420);
 
   viewArea.innerHTML = `
     <div class="album-page">
@@ -1552,10 +1658,12 @@ function renderPlaylist(playlistId) {
   const cover = playlistCoverItem(playlist);
   const totalDuration = tracks.reduce((sum, track) => sum + (Number(track.duration) || 0), 0);
   const album = albumById(tracks[0]?.albumId);
-  setStageAccent(
-    isLikedPlaylist(playlist) ? "#450af5" : (album?.color || cover.color || "#3a1f12"),
-    420
-  );
+  const playlistFallback = isLikedPlaylist(playlist) ? "#450af5" : (album?.color || cover.color || "#3a1f12");
+  setStageAccent(playlistFallback, 420);
+  if (!isLikedPlaylist(playlist)) {
+    const artUrl = cover.coverUrl || album?.coverUrl;
+    setStageAccentFromArt(artUrl, playlistFallback, 420);
+  }
 
   viewArea.innerHTML = `
     <div class="album-page">
@@ -1594,7 +1702,9 @@ function renderArtist(name) {
     return (left.trackNumber || 0) - (right.trackNumber || 0) || compareText(left.title, right.title);
   });
   const accent = albums[0]?.color || tracks[0]?.color || "#3a1f12";
+  const artistArtUrl = albums[0]?.coverUrl || tracks[0]?.coverUrl;
   setStageAccent(accent, 420);
+  setStageAccentFromArt(artistArtUrl, accent, 420);
 
   viewArea.innerHTML = `
     <div class="album-page">
