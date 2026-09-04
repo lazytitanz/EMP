@@ -132,7 +132,7 @@ const HOME_QUICK_SIZE = 6;
 const SIDEBAR_MIN = 200;
 const SIDEBAR_MAX = 420;
 const SIDEBAR_COLLAPSED = 72;
-const HOME_SHELF_SIZE = 8;
+const HOME_SHELF_SIZE = 14;
 const SIDEBAR_RECENTS = 12;
 const MAX_RECENTS = 24;
 const SEARCH_ALBUM_LIMIT = 12;
@@ -878,8 +878,8 @@ function isSidebarPlaylistPlaying(playlistId) {
   return Boolean(state.playing && queueMatchesIds(playlistTracks(playlistById(playlistId)).map((track) => track.id)));
 }
 
-function nowEqMarkup() {
-  return `<span class="now-eq" aria-hidden="true"><span></span><span></span><span></span></span>`;
+function nowEqMarkup(className = "now-eq") {
+  return `<span class="${className}" aria-hidden="true"><span></span><span></span><span></span></span>`;
 }
 
 function sidebarPlayOverlay(attrs, label, playing) {
@@ -1274,6 +1274,7 @@ function render(entry) {
 
   renderLibraryList();
   updateCollectionControls();
+  syncTopBarScroll();
 }
 
 function renderLibraryList() {
@@ -1373,17 +1374,24 @@ function renderLibraryList() {
   }).join("");
 }
 
-function albumCard(album) {
+function albumCard(album, options) {
+  const subtitleMode = options && typeof options === "object" && options.subtitleMode === "artist"
+    ? "artist"
+    : "type";
+  const sub = subtitleMode === "artist"
+    ? `<button class="inline-link" type="button" data-open-artist="${escapeHtml(album.artist)}">${escapeHtml(album.artist)}</button>`
+    : `${album.isSingle ? "Single" : "Album"} • <button class="inline-link" type="button" data-open-artist="${escapeHtml(album.artist)}">${escapeHtml(album.artist)}</button>`;
+  const playing = isSidebarAlbumPlaying(album.id);
   return `
-    <article class="media-card" data-open-album="${album.id}">
+    <article class="media-card${playing ? " is-playing" : ""}" data-open-album="${album.id}">
       <div class="media-cover-wrap">
         ${coverMarkup(album, "media-cover")}
-        <button class="play-fab" type="button" data-play-album="${album.id}" title="Play" aria-label="Play ${escapeHtml(album.title)}">
-          <i class="bi bi-play-fill"></i>
+        <button class="play-fab${playing ? " is-playing" : ""}" type="button" data-play-album="${album.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(album.title)}">
+          <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
         </button>
       </div>
       <div class="media-title">${escapeHtml(album.title)}</div>
-      <div class="media-sub">${album.isSingle ? "Single" : "Album"} • <button class="inline-link" type="button" data-open-artist="${escapeHtml(album.artist)}">${escapeHtml(album.artist)}</button></div>
+      <div class="media-sub">${sub}</div>
     </article>
   `;
 }
@@ -1443,22 +1451,81 @@ function libraryArtistRow(artist) {
 }
 
 function quickCard(album) {
+  const playing = isSidebarAlbumPlaying(album.id);
   return `
-    <div class="quick-card-wrap">
+    <div class="quick-card-wrap${playing ? " is-playing" : ""}">
       <button class="quick-card" type="button" data-open-album="${album.id}">
         <span class="quick-cover-wrap">
           ${coverMarkup(album, "playlist-cover")}
         </span>
+        ${playing ? nowEqMarkup("now-eq quick-eq") : ""}
         <span class="quick-title">${escapeHtml(album.title)}</span>
       </button>
-      <button class="playlist-play quick-play" type="button" tabindex="-1" data-play-album="${album.id}" title="Play" aria-label="Play ${escapeHtml(album.title)}">
-        <i class="bi bi-play-fill"></i>
+      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" tabindex="-1" data-play-album="${album.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(album.title)}">
+        <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
       </button>
     </div>
   `;
 }
 
-function shelfSection(title, items, filter) {
+function quickPlaylistCard(playlist) {
+  const playing = isSidebarPlaylistPlaying(playlist.id);
+  return `
+    <div class="quick-card-wrap${playing ? " is-playing" : ""}">
+      <button class="quick-card" type="button" data-open-playlist="${playlist.id}">
+        <span class="quick-cover-wrap">
+          ${playlistCoverMarkup(playlist, "playlist-cover")}
+        </span>
+        ${playing ? nowEqMarkup("now-eq quick-eq") : ""}
+        <span class="quick-title">${escapeHtml(playlist.name)}</span>
+      </button>
+      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" tabindex="-1" data-play-playlist="${playlist.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(playlist.name)}">
+        <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
+      </button>
+    </div>
+  `;
+}
+
+function homeQuickItems() {
+  const items = [];
+  const seenAlbums = new Set();
+  const liked = likedPlaylist();
+  if (liked) {
+    items.push({ kind: "playlist", playlist: liked });
+  }
+
+  for (const album of recentAlbums(MAX_RECENTS)) {
+    if (items.length >= HOME_QUICK_SIZE) {
+      break;
+    }
+    items.push({ kind: "album", album });
+    seenAlbums.add(album.id);
+  }
+
+  if (items.length < HOME_QUICK_SIZE) {
+    for (const album of albumsByRecency(allAlbums())) {
+      if (items.length >= HOME_QUICK_SIZE) {
+        break;
+      }
+      if (seenAlbums.has(album.id)) {
+        continue;
+      }
+      items.push({ kind: "album", album });
+      seenAlbums.add(album.id);
+    }
+  }
+
+  return items;
+}
+
+function renderQuickCard(item) {
+  if (item.kind === "playlist") {
+    return quickPlaylistCard(item.playlist);
+  }
+  return quickCard(item.album);
+}
+
+function shelfSection(title, items, filter, { subtitleMode = "type" } = {}) {
   if (!items.length) {
     return "";
   }
@@ -1466,11 +1533,15 @@ function shelfSection(title, items, filter) {
   const shown = items.slice(0, HOME_SHELF_SIZE);
   const showAll = items.length > HOME_SHELF_SIZE;
   return `
-    <div class="section-head">
-      <h2>${title}</h2>
-      ${showAll ? `<button class="see-all" type="button" data-nav="albums" data-filter="${filter}">Show all</button>` : ""}
-    </div>
-    <div class="shelf-row">${shown.map(albumCard).join("")}</div>
+    <section class="home-shelf">
+      <div class="section-head">
+        <button class="section-title-btn" type="button" data-nav="albums" data-filter="${filter}">
+          <h2>${title}</h2>
+        </button>
+        ${showAll ? `<button class="see-all" type="button" data-nav="albums" data-filter="${filter}">See all</button>` : ""}
+      </div>
+      <div class="shelf-row">${shown.map((album) => albumCard(album, { subtitleMode })).join("")}</div>
+    </section>
   `;
 }
 
@@ -1482,15 +1553,28 @@ function renderHome() {
   }
 
   const recents = recentAlbums();
-  const quick = recents.slice(0, HOME_QUICK_SIZE);
+  const quick = homeQuickItems();
+  const accentAlbum = quick.find((item) => item.kind === "album")?.album
+    || recents[0]
+    || albums[0]
+    || singles[0]
+    || null;
+  const accentPlaylist = !accentAlbum ? quick.find((item) => item.kind === "playlist")?.playlist : null;
+  const coverUrl = accentAlbum?.coverUrl
+    || (accentPlaylist ? playlistArtworkUrls(accentPlaylist)[0] : null)
+    || null;
+  const fallbackAccent = accentAlbum?.color || "#1e3b2a";
+  setStageAccent(fallbackAccent, 300);
+  setStageAccentFromArt(coverUrl, fallbackAccent, 300);
 
   viewArea.innerHTML = `
-    <h1 class="greeting">${greeting()}</h1>
-    <p class="collection-stat">${albums.length} albums • ${singles.length} singles • ${tracks.length} tracks</p>
-    ${quick.length ? `<div class="quick-grid">${quick.map(quickCard).join("")}</div>` : ""}
-    ${recents.length > HOME_QUICK_SIZE ? shelfSection("Recently played", recents, "all") : ""}
-    ${shelfSection("Albums", albumsByRecency(albums), "albums")}
-    ${shelfSection("Singles", albumsByRecency(singles), "singles")}
+    <div class="home-page">
+      <h1 class="greeting">${greeting()}</h1>
+      ${quick.length ? `<div class="quick-grid">${quick.map(renderQuickCard).join("")}</div>` : ""}
+      ${recents.length > HOME_QUICK_SIZE ? shelfSection("Recently played", recents, "all", { subtitleMode: "type" }) : ""}
+      ${shelfSection("Albums", albumsByRecency(albums), "albums", { subtitleMode: "artist" })}
+      ${shelfSection("Singles", albumsByRecency(singles), "singles", { subtitleMode: "artist" })}
+    </div>
   `;
 }
 
@@ -2076,10 +2160,16 @@ function artistOriginText(info) {
 }
 
 function renderEmpty() {
+  const hasFolders = musicFolders().length > 0;
   viewArea.innerHTML = `
     <div class="empty-state">
       <h2>No music found</h2>
-      <p>EMP looks in your music folders. Add a folder in Settings, or add albums there, then refresh your library.</p>
+      <p>${hasFolders
+        ? "EMP couldn’t find tracks in your music folders. Add albums there, then refresh your library."
+        : "Add a music folder to start building your library."}</p>
+      ${hasFolders
+        ? `<button class="pill-btn empty-cta" type="button" data-nav="settings">Open Settings</button>`
+        : `<button class="pill-btn empty-cta" type="button" data-add-folder>Add music folder</button>`}
     </div>
   `;
 }
@@ -2165,6 +2255,7 @@ function highlightPlaying() {
     name.classList.toggle("playing", row?.dataset.playId === id);
   });
   syncSidebarPlaying();
+  syncHomePlaying();
 }
 
 function syncSidebarPlaying() {
@@ -2191,6 +2282,55 @@ function syncSidebarPlaying() {
 
     row.classList.toggle("is-playing", playing);
     play?.classList.toggle("is-playing", playing);
+  });
+}
+
+function syncHomePlaying() {
+  if (state.view !== "home" || !viewArea) {
+    return;
+  }
+
+  viewArea.querySelectorAll(".quick-card-wrap").forEach((wrap) => {
+    const openAlbum = wrap.querySelector("[data-open-album]");
+    const openPlaylist = wrap.querySelector("[data-open-playlist]");
+    const fab = wrap.querySelector(".quick-play-fab");
+    let playing = false;
+    if (openAlbum) {
+      playing = isSidebarAlbumPlaying(openAlbum.dataset.openAlbum);
+    } else if (openPlaylist) {
+      playing = isSidebarPlaylistPlaying(openPlaylist.dataset.openPlaylist);
+    }
+
+    wrap.classList.toggle("is-playing", playing);
+    if (fab) {
+      fab.classList.toggle("is-playing", playing);
+      fab.innerHTML = playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
+      fab.title = playing ? "Pause" : "Play";
+      const label = wrap.querySelector(".quick-title")?.textContent || "";
+      fab.setAttribute("aria-label", `${playing ? "Pause" : "Play"} ${label}`);
+    }
+
+    let eq = wrap.querySelector(".quick-eq");
+    if (playing && !eq) {
+      const card = wrap.querySelector(".quick-card");
+      const title = card?.querySelector(".quick-title");
+      if (card && title) {
+        title.insertAdjacentHTML("beforebegin", nowEqMarkup("now-eq quick-eq"));
+      }
+    } else if (!playing && eq) {
+      eq.remove();
+    }
+  });
+
+  viewArea.querySelectorAll(".home-shelf .media-card[data-open-album]").forEach((card) => {
+    const playing = isSidebarAlbumPlaying(card.dataset.openAlbum);
+    const fab = card.querySelector(".play-fab");
+    card.classList.toggle("is-playing", playing);
+    if (fab) {
+      fab.classList.toggle("is-playing", playing);
+      fab.innerHTML = playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
+      fab.title = playing ? "Pause" : "Play";
+    }
   });
 }
 
@@ -4163,10 +4303,14 @@ document.body.addEventListener("click", (event) => {
   if (playPlaylistButton) {
     event.preventDefault();
     event.stopPropagation();
-    if (playPlaylistButton.classList.contains("play-fab-lg") && collectionIsCurrent()) {
+    const playlistId = playPlaylistButton.dataset.playPlaylist;
+    const canToggle = playPlaylistButton.classList.contains("play-fab-lg")
+      || playPlaylistButton.classList.contains("play-fab")
+      || playPlaylistButton.classList.contains("quick-play-fab");
+    if (canToggle && queueMatchesIds(playlistTracks(playlistById(playlistId)).map((track) => track.id))) {
       togglePlay();
     } else {
-      playPlaylist(playPlaylistButton.dataset.playPlaylist);
+      playPlaylist(playlistId);
     }
     return;
   }
@@ -4183,10 +4327,14 @@ document.body.addEventListener("click", (event) => {
   if (playAlbumButton) {
     event.preventDefault();
     event.stopPropagation();
-    if (playAlbumButton.classList.contains("play-fab-lg") && collectionIsCurrent()) {
+    const albumId = playAlbumButton.dataset.playAlbum;
+    const canToggle = playAlbumButton.classList.contains("play-fab-lg")
+      || playAlbumButton.classList.contains("play-fab")
+      || playAlbumButton.classList.contains("quick-play-fab");
+    if (canToggle && queueMatchesIds(albumQueueIds(albumById(albumId)))) {
       togglePlay();
     } else {
-      playAlbum(playAlbumButton.dataset.playAlbum);
+      playAlbum(albumId);
     }
     return;
   }
@@ -4194,10 +4342,13 @@ document.body.addEventListener("click", (event) => {
   if (playArtistButton) {
     event.preventDefault();
     event.stopPropagation();
-    if (playArtistButton.classList.contains("play-fab-lg") && collectionIsCurrent()) {
+    const artistName = playArtistButton.dataset.playArtist;
+    const canToggle = playArtistButton.classList.contains("play-fab-lg")
+      || playArtistButton.classList.contains("play-fab");
+    if (canToggle && queueMatchesIds(artistQueueIds(artistName))) {
       togglePlay();
     } else {
-      playArtist(playArtistButton.dataset.playArtist);
+      playArtist(artistName);
     }
     return;
   }
@@ -4281,13 +4432,23 @@ viewArea.addEventListener("scroll", () => {
   closeContextMenu();
   closeOverflowMenu();
   closeEqPresetMenu();
+  syncTopBarScroll();
 });
 window.addEventListener("resize", () => {
   closeContextMenu();
   closeOverflowMenu();
   closeEqPresetMenu();
   updateLibraryChipsScroll();
+  syncTopBarScroll();
 });
+
+function syncTopBarScroll() {
+  const topBar = document.querySelector(".top-bar");
+  if (!topBar) {
+    return;
+  }
+  topBar.classList.toggle("is-scrolled", viewArea.scrollTop > 8);
+}
 
 viewArea.addEventListener("input", (event) => {
   const input = event.target.closest("[data-eq-band-input]");
