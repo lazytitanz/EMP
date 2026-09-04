@@ -529,6 +529,14 @@ function shuffleInPlace(list) {
   return list;
 }
 
+function queueStartId(ids, startId) {
+  return startId && ids.includes(startId) ? startId : ids[0];
+}
+
+function randomQueueId(ids) {
+  return ids[Math.floor(Math.random() * ids.length)];
+}
+
 function rebuildShuffleBag(currentId) {
   const rest = state.queue.filter((id) => id !== currentId);
   shuffleInPlace(rest);
@@ -796,7 +804,7 @@ function removeTrackFromPlaylist(playlistId, trackId) {
   }
 }
 
-function playPlaylist(playlistId) {
+function playPlaylist(playlistId, startId) {
   const playlist = playlistById(playlistId);
   const ids = playlistTracks(playlist).map((track) => track.id);
   if (!ids.length) {
@@ -804,7 +812,7 @@ function playPlaylist(playlistId) {
   }
 
   recordRecentPlaylist(playlistId);
-  playTrack(ids[0], ids);
+  playTrack(queueStartId(ids, startId), ids);
 }
 
 function setRecentsFilter(filter) {
@@ -3393,13 +3401,13 @@ function updateCollectionControls() {
   }
 }
 
-function playCollectionFromView() {
+function playCollectionFromView(startId) {
   if (state.view === "album" && state.albumId) {
-    playAlbum(state.albumId);
+    playAlbum(state.albumId, startId);
   } else if (state.view === "playlist" && state.playlistId) {
-    playPlaylist(state.playlistId);
+    playPlaylist(state.playlistId, startId);
   } else if (state.view === "artist" && state.artist) {
-    playArtist(state.artist);
+    playArtist(state.artist, startId);
   }
 }
 
@@ -3409,26 +3417,31 @@ function toggleCollectionShuffle() {
     return;
   }
 
+  const ids = viewQueueIds();
+  if (!ids.length) {
+    return;
+  }
+
   if (!state.shuffle) {
     setShuffle(true);
   }
-  playCollectionFromView();
+  playCollectionFromView(randomQueueId(ids));
 }
 
-function playAlbum(albumId) {
+function playAlbum(albumId, startId) {
   const ids = albumQueueIds(albumById(albumId));
   if (!ids.length) {
     return;
   }
-  playTrack(ids[0], ids);
+  playTrack(queueStartId(ids, startId), ids);
 }
 
-function playArtist(name) {
+function playArtist(name, startId) {
   const ids = artistQueueIds(name);
   if (!ids.length) {
     return;
   }
-  playTrack(ids[0], ids);
+  playTrack(queueStartId(ids, startId), ids);
 }
 
 function togglePlay() {
