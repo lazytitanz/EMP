@@ -16,6 +16,7 @@
   --sidebar-min: 200px;
   --sidebar-max: 420px;
   --player-height: 90px;
+  --top-bar-height: 56px;
   --gap: 8px;
   --radius: 8px;
 }
@@ -937,6 +938,7 @@ img.album-hero-cover {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  position: relative;
   background: linear-gradient(180deg, #1e3b2a 0%, var(--emp-bg) 280px);
 }
 
@@ -945,16 +947,17 @@ img.album-hero-cover {
   align-items: center;
   gap: 12px;
   padding: 16px 24px 8px;
-  flex-shrink: 0;
-  position: relative;
-  z-index: 4;
-  transition: background 0.18s ease, backdrop-filter 0.18s ease, box-shadow 0.18s ease;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  background: transparent;
+  transition: background 0.18s ease, box-shadow 0.18s ease;
 }
 
 .top-bar.is-scrolled {
-  background: rgba(18, 18, 18, 0.72);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  background: var(--emp-bg);
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
@@ -1243,8 +1246,9 @@ img.album-hero-cover {
 .view-area {
   flex: 1;
   overflow: auto;
+  min-height: 0;
   --view-pad-x: 24px;
-  padding: 8px var(--view-pad-x) 24px;
+  padding: 0 var(--view-pad-x) 24px;
 }
 
 .greeting {
@@ -1254,12 +1258,19 @@ img.album-hero-cover {
   letter-spacing: -0.02em;
 }
 
+.view-area > .greeting {
+  margin-top: 0;
+  padding-top: calc(var(--top-bar-height) + 8px);
+}
+
 .home-page {
+  padding-top: calc(var(--top-bar-height) + 8px);
   padding-bottom: 16px;
 }
 
 .settings-page {
   max-width: 900px;
+  padding-top: var(--top-bar-height);
 }
 
 .settings-page > h1 {
@@ -2047,7 +2058,7 @@ img.album-hero-cover {
   text-transform: uppercase;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   position: sticky;
-  top: 0;
+  top: var(--top-bar-height);
   z-index: 2;
   background: var(--emp-bg);
 }
@@ -2431,7 +2442,7 @@ input[type="range"].slider:hover::-webkit-slider-thumb {
 .loading-state,
 .empty-state {
   color: var(--emp-muted);
-  padding: 48px 8px;
+  padding: calc(var(--top-bar-height) + 48px) 8px 48px;
 }
 
 .empty-state h2 {
@@ -2450,7 +2461,7 @@ input[type="range"].slider:hover::-webkit-slider-thumb {
 }
 
 .album-page {
-  padding-top: 16px;
+  padding-top: calc(var(--top-bar-height) + 16px);
 }
 
 .track-panel {
@@ -2467,11 +2478,11 @@ input[type="range"].slider:hover::-webkit-slider-thumb {
 .track-panel .track-table-head::before {
   content: "";
   position: absolute;
-  top: 0;
+  top: -1px;
   bottom: 0;
   left: calc(-1 * var(--view-pad-x, 24px));
   right: calc(-1 * var(--view-pad-x, 24px));
-  background: inherit;
+  background: var(--emp-bg);
   z-index: -1;
   pointer-events: none;
 }

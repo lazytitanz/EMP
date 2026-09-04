@@ -4447,6 +4447,7 @@ function syncTopBarScroll() {
   if (!topBar) {
     return;
   }
+  document.documentElement.style.setProperty("--top-bar-height", `${topBar.offsetHeight}px`);
   topBar.classList.toggle("is-scrolled", viewArea.scrollTop > 8);
 }
 
@@ -4870,6 +4871,7 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach((element) => {
 applySidebarLayout();
 syncSidebarSortUi();
 updateLibraryChipsScroll();
+syncTopBarScroll();
 
 window.addEventListener("emp-library", (event) => bindLibrary(event.detail));
 window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.detail));
