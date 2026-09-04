@@ -82,6 +82,10 @@ const state = {
   albumFilter: "all",
   librarySort: "recent",
   libraryLayout: "grid",
+  sidebarSort: "recent",
+  sidebarWidth: 300,
+  sidebarCollapsed: false,
+  libraryQuery: "",
   holdEnded: false,
   crossfade: false,
   gapless: false,
@@ -98,6 +102,13 @@ let historyIndex = 0;
 
 const viewArea = document.getElementById("viewArea");
 const libraryList = document.getElementById("libraryList");
+const sidebar = document.getElementById("sidebar");
+const librarySearch = document.getElementById("librarySearch");
+const sidebarSortBtn = document.getElementById("sidebarSortBtn");
+const sidebarSortLabel = document.getElementById("sidebarSortLabel");
+const sidebarCollapseBtn = document.getElementById("sidebarCollapseBtn");
+const sidebarResize = document.getElementById("sidebarResize");
+const createPlaylistBtn = document.getElementById("createPlaylistBtn");
 const topSearch = document.getElementById("topSearch");
 const searchInput = document.getElementById("searchInput");
 const mainStage = document.getElementById("mainStage");
@@ -118,6 +129,9 @@ const SESSION_KEY = "emp.playback";
 const LIKED_PLAYLIST_ID = "pl_liked";
 const LIKED_PLAYLIST_NAME = "Liked Songs";
 const HOME_QUICK_SIZE = 6;
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 420;
+const SIDEBAR_COLLAPSED = 72;
 const HOME_SHELF_SIZE = 8;
 const SIDEBAR_RECENTS = 12;
 const MAX_RECENTS = 24;
@@ -162,8 +176,17 @@ function normalizeSort(value) {
   return "recent";
 }
 
+function normalizeSidebarSort(value) {
+  return value === "title" ? "title" : "recent";
+}
+
 function normalizeLayout(value) {
   return value === "list" ? "list" : "grid";
+}
+
+function normalizeSidebarWidth(value) {
+  const width = Math.round(Number(value) || 300);
+  return Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, width));
 }
 
 function normalizeStartupOnLogin(value) {
@@ -235,6 +258,9 @@ function writeSession() {
     repeat: state.repeat,
     librarySort: state.librarySort,
     libraryLayout: state.libraryLayout,
+    sidebarSort: state.sidebarSort,
+    sidebarWidth: state.sidebarWidth,
+    sidebarCollapsed: state.sidebarCollapsed,
     recentAlbumIds: state.recentAlbumIds,
     recentTrackIds: state.recentTrackIds,
     recentPlaylistIds: state.recentPlaylistIds,
@@ -298,6 +324,9 @@ function restoreEqualizerState(session) {
   state.repeat = normalizeRepeat(session.repeat);
   state.librarySort = normalizeSort(session.librarySort);
   state.libraryLayout = normalizeLayout(session.libraryLayout);
+  state.sidebarSort = normalizeSidebarSort(session.sidebarSort);
+  state.sidebarWidth = normalizeSidebarWidth(session.sidebarWidth);
+  state.sidebarCollapsed = Boolean(session.sidebarCollapsed);
   if (Array.isArray(session.recentAlbumIds)) {
     state.recentAlbumIds = session.recentAlbumIds.filter((id) => typeof id === "string");
   }
@@ -789,6 +818,178 @@ function syncRecentsChips() {
   document.querySelectorAll("[data-recents-filter]").forEach((chip) => {
     chip.classList.toggle("active", chip.dataset.recentsFilter === state.recentsFilter);
   });
+  updateLibraryChipsScroll();
+}
+
+function isLibraryView(view = state.view) {
+  return view === "albums" || view === "album" || view === "artist" || view === "tracks" || view === "playlist";
+}
+
+function syncNavIcons(entry) {
+  const homeIcon = document.querySelector('.nav-stack [data-nav="home"] i');
+  if (homeIcon) {
+    homeIcon.className = entry.view === "home" ? "bi bi-house-fill" : "bi bi-house";
+  }
+
+  const settingsIcon = document.querySelector('.nav-stack [data-nav="settings"] i');
+  if (settingsIcon) {
+    settingsIcon.className = entry.view === "settings" ? "bi bi-gear-fill" : "bi bi-gear";
+  }
+
+  const libraryIcon = document.querySelector(".library-title-btn i");
+  if (libraryIcon) {
+    libraryIcon.className = isLibraryView(entry.view) ? "bi bi-collection-play-fill" : "bi bi-collection-play";
+  }
+}
+
+function libraryQueryNeedle() {
+  return String(state.libraryQuery || "").trim().toLowerCase();
+}
+
+function matchesLibraryQuery(...parts) {
+  const needle = libraryQueryNeedle();
+  if (!needle) {
+    return true;
+  }
+  return parts.some((part) => String(part || "").toLowerCase().includes(needle));
+}
+
+function sortSidebarItems(items, getTitle) {
+  const list = [...items];
+  if (state.sidebarSort === "title") {
+    return list.sort((left, right) => compareText(getTitle(left), getTitle(right)));
+  }
+  return list;
+}
+
+function queueMatchesIds(ids) {
+  return sameCollection(state.queue, ids) && Boolean(currentTrack());
+}
+
+function isSidebarTrackPlaying(trackId) {
+  return Boolean(state.playing && currentTrack()?.id === trackId);
+}
+
+function isSidebarAlbumPlaying(albumId) {
+  return Boolean(state.playing && queueMatchesIds(albumQueueIds(albumById(albumId))));
+}
+
+function isSidebarPlaylistPlaying(playlistId) {
+  return Boolean(state.playing && queueMatchesIds(playlistTracks(playlistById(playlistId)).map((track) => track.id)));
+}
+
+function nowEqMarkup() {
+  return `<span class="now-eq" aria-hidden="true"><span></span><span></span><span></span></span>`;
+}
+
+function sidebarPlayOverlay(attrs, label, playing) {
+  return `
+    <button class="playlist-play${playing ? " is-playing" : ""}" type="button" tabindex="-1" ${attrs} title="Play" aria-label="Play ${escapeHtml(label)}">
+      <i class="bi bi-play-fill"></i>
+      ${nowEqMarkup()}
+    </button>
+  `;
+}
+
+function syncSidebarSortUi() {
+  if (sidebarSortLabel) {
+    sidebarSortLabel.textContent = state.sidebarSort === "title" ? "A–Z" : "Recents";
+  }
+  if (sidebarSortBtn) {
+    const icon = sidebarSortBtn.querySelector("i");
+    if (icon) {
+      icon.className = state.sidebarSort === "title" ? "bi bi-sort-alpha-down" : "bi bi-clock-history";
+    }
+    sidebarSortBtn.setAttribute("aria-label", state.sidebarSort === "title" ? "Sorted A to Z" : "Sorted by recents");
+  }
+}
+
+function applySidebarLayout() {
+  if (!sidebar) {
+    return;
+  }
+
+  const width = state.sidebarCollapsed ? SIDEBAR_COLLAPSED : state.sidebarWidth;
+  document.documentElement.style.setProperty("--sidebar-width", `${width}px`);
+  sidebar.classList.toggle("is-collapsed", state.sidebarCollapsed);
+  sidebar.classList.toggle("is-resizing", false);
+
+  if (sidebarCollapseBtn) {
+    const icon = sidebarCollapseBtn.querySelector("i");
+    const label = state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar";
+    if (icon) {
+      icon.className = state.sidebarCollapsed ? "bi bi-arrows-angle-expand" : "bi bi-arrows-angle-contract";
+    }
+    sidebarCollapseBtn.setAttribute("aria-label", label);
+    const tip = bootstrap.Tooltip.getInstance(sidebarCollapseBtn);
+    tip?.setContent({ ".tooltip-inner": label });
+    sidebarCollapseBtn.setAttribute("data-bs-title", label);
+  }
+}
+
+function updateLibraryChipsScroll() {
+  const scroller = document.querySelector("[data-chips-scroll]");
+  const row = scroller?.querySelector(".library-chips");
+  if (!scroller || !row) {
+    return;
+  }
+
+  const max = row.scrollWidth - row.clientWidth;
+  scroller.classList.toggle("can-scroll-left", row.scrollLeft > 2);
+  scroller.classList.toggle("can-scroll-right", max - row.scrollLeft > 2);
+}
+
+function setSidebarCollapsed(collapsed) {
+  state.sidebarCollapsed = Boolean(collapsed);
+  applySidebarLayout();
+  writeSession();
+  updateLibraryChipsScroll();
+}
+
+function toggleSidebarCollapsed() {
+  setSidebarCollapsed(!state.sidebarCollapsed);
+}
+
+function cycleSidebarSort() {
+  state.sidebarSort = state.sidebarSort === "title" ? "recent" : "title";
+  syncSidebarSortUi();
+  writeSession();
+  renderLibraryList();
+}
+
+function createPlaylistFromSidebar() {
+  const playlist = createPlaylist();
+  state.recentsFilter = "playlists";
+  syncRecentsChips();
+  writeSession();
+  navigate({ view: "playlist", playlistId: playlist.id });
+}
+
+function sidebarPlaylists() {
+  const liked = likedPlaylist();
+  const rank = new Map(state.recentPlaylistIds.map((id, index) => [id, index]));
+  const others = state.playlists
+    .filter((playlist) => !isLikedPlaylist(playlist))
+    .filter((playlist) => matchesLibraryQuery(playlist.name));
+
+  let ordered;
+  if (state.sidebarSort === "title") {
+    ordered = others.sort((left, right) => compareText(left.name, right.name));
+  } else {
+    ordered = others.sort((left, right) => {
+      const leftRank = rank.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+      const rightRank = rank.get(right.id) ?? Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank;
+      }
+      return compareText(left.name, right.name);
+    });
+  }
+
+  if (liked && matchesLibraryQuery(liked.name)) {
+    return [liked, ...ordered];
+  }
+  return ordered;
 }
 
 function libraryFilterChips() {
@@ -1031,14 +1232,16 @@ function render(entry) {
     state.albumFilter = entry.filter ?? "all";
   }
 
-  const libraryViews = entry.view === "albums" || entry.view === "album" || entry.view === "artist" || entry.view === "tracks";
+  const libraryViews = isLibraryView(entry.view);
   document.querySelectorAll("[data-nav]").forEach((item) => {
     const nav = item.dataset.nav;
     const active = nav === entry.view
       || (libraryViews && nav === "albums" && !item.classList.contains("chip"));
     item.classList.toggle("active", active);
   });
+  syncNavIcons(entry);
   syncRecentsChips();
+  syncSidebarSortUi();
 
   topSearch.classList.toggle("d-none", entry.view !== "search");
   if (entry.view === "search") {
@@ -1074,47 +1277,56 @@ function render(entry) {
 }
 
 function renderLibraryList() {
+  if (!libraryList) {
+    return;
+  }
+
   if (state.recentsFilter === "tracks") {
-    const recents = recentTracks(SIDEBAR_RECENTS);
+    let recents = recentTracks(SIDEBAR_RECENTS)
+      .filter((track) => matchesLibraryQuery(track.title, track.artist, track.album));
+    recents = sortSidebarItems(recents, (track) => track.title);
     if (!recents.length) {
-      libraryList.innerHTML = `<li class="playlist-sub px-3 py-2">Play something to see recents</li>`;
+      libraryList.innerHTML = `<li class="playlist-sub px-3 py-2">${libraryQueryNeedle() ? "No matching tracks" : "Play something to see recents"}</li>`;
       return;
     }
 
     const currentId = currentTrack()?.id;
-    libraryList.innerHTML = recents.map((track) => `
+    libraryList.innerHTML = recents.map((track) => {
+      const playing = isSidebarTrackPlaying(track.id);
+      return `
       <li>
-        <div class="playlist-row">
+        <div class="playlist-row${playing ? " is-playing" : ""}">
           <button class="playlist-item${currentId === track.id ? " active" : ""}" type="button" data-play-id="${track.id}">
             <span class="playlist-cover-wrap">
               ${coverMarkup(track, "playlist-cover")}
             </span>
             <span class="playlist-meta">
               <span class="playlist-title">${escapeHtml(track.title)}</span>
-              <span class="playlist-sub">Track • ${escapeHtml(track.artist)}</span>
+              <span class="playlist-sub">Song • ${escapeHtml(track.artist)}</span>
             </span>
           </button>
-          <button class="playlist-play" type="button" tabindex="-1" data-play-id="${track.id}" title="Play" aria-label="Play ${escapeHtml(track.title)}">
-            <i class="bi bi-play-fill"></i>
-          </button>
+          ${sidebarPlayOverlay(`data-play-id="${track.id}"`, track.title, playing)}
         </div>
       </li>
-    `).join("");
+    `;
+    }).join("");
     return;
   }
 
   if (state.recentsFilter === "playlists") {
-    const recents = recentPlaylists(SIDEBAR_RECENTS);
+    const recents = sidebarPlaylists();
     if (!recents.length) {
-      libraryList.innerHTML = `<li class="playlist-sub px-3 py-2">Add a track to a playlist to see recents</li>`;
+      libraryList.innerHTML = `<li class="playlist-sub px-3 py-2">${libraryQueryNeedle() ? "No matching playlists" : "Create a playlist to see it here"}</li>`;
       return;
     }
 
     libraryList.innerHTML = recents.map((playlist) => {
       const tracks = playlistTracks(playlist);
+      const playing = isSidebarPlaylistPlaying(playlist.id);
+      const pinned = isLikedPlaylist(playlist);
       return `
         <li>
-          <div class="playlist-row">
+          <div class="playlist-row${playing ? " is-playing" : ""}${pinned ? " is-pinned" : ""}">
             <button class="playlist-item${state.view === "playlist" && state.playlistId === playlist.id ? " active" : ""}" type="button" data-open-playlist="${playlist.id}">
               <span class="playlist-cover-wrap">
                 ${playlistCoverMarkup(playlist, "playlist-cover")}
@@ -1124,9 +1336,7 @@ function renderLibraryList() {
                 <span class="playlist-sub">Playlist • ${songLabel(tracks.length)}</span>
               </span>
             </button>
-            <button class="playlist-play" type="button" tabindex="-1" data-play-playlist="${playlist.id}" title="Play" aria-label="Play ${escapeHtml(playlist.name)}">
-              <i class="bi bi-play-fill"></i>
-            </button>
+            ${sidebarPlayOverlay(`data-play-playlist="${playlist.id}"`, playlist.name, playing)}
           </div>
         </li>
       `;
@@ -1134,15 +1344,19 @@ function renderLibraryList() {
     return;
   }
 
-  const recents = recentAlbums(SIDEBAR_RECENTS);
+  let recents = recentAlbums(SIDEBAR_RECENTS)
+    .filter((album) => matchesLibraryQuery(album.title, album.artist));
+  recents = sortSidebarItems(recents, (album) => album.title);
   if (!recents.length) {
-    libraryList.innerHTML = `<li class="playlist-sub px-3 py-2">Play something to see recents</li>`;
+    libraryList.innerHTML = `<li class="playlist-sub px-3 py-2">${libraryQueryNeedle() ? "No matching albums" : "Play something to see recents"}</li>`;
     return;
   }
 
-  libraryList.innerHTML = recents.map((album) => `
+  libraryList.innerHTML = recents.map((album) => {
+    const playing = isSidebarAlbumPlaying(album.id);
+    return `
     <li>
-      <div class="playlist-row">
+      <div class="playlist-row${playing ? " is-playing" : ""}">
         <button class="playlist-item${state.view === "album" && state.albumId === album.id ? " active" : ""}" type="button" data-open-album="${album.id}">
           <span class="playlist-cover-wrap">
             ${coverMarkup(album, "playlist-cover")}
@@ -1152,12 +1366,11 @@ function renderLibraryList() {
             <span class="playlist-sub">${album.isSingle ? "Single" : "Album"} • ${escapeHtml(album.artist)}</span>
           </span>
         </button>
-        <button class="playlist-play" type="button" tabindex="-1" data-play-album="${album.id}" title="Play" aria-label="Play ${escapeHtml(album.title)}">
-          <i class="bi bi-play-fill"></i>
-        </button>
+        ${sidebarPlayOverlay(`data-play-album="${album.id}"`, album.title, playing)}
       </div>
     </li>
-  `).join("");
+  `;
+  }).join("");
 }
 
 function albumCard(album) {
@@ -1950,6 +2163,34 @@ function highlightPlaying() {
   document.querySelectorAll(".track-name").forEach((name) => {
     const row = name.closest(".track-row");
     name.classList.toggle("playing", row?.dataset.playId === id);
+  });
+  syncSidebarPlaying();
+}
+
+function syncSidebarPlaying() {
+  if (!libraryList) {
+    return;
+  }
+
+  libraryList.querySelectorAll(".playlist-row").forEach((row) => {
+    const item = row.querySelector(".playlist-item");
+    const play = row.querySelector(".playlist-play");
+    if (!item) {
+      return;
+    }
+
+    let playing = false;
+    if (item.dataset.playId) {
+      playing = isSidebarTrackPlaying(item.dataset.playId);
+      item.classList.toggle("active", currentTrack()?.id === item.dataset.playId);
+    } else if (item.dataset.openAlbum) {
+      playing = isSidebarAlbumPlaying(item.dataset.openAlbum);
+    } else if (item.dataset.openPlaylist) {
+      playing = isSidebarPlaylistPlaying(item.dataset.openPlaylist);
+    }
+
+    row.classList.toggle("is-playing", playing);
+    play?.classList.toggle("is-playing", playing);
   });
 }
 
@@ -4008,6 +4249,9 @@ document.body.addEventListener("click", (event) => {
   }
 
   if (navButton) {
+    if (navButton.classList.contains("library-title-btn") && state.sidebarCollapsed) {
+      setSidebarCollapsed(false);
+    }
     const entry = { view: navButton.dataset.nav };
     if (navButton.dataset.filter) {
       entry.filter = navButton.dataset.filter;
@@ -4042,6 +4286,7 @@ window.addEventListener("resize", () => {
   closeContextMenu();
   closeOverflowMenu();
   closeEqPresetMenu();
+  updateLibraryChipsScroll();
 });
 
 viewArea.addEventListener("input", (event) => {
@@ -4118,6 +4363,92 @@ document.getElementById("forwardBtn").addEventListener("click", () => {
 document.getElementById("refreshBtn").addEventListener("click", () => {
   window.chrome?.webview?.postMessage({ type: "refresh" });
 });
+
+createPlaylistBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  createPlaylistFromSidebar();
+});
+
+sidebarCollapseBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  toggleSidebarCollapsed();
+});
+
+sidebarSortBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  cycleSidebarSort();
+});
+
+librarySearch?.addEventListener("input", () => {
+  state.libraryQuery = librarySearch.value;
+  renderLibraryList();
+});
+
+document.querySelector("[data-chips-scroll] .library-chips")?.addEventListener("scroll", updateLibraryChipsScroll, { passive: true });
+
+(function bindSidebarResize() {
+  if (!sidebarResize || !sidebar) {
+    return;
+  }
+
+  let dragging = false;
+  let startX = 0;
+  let startWidth = state.sidebarWidth;
+
+  const onMove = (event) => {
+    if (!dragging) {
+      return;
+    }
+    const delta = event.clientX - startX;
+    state.sidebarWidth = normalizeSidebarWidth(startWidth + delta);
+    document.documentElement.style.setProperty("--sidebar-width", `${state.sidebarWidth}px`);
+  };
+
+  const onUp = () => {
+    if (!dragging) {
+      return;
+    }
+    dragging = false;
+    sidebar.classList.remove("is-resizing");
+    document.body.style.cursor = "";
+    writeSession();
+    updateLibraryChipsScroll();
+  };
+
+  sidebarResize.addEventListener("pointerdown", (event) => {
+    if (state.sidebarCollapsed || event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    dragging = true;
+    startX = event.clientX;
+    startWidth = state.sidebarWidth;
+    sidebar.classList.add("is-resizing");
+    document.body.style.cursor = "col-resize";
+    sidebarResize.setPointerCapture?.(event.pointerId);
+  });
+
+  sidebarResize.addEventListener("pointermove", onMove);
+  sidebarResize.addEventListener("pointerup", onUp);
+  sidebarResize.addEventListener("pointercancel", onUp);
+
+  sidebarResize.addEventListener("keydown", (event) => {
+    if (state.sidebarCollapsed) {
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      state.sidebarWidth = normalizeSidebarWidth(state.sidebarWidth - 16);
+      applySidebarLayout();
+      writeSession();
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      state.sidebarWidth = normalizeSidebarWidth(state.sidebarWidth + 16);
+      applySidebarLayout();
+      writeSession();
+    }
+  });
+})();
 
 searchInput.addEventListener("input", () => {
   state.query = searchInput.value;
@@ -4374,6 +4705,10 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach((element) => {
   element.addEventListener("mouseleave", hideTooltip);
   element.addEventListener("blur", hideTooltip);
 });
+
+applySidebarLayout();
+syncSidebarSortUi();
+updateLibraryChipsScroll();
 
 window.addEventListener("emp-library", (event) => bindLibrary(event.detail));
 window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.detail));

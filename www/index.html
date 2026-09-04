@@ -6,11 +6,11 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=31">
+  <link rel="stylesheet" href="css/player.css?v=33">
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><img src="img/music.png" alt=""></span>
         <span class="brand-name">EMP</span>
@@ -18,38 +18,63 @@
 
       <nav class="nav-stack" aria-label="Primary">
         <button class="nav-item active" type="button" data-nav="home">
-          <i class="bi bi-house-door-fill"></i>
-          <span>Home</span>
+          <i class="bi bi-house-fill"></i>
+          <span class="nav-label">Home</span>
         </button>
-        <div class="nav-row">
-          <button class="nav-item" type="button" data-nav="albums">
-            <i class="bi bi-collection-play"></i>
-            <span>Your Library</span>
-          </button>
-          <button class="icon-btn" type="button" id="refreshBtn" aria-label="Refresh library" data-bs-toggle="tooltip" data-bs-title="Refresh library">
-            <i class="bi bi-arrow-clockwise"></i>
-          </button>
-        </div>
         <button class="nav-item" type="button" data-nav="search">
           <i class="bi bi-search"></i>
-          <span>Search</span>
+          <span class="nav-label">Search</span>
         </button>
         <button class="nav-item" type="button" data-nav="settings">
-          <i class="bi bi-gear-fill"></i>
-          <span>Settings</span>
+          <i class="bi bi-gear"></i>
+          <span class="nav-label">Settings</span>
         </button>
       </nav>
 
       <div class="library-panel">
-        <div class="library-chips">
-          <button class="chip active" type="button" data-recents-filter="albums">Albums</button>
-          <button class="chip" type="button" data-recents-filter="tracks">Tracks</button>
-          <button class="chip" type="button" data-recents-filter="playlists">Playlists</button>
+        <div class="library-header">
+          <button class="library-title-btn" type="button" data-nav="albums" id="libraryTitleBtn" aria-label="Your Library">
+            <i class="bi bi-collection-play"></i>
+            <span class="nav-label">Your Library</span>
+          </button>
+          <div class="library-header-actions">
+            <button class="icon-btn" type="button" id="createPlaylistBtn" aria-label="Create playlist" data-bs-toggle="tooltip" data-bs-title="Create playlist">
+              <i class="bi bi-plus-lg"></i>
+            </button>
+            <button class="icon-btn" type="button" id="refreshBtn" aria-label="Refresh library" data-bs-toggle="tooltip" data-bs-title="Refresh library">
+              <i class="bi bi-arrow-clockwise"></i>
+            </button>
+            <button class="icon-btn" type="button" id="sidebarCollapseBtn" aria-label="Collapse sidebar" data-bs-toggle="tooltip" data-bs-title="Collapse sidebar">
+              <i class="bi bi-arrows-angle-contract"></i>
+            </button>
+          </div>
         </div>
 
-        <div class="library-subhead">Recents</div>
-        <ul class="playlist-list" id="libraryList"></ul>
+        <div class="library-panel-body">
+          <div class="library-chips-scroll" data-chips-scroll>
+            <div class="library-chips">
+              <button class="chip active" type="button" data-recents-filter="albums">Albums</button>
+              <button class="chip" type="button" data-recents-filter="tracks">Tracks</button>
+              <button class="chip" type="button" data-recents-filter="playlists">Playlists</button>
+            </div>
+          </div>
+
+          <div class="library-tools">
+            <label class="library-search">
+              <i class="bi bi-search" aria-hidden="true"></i>
+              <input type="search" id="librarySearch" placeholder="Search in Your Library" aria-label="Search in Your Library" autocomplete="off">
+            </label>
+            <button class="library-sort-btn" type="button" id="sidebarSortBtn" data-sidebar-sort aria-label="Sort library list">
+              <i class="bi bi-clock-history"></i>
+              <span id="sidebarSortLabel">Recents</span>
+            </button>
+          </div>
+
+          <ul class="playlist-list" id="libraryList"></ul>
+        </div>
       </div>
+
+      <div class="sidebar-resize" id="sidebarResize" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
     </aside>
 
     <main class="main-stage" id="mainStage">
@@ -124,6 +149,6 @@
 
   <script src="lib/bootstrap/5.3.8/bootstrap.bundle.min.js"></script>
   <script src="js/eq-presets.js?v=2"></script>
-  <script src="js/player.js?v=26"></script>
+  <script src="js/player.js?v=27"></script>
 </body>
 </html>
