@@ -1675,10 +1675,47 @@ function boostSaturation([r, g, b], factor) {
   ];
 }
 
+function parseColor(color) {
+  if (typeof color !== "string") {
+    return null;
+  }
+
+  const hex = color.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (hex) {
+    const value = hex[1].length === 3
+      ? hex[1].split("").map((part) => part + part).join("")
+      : hex[1];
+    return [
+      Number.parseInt(value.slice(0, 2), 16),
+      Number.parseInt(value.slice(2, 4), 16),
+      Number.parseInt(value.slice(4, 6), 16)
+    ];
+  }
+
+  const rgb = color.match(/rgba?\(([^)]+)\)/i);
+  if (!rgb) {
+    return null;
+  }
+
+  const parts = rgb[1].split(",").slice(0, 3).map((part) => Number.parseFloat(part));
+  return parts.length === 3 && parts.every(Number.isFinite) ? parts : null;
+}
+
+function darkenColor(color, factor) {
+  const rgb = parseColor(color);
+  if (!rgb) {
+    return null;
+  }
+
+  const [r, g, b] = rgb.map((channel) => Math.round(Math.min(255, Math.max(0, channel * factor))));
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
 function setStageAccent(color, depth = 320) {
   mainStage.style.background = color
     ? `linear-gradient(180deg, ${color} 0%, var(--emp-bg) ${depth}px)`
     : "";
+  mainStage.style.setProperty("--stage-accent-bar", (color && darkenColor(color, 0.55)) || "");
 }
 
 async function setStageAccentFromArt(coverUrl, fallbackColor, depth = 320) {
@@ -1777,6 +1814,7 @@ function render(entry) {
   }
 
   renderLibraryList();
+  mountTopCollection();
   updateCollectionControls();
   syncTopBarScroll();
 }
@@ -3955,14 +3993,25 @@ function collectionActionsMarkup(label, playAttrs, { more = false } = {}) {
 
 function updateCollectionControls() {
   const play = viewArea.querySelector(".play-fab-lg");
-  if (!play) {
+  const topPlay = document.getElementById("topCollectionPlay");
+  if (!play && !topPlay) {
     return;
   }
 
   const current = collectionIsCurrent();
   const playing = current && state.playing;
-  play.innerHTML = playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
-  play.setAttribute("aria-label", playing ? "Pause" : "Play");
+  const icon = playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
+  const label = playing ? "Pause" : "Play";
+
+  if (play) {
+    play.innerHTML = icon;
+    play.setAttribute("aria-label", label);
+  }
+
+  if (topPlay) {
+    topPlay.innerHTML = icon;
+    topPlay.setAttribute("aria-label", label);
+  }
 
   const shuffle = viewArea.querySelector("[data-collection-shuffle]");
   if (shuffle) {
@@ -5067,6 +5116,67 @@ function syncTopBarScroll() {
   }
   document.documentElement.style.setProperty("--top-bar-height", `${topBar.offsetHeight}px`);
   topBar.classList.toggle("is-scrolled", viewArea.scrollTop > 8);
+
+  const barBottom = topBar.getBoundingClientRect().bottom;
+  syncStuckTableHead(barBottom);
+  syncTopCollection(barBottom);
+}
+
+function syncStuckTableHead(barBottom) {
+  const head = viewArea.querySelector(".track-panel .track-table-head");
+  if (!head) {
+    return;
+  }
+  head.classList.toggle("is-stuck", head.getBoundingClientRect().top <= barBottom + 1);
+}
+
+function syncTopCollection(barBottom) {
+  const chrome = document.getElementById("topCollection");
+  if (!chrome || chrome.hidden) {
+    return;
+  }
+
+  const title = viewArea.querySelector(".album-hero h1");
+  const show = Boolean(title) && title.getBoundingClientRect().bottom <= barBottom;
+  chrome.classList.toggle("is-visible", show);
+  chrome.setAttribute("aria-hidden", show ? "false" : "true");
+}
+
+function collectionHeader() {
+  if (state.view === "album") {
+    const album = albumById(state.albumId);
+    return album ? { name: album.title, attribute: "data-play-album", value: album.id } : null;
+  }
+  if (state.view === "playlist") {
+    const playlist = playlistById(state.playlistId);
+    return playlist ? { name: playlist.name, attribute: "data-play-playlist", value: playlist.id } : null;
+  }
+  if (state.view === "artist" && state.artist) {
+    return { name: state.artist, attribute: "data-play-artist", value: state.artist };
+  }
+  return null;
+}
+
+function mountTopCollection() {
+  const chrome = document.getElementById("topCollection");
+  const play = document.getElementById("topCollectionPlay");
+  const name = document.getElementById("topCollectionName");
+  if (!chrome || !play || !name) {
+    return;
+  }
+
+  chrome.classList.remove("is-visible");
+  chrome.setAttribute("aria-hidden", "true");
+  play.removeAttribute("data-play-album");
+  play.removeAttribute("data-play-playlist");
+  play.removeAttribute("data-play-artist");
+
+  const header = collectionHeader();
+  chrome.hidden = !header;
+  name.textContent = header ? header.name : "";
+  if (header) {
+    play.setAttribute(header.attribute, header.value);
+  }
 }
 
 viewArea.addEventListener("input", (event) => {

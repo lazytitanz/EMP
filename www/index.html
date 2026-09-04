@@ -6,7 +6,7 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=42">
+  <link rel="stylesheet" href="css/player.css?v=43">
 </head>
 <body>
   <div class="app-shell">
@@ -88,6 +88,13 @@
           </button>
         </div>
 
+        <div class="top-collection" id="topCollection" aria-hidden="true" hidden>
+          <button class="top-collection-play" type="button" id="topCollectionPlay" aria-label="Play">
+            <i class="bi bi-play-fill"></i>
+          </button>
+          <span class="top-collection-name" id="topCollectionName"></span>
+        </div>
+
         <div class="top-search d-none" id="topSearch">
           <i class="bi bi-search"></i>
           <input type="search" id="searchInput" placeholder="What do you want to play?" aria-label="Search">
@@ -164,6 +171,6 @@
 
   <script src="lib/bootstrap/5.3.8/bootstrap.bundle.min.js"></script>
   <script src="js/eq-presets.js?v=2"></script>
-  <script src="js/player.js?v=35"></script>
+  <script src="js/player.js?v=36"></script>
 </body>
 </html>
