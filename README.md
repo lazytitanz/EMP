@@ -2,13 +2,16 @@
   <img src="www/img/music.png" alt="EMP" width="72" height="72">
 </p>
 
+<p align="center">
+  <img src="www/img/promo.png" alt="EMP — a cleaner way to listen">
+</p>
+
 # EMP
 
 [![Windows](https://img.shields.io/badge/Windows-10%2B-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![.NET](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
 [![C#](https://img.shields.io/badge/C%23-239120?logo=csharp&logoColor=white)](https://github.com/lazytitanz/EMP)
 [![Local only](https://img.shields.io/badge/playback-local%20only-1DB954)](#why-emp)
-[![No AI](https://img.shields.io/badge/AI-none-111111)](#why-emp)
 [![GitHub last commit](https://img.shields.io/github/last-commit/lazytitanz/EMP)](https://github.com/lazytitanz/EMP/commits/main)
 
 EMP is a local music player for Windows. It was built to feel familiar if you already know Spotify, without streaming, accounts, social features, or AI.
