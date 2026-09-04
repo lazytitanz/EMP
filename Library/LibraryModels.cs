@@ -18,6 +18,28 @@ namespace EMP.Library
         public IReadOnlyList<AlbumInfo> Singles { get; init; } = [];
 
         public IReadOnlyList<TrackInfo> Tracks { get; init; } = [];
+
+        public IReadOnlyDictionary<string, LibraryMediaLocation> Locations { get; init; } =
+            new Dictionary<string, LibraryMediaLocation>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal sealed class LibraryMediaLocation
+    {
+        public required string TrackId { get; init; }
+
+        public required string FullPath { get; init; }
+
+        public required string RootPath { get; init; }
+
+        public required string Title { get; init; }
+
+        public required string Artist { get; init; }
+
+        public required string Album { get; init; }
+
+        public double Duration { get; init; }
+
+        public string? ArtworkPath { get; init; }
     }
 
     internal sealed class AlbumInfo

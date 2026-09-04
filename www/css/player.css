@@ -2353,6 +2353,13 @@ img.album-hero-cover {
   color: var(--emp-text);
 }
 
+.text-btn:disabled,
+.text-btn:disabled:hover {
+  color: var(--emp-muted);
+  opacity: 0.45;
+  cursor: default;
+}
+
 .text-btn.active {
   color: var(--emp-green);
 }
@@ -2433,8 +2440,13 @@ input[type="range"].slider::-webkit-slider-thumb {
   box-shadow: none;
 }
 
-input[type="range"].slider:hover {
-  --fill-color: var(--emp-green);
+input[type="range"].slider:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+input[type="range"].slider:disabled:hover {
+  --fill-color: #ffffff;
 }
 
 input[type="range"].slider:hover::-webkit-slider-thumb {
@@ -2996,6 +3008,215 @@ img.details-cover {
 .delete-modal-confirm:hover {
   background: #f15050;
   transform: scale(1.04);
+}
+
+.device-drawer-root {
+  position: fixed;
+  top: var(--gap);
+  left: var(--gap);
+  right: var(--gap);
+  bottom: calc(var(--player-height) + var(--gap) * 2);
+  z-index: 45;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(0, 0, 0, 0.65);
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+}
+
+.device-drawer-root[hidden] {
+  display: none !important;
+}
+
+.device-drawer-root.is-open {
+  opacity: 1;
+  pointer-events: auto;
+  visibility: visible;
+}
+
+.device-drawer {
+  width: min(380px, 100%);
+  height: 100%;
+  background: var(--emp-bg);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  transform: translateX(24px);
+  opacity: 0.96;
+  transition: transform 0.22s ease;
+  overflow: hidden;
+}
+
+.device-drawer-root.is-open .device-drawer {
+  transform: translateX(0);
+}
+
+.device-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 16px 12px 20px;
+  flex-shrink: 0;
+}
+
+.device-drawer-head h2 {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.device-drawer-body {
+  overflow: auto;
+  padding: 0 8px 16px;
+  min-height: 0;
+}
+
+.device-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.device-row:hover,
+.device-row:focus-visible {
+  background: var(--emp-row-hover);
+}
+
+.device-row-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--emp-highlight);
+  color: var(--emp-text);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  font-size: 1.15rem;
+}
+
+.device-row-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.device-row-name {
+  font-size: 0.92rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.device-row-meta {
+  color: var(--emp-muted);
+  font-size: 0.78rem;
+}
+
+.device-row-mark {
+  color: var(--emp-green);
+  font-size: 1.1rem;
+  width: 22px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.device-section-label {
+  color: var(--emp-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 16px 12px 6px;
+}
+
+.device-empty {
+  padding: 28px 16px 12px;
+  color: var(--emp-muted);
+  text-align: center;
+}
+
+.device-empty h3 {
+  margin: 0 0 8px;
+  color: var(--emp-text);
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.device-empty p {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.device-scan {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--emp-muted);
+  font-size: 0.88rem;
+}
+
+.device-scan-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--emp-green);
+  animation: device-scan-pulse 1.1s ease-in-out infinite;
+}
+
+.device-error {
+  color: var(--emp-muted);
+  font-size: 0.82rem;
+  padding: 8px 12px 4px;
+}
+
+.device-note {
+  color: var(--emp-subtle);
+  font-size: 0.75rem;
+  padding: 12px 12px 4px;
+  line-height: 1.4;
+}
+
+.text-btn.is-connecting {
+  color: var(--emp-text);
+}
+
+.text-btn.is-connecting i {
+  animation: device-scan-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes device-scan-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .device-drawer-root,
+  .device-drawer,
+  .device-scan-dot,
+  .text-btn.is-connecting i {
+    transition: none;
+    animation: none;
+  }
 }
 
 @media (max-width: 900px) {

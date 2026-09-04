@@ -95,7 +95,16 @@ const state = {
   equalizerPreset: "flat",
   equalizerGains: cloneEqGains(EQ_FLAT_GAINS),
   startupOnLogin: "no",
-  closeMinimizes: false
+  closeMinimizes: false,
+  playbackTarget: "local",
+  connectingDeviceId: null,
+  castDevices: [],
+  castScanning: false,
+  castError: null,
+  castVolumeAvailable: false,
+  remotePosition: 0,
+  remoteDuration: 0,
+  remoteStatusAt: 0
 };
 
 const historyStack = [{ view: "home" }];
@@ -125,6 +134,9 @@ const durationEl = document.getElementById("duration");
 const shuffleBtn = document.getElementById("shuffleBtn");
 const repeatBtn = document.getElementById("repeatBtn");
 const muteBtn = document.getElementById("muteBtn");
+const deviceBtn = document.getElementById("deviceBtn");
+const deviceDrawerRoot = document.getElementById("deviceDrawerRoot");
+const deviceDrawerBody = document.getElementById("deviceDrawerBody");
 
 const SESSION_KEY = "emp.playback";
 const LIKED_PLAYLIST_ID = "pl_liked";
@@ -150,6 +162,12 @@ let rescanTimer = 0;
 let lastSessionWrite = 0;
 let trackVirtual = null;
 let lastAudioTime = 0;
+let pendingHandoff = null;
+let remoteClock = 0;
+let remoteAdvanceAt = 0;
+let deviceDrawerCloseTimer = 0;
+let deviceScanStarted = 0;
+let deviceScanWaitTimer = 0;
 
 function readSession() {
   try {
@@ -275,7 +293,7 @@ function writeSession() {
     queue: state.queue,
     shuffleBag: state.shuffleBag,
     index: state.index,
-    position: Number.isFinite(currentAudio().currentTime) ? currentAudio().currentTime : 0,
+    position: Number.isFinite(playbackPosition()) ? playbackPosition() : 0,
     volume: state.volume,
     lastVolume: state.lastVolume,
     muted: state.muted,
@@ -546,6 +564,422 @@ function activeOrder() {
 
 function currentTrack() {
   return trackById(activeOrder()[state.index]) ?? null;
+}
+
+function isRemotePlayback() {
+  return Boolean(state.playbackTarget && state.playbackTarget !== "local");
+}
+
+function isConnectingPlayback() {
+  return Boolean(state.connectingDeviceId);
+}
+
+function playbackPosition() {
+  if (isRemotePlayback()) {
+    const base = Number(state.remotePosition) || 0;
+    if (!state.playing || state.seeking) {
+      return base;
+    }
+    return Math.max(0, base + (performance.now() - (state.remoteStatusAt || performance.now())) / 1000);
+  }
+  return currentAudio().currentTime || 0;
+}
+
+function playbackDuration() {
+  const local = currentTrack()?.duration || 0;
+  if (isRemotePlayback()) {
+    return preferRemoteDuration(state.remoteDuration, local);
+  }
+  return currentAudio().duration || local;
+}
+
+function preferRemoteDuration(remoteValue, localValue) {
+  const remote = Number(remoteValue) || 0;
+  const local = Number(localValue) || 0;
+  if (local > 1 && (remote <= 0 || !isPlausibleRemoteDuration(remote, local))) {
+    return local;
+  }
+  return remote || local;
+}
+
+function isPlausibleRemoteDuration(remote, local) {
+  if (remote <= 0) {
+    return false;
+  }
+  if (local <= 1) {
+    return remote > 1;
+  }
+  const floor = Math.max(30, local * 0.5);
+  if (remote + 0.5 < Math.min(local, floor) && remote + 2 < local) {
+    return false;
+  }
+  return remote <= local * 1.5 + 5;
+}
+
+function consumeRemoteAdvance() {
+  const now = Date.now();
+  if (now - remoteAdvanceAt < 1500) {
+    return false;
+  }
+  remoteAdvanceAt = now;
+  return true;
+}
+
+function nextCastTrackId() {
+  return peekNextId({ wrap: state.repeat === "all" });
+}
+
+function stopLocalOutput() {
+  cancelTransition();
+  currentAudio().pause();
+  incomingPlayer().el.pause();
+}
+
+function postCastDiscovery(enabled) {
+  window.chrome?.webview?.postMessage({ type: "castDiscovery", enabled: Boolean(enabled) });
+}
+
+function postCastSelect(deviceId) {
+  window.chrome?.webview?.postMessage({
+    type: "castSelect",
+    deviceId,
+    trackId: currentTrack()?.id ?? null,
+    nextTrackId: nextCastTrackId(),
+    position: playbackPosition(),
+    playing: Boolean(state.playing),
+    volume: state.volume,
+    muted: state.muted
+  });
+}
+
+function postCastCommand(action, extra = {}) {
+  window.chrome?.webview?.postMessage({
+    type: "castCommand",
+    action,
+    trackId: extra.trackId ?? currentTrack()?.id ?? null,
+    nextTrackId: extra.nextTrackId ?? nextCastTrackId(),
+    position: extra.position ?? playbackPosition(),
+    playing: extra.playing ?? Boolean(state.playing),
+    volume: extra.volume ?? state.volume,
+    muted: extra.muted ?? state.muted
+  });
+}
+
+function stopRemoteClock() {
+  if (remoteClock) {
+    cancelAnimationFrame(remoteClock);
+    remoteClock = 0;
+  }
+}
+
+function startRemoteClock() {
+  stopRemoteClock();
+  if (!isRemotePlayback()) {
+    return;
+  }
+  const tick = () => {
+    if (!isRemotePlayback()) {
+      remoteClock = 0;
+      return;
+    }
+    if (!state.seeking) {
+      const duration = playbackDuration() || 1;
+      const position = Math.min(playbackPosition(), duration);
+      elapsedEl.textContent = formatTime(position);
+      seekBar.value = String(Math.round((position / duration) * 1000));
+      updateSlider(seekBar);
+    }
+    remoteClock = requestAnimationFrame(tick);
+  };
+  remoteClock = requestAnimationFrame(tick);
+}
+
+function applyVolumeControls() {
+  const remoteNoVolume = isRemotePlayback() && !state.castVolumeAvailable;
+  volumeBar.disabled = remoteNoVolume;
+  muteBtn.disabled = remoteNoVolume;
+  volumeBar.title = remoteNoVolume ? "Volume is controlled on the device" : "";
+  muteBtn.title = remoteNoVolume ? "Volume is controlled on the device" : "";
+}
+
+function updateDeviceButton() {
+  if (!deviceBtn) {
+    return;
+  }
+  const connected = isRemotePlayback();
+  const connecting = isConnectingPlayback();
+  deviceBtn.classList.toggle("active", connected);
+  deviceBtn.classList.toggle("is-connecting", connecting && !connected);
+  const title = connecting
+    ? "Connecting to a device"
+    : connected
+      ? "Connected to a device"
+      : "Connect to a device";
+  setTooltipTitle(deviceBtn, title);
+}
+
+function deviceDrawerIsOpen() {
+  return Boolean(deviceDrawerRoot && !deviceDrawerRoot.hidden);
+}
+
+function renderDeviceDrawer() {
+  if (!deviceDrawerBody) {
+    return;
+  }
+
+  const localActive = !isRemotePlayback();
+  const devices = Array.isArray(state.castDevices) ? state.castDevices : [];
+  const rows = devices.map((device) => {
+    const connected = state.playbackTarget === device.id;
+    const connecting = state.connectingDeviceId === device.id;
+    const icon = device.kind === "tv" ? "bi-tv" : "bi-speaker";
+    let mark = "";
+    if (connected) {
+      mark = '<i class="bi bi-check-lg"></i>';
+    } else if (connecting) {
+      mark = "…";
+    }
+    const meta = connecting ? "Connecting…" : (device.protocolLabel || "");
+    return `
+      <button class="device-row" type="button" data-cast-device="${escapeHtml(device.id)}">
+        <span class="device-row-icon" aria-hidden="true"><i class="bi ${icon}"></i></span>
+        <span class="device-row-copy">
+          <span class="device-row-name">${escapeHtml(device.name || "Device")}</span>
+          <span class="device-row-meta">${escapeHtml(meta)}</span>
+        </span>
+        <span class="device-row-mark">${mark}</span>
+      </button>
+    `;
+  }).join("");
+
+  let available = "";
+  if (!devices.length) {
+    const waited = Date.now() - (deviceScanStarted || Date.now()) > 8000;
+    available = !waited
+      ? `<div class="device-empty">
+           <div class="device-scan"><span class="device-scan-dot"></span>Looking for devices…</div>
+         </div>`
+      : `<div class="device-empty">
+           <h3>No devices found</h3>
+           <p>Make sure your devices are on the same network.</p>
+           ${state.castScanning ? `<div class="device-scan" style="margin-top:16px"><span class="device-scan-dot"></span>Looking for devices…</div>` : ""}
+         </div>`;
+  } else {
+    available = `<div class="device-section-label">Available devices</div>${rows}`;
+  }
+
+  const error = state.castError
+    ? `<div class="device-error">${escapeHtml(state.castError)}</div>`
+    : "";
+  const note = isRemotePlayback()
+    ? `<div class="device-note">Sound processing stays on this computer.</div>`
+    : "";
+
+  deviceDrawerBody.innerHTML = `
+    <button class="device-row" type="button" data-cast-device="local">
+      <span class="device-row-icon" aria-hidden="true"><i class="bi bi-pc-display"></i></span>
+      <span class="device-row-copy">
+        <span class="device-row-name">This computer</span>
+        <span class="device-row-meta">${localActive ? "Playing here" : "EMP"}</span>
+      </span>
+      <span class="device-row-mark">${localActive ? '<i class="bi bi-check-lg"></i>' : ""}</span>
+    </button>
+    ${available}
+    ${error}
+    ${note}
+  `;
+}
+
+function openDeviceDrawer() {
+  if (!deviceDrawerRoot) {
+    return;
+  }
+  window.clearTimeout(deviceDrawerCloseTimer);
+  window.clearTimeout(deviceScanWaitTimer);
+  deviceScanStarted = Date.now();
+  deviceDrawerRoot.hidden = false;
+  requestAnimationFrame(() => deviceDrawerRoot.classList.add("is-open"));
+  state.castError = null;
+  postCastDiscovery(true);
+  renderDeviceDrawer();
+  deviceScanWaitTimer = window.setTimeout(() => {
+    if (deviceDrawerIsOpen()) {
+      renderDeviceDrawer();
+    }
+  }, 8200);
+}
+
+function closeDeviceDrawer() {
+  if (!deviceDrawerRoot || deviceDrawerRoot.hidden) {
+    return;
+  }
+  deviceDrawerRoot.classList.remove("is-open");
+  deviceDrawerCloseTimer = window.setTimeout(() => {
+    deviceDrawerRoot.hidden = true;
+  }, 220);
+  if (!isRemotePlayback() && !isConnectingPlayback()) {
+    postCastDiscovery(false);
+  }
+}
+
+function selectPlaybackDevice(deviceId) {
+  if (deviceId === "local") {
+    const position = playbackPosition();
+    const playing = state.playing;
+    pendingHandoff = null;
+    state.connectingDeviceId = null;
+    state.playbackTarget = "local";
+    state.castVolumeAvailable = false;
+    stopRemoteClock();
+    postCastSelect("local");
+    const track = currentTrack();
+    if (track) {
+      playTrack(track.id, null, { position, autoplay: playing, keepBag: true, recordRecent: false });
+    }
+    updateDeviceButton();
+    applyVolumeControls();
+    renderDeviceDrawer();
+    updateNowPlaying();
+    return;
+  }
+
+  if (state.playbackTarget === deviceId || state.connectingDeviceId === deviceId) {
+    return;
+  }
+
+  pendingHandoff = {
+    position: playbackPosition(),
+    playing: Boolean(state.playing)
+  };
+  state.connectingDeviceId = deviceId;
+  state.castError = null;
+  stopLocalOutput();
+  postCastSelect(deviceId);
+  updateDeviceButton();
+  renderDeviceDrawer();
+  updateNowPlaying();
+}
+
+function restoreLocalAfterCastFailure(message) {
+  const position = pendingHandoff?.position ?? state.remotePosition ?? 0;
+  const playing = pendingHandoff?.playing ?? false;
+  pendingHandoff = null;
+  state.connectingDeviceId = null;
+  const wasRemote = isRemotePlayback();
+  state.playbackTarget = "local";
+  state.castVolumeAvailable = false;
+  state.castError = message || state.castError;
+  stopRemoteClock();
+  if (wasRemote || playing || currentTrack()) {
+    const track = currentTrack();
+    if (track) {
+      playTrack(track.id, null, { position, autoplay: playing, keepBag: true, recordRecent: false });
+    }
+  }
+  if (!deviceDrawerIsOpen()) {
+    postCastDiscovery(false);
+  }
+  updateDeviceButton();
+  applyVolumeControls();
+  renderDeviceDrawer();
+  updateNowPlaying();
+}
+
+function handleCastMessage(detail) {
+  if (!detail || !detail.type) {
+    return;
+  }
+
+  if (detail.type === "castDevices") {
+    state.castDevices = Array.isArray(detail.devices) ? detail.devices : [];
+    state.castScanning = detail.scanning !== false;
+    renderDeviceDrawer();
+    return;
+  }
+
+  if (detail.type === "castError") {
+    if (detail.fatal) {
+      restoreLocalAfterCastFailure(detail.message || "Couldn't connect to that device.");
+    } else {
+      state.castError = detail.message || null;
+      renderDeviceDrawer();
+    }
+    return;
+  }
+
+  if (detail.type !== "castStatus") {
+    return;
+  }
+
+  if (detail.state === "connecting") {
+    state.connectingDeviceId = detail.deviceId || state.connectingDeviceId;
+    updateDeviceButton();
+    renderDeviceDrawer();
+    return;
+  }
+
+  if (detail.state === "local") {
+    if (isRemotePlayback() || isConnectingPlayback()) {
+      restoreLocalAfterCastFailure(state.castError);
+    }
+    return;
+  }
+
+  if (detail.state !== "connected") {
+    return;
+  }
+
+  pendingHandoff = null;
+  state.connectingDeviceId = null;
+  state.playbackTarget = detail.deviceId || state.playbackTarget;
+  state.remotePosition = Math.max(0, Number(detail.position) || 0);
+  if (detail.skip === "applied" && detail.trackId) {
+    advanceQueueTo(detail.trackId);
+  }
+  state.remoteDuration = preferRemoteDuration(detail.duration, currentTrack()?.duration);
+  state.remoteStatusAt = performance.now();
+  state.playing = Boolean(detail.playing);
+  state.castVolumeAvailable = Boolean(detail.volumeAvailable);
+  if (detail.volumeAvailable && typeof detail.volume === "number") {
+    state.volume = Math.max(0, Math.min(100, detail.volume));
+    state.muted = state.volume === 0;
+    volumeBar.value = String(state.muted ? 0 : state.volume);
+  }
+  if (detail.skip === "applied") {
+    if (consumeRemoteAdvance()) {
+      postCastCommand("sync");
+    }
+    startRemoteClock();
+    applyVolumeControls();
+    updateDeviceButton();
+    renderDeviceDrawer();
+    updateNowPlaying();
+    writeSession();
+    return;
+  }
+  if (detail.skip === "next" || detail.skip === "previous") {
+    if (!consumeRemoteAdvance()) {
+      return;
+    }
+    if (detail.skip === "previous") {
+      previousTrack();
+    } else {
+      nextTrack({ wrap: state.repeat === "all" });
+    }
+    return;
+  }
+  if (detail.ended) {
+    if (!consumeRemoteAdvance()) {
+      return;
+    }
+    nextTrack({ wrap: state.repeat === "all" });
+    return;
+  }
+  startRemoteClock();
+  applyVolumeControls();
+  updateDeviceButton();
+  renderDeviceDrawer();
+  updateNowPlaying();
 }
 
 function shuffleInPlace(list) {
@@ -2904,7 +3338,7 @@ function ensureIncomingLoaded(track) {
 }
 
 function maybePreloadNext() {
-  if (playbackTransitioning || state.repeat === "one") {
+  if (isRemotePlayback() || isConnectingPlayback() || playbackTransitioning || state.repeat === "one") {
     return;
   }
   if (!state.crossfade && !state.gapless) {
@@ -3033,7 +3467,7 @@ async function startGapless(nextId) {
 }
 
 function maybeStartAutoAdvance() {
-  if (!state.playing || playbackTransitioning || state.repeat === "one" || state.seeking) {
+  if (isRemotePlayback() || isConnectingPlayback() || !state.playing || playbackTransitioning || state.repeat === "one" || state.seeking) {
     return;
   }
   const el = currentAudio();
@@ -3229,8 +3663,8 @@ function updateNowPlaying() {
   nowTitle.textContent = track.title;
   nowArtist.textContent = track.artist;
   setNowPlayingInteractive(true);
-  durationEl.textContent = formatTime(currentAudio().duration || track.duration);
-  elapsedEl.textContent = formatTime(currentAudio().currentTime || 0);
+  durationEl.textContent = formatTime(playbackDuration() || track.duration);
+  elapsedEl.textContent = formatTime(Math.min(playbackPosition(), playbackDuration() || playbackPosition()));
   playBtn.innerHTML = state.playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
   playBtn.setAttribute("aria-label", state.playing ? "Pause" : "Play");
   likeBtn.innerHTML = state.liked.has(track.id) ? '<i class="bi bi-heart-fill"></i>' : '<i class="bi bi-heart"></i>';
@@ -3249,6 +3683,8 @@ function updateNowPlaying() {
   trackVirtual?.paint();
   updateSlider(seekBar);
   updateSlider(volumeBar);
+  applyVolumeControls();
+  updateDeviceButton();
   postNowPlaying();
 }
 
@@ -3284,6 +3720,30 @@ async function playTrack(id, queueIds, options = {}) {
   if (options.recordRecent !== false) {
     recordRecentAlbum(track.albumId);
     recordRecentTrack(track.id);
+  }
+
+  if (isConnectingPlayback() && !isRemotePlayback()) {
+    lastAudioTime = position;
+    state.playing = autoplay;
+    updateNowPlaying();
+    writeSession();
+    return;
+  }
+
+  if (isRemotePlayback()) {
+    stopLocalOutput();
+    lastAudioTime = position;
+    state.remotePosition = position;
+    state.remoteStatusAt = performance.now();
+    state.playing = autoplay;
+    postCastCommand("load", {
+      trackId: track.id,
+      position,
+      playing: autoplay
+    });
+    updateNowPlaying();
+    writeSession();
+    return;
   }
 
   ensureAudioGraph();
@@ -3340,14 +3800,20 @@ function seekWhenReady(position, fallbackDuration) {
 }
 
 function seekBy(seconds) {
-  const el = currentAudio();
-  const duration = el.duration || currentTrack()?.duration || 0;
+  const duration = playbackDuration();
   if (!duration) {
     return;
   }
 
-  el.currentTime = Math.max(0, Math.min(duration, (el.currentTime || 0) + seconds));
-  lastAudioTime = el.currentTime;
+  const next = Math.max(0, Math.min(duration, playbackPosition() + seconds));
+  if (isRemotePlayback()) {
+    postCastCommand("seek", { position: next });
+    state.remotePosition = next;
+    state.remoteStatusAt = performance.now();
+  } else {
+    currentAudio().currentTime = next;
+  }
+  lastAudioTime = next;
   updateNowPlaying();
   writeSession();
 }
@@ -3560,6 +4026,23 @@ function togglePlay() {
     return;
   }
 
+  if (isConnectingPlayback()) {
+    return;
+  }
+
+  if (isRemotePlayback()) {
+    if (state.playing) {
+      postCastCommand("pause");
+      state.playing = false;
+    } else {
+      postCastCommand("play", { playing: true });
+      state.playing = true;
+    }
+    updateNowPlaying();
+    writeSession();
+    return;
+  }
+
   const el = currentAudio();
   if (state.playing) {
     el.pause();
@@ -3586,7 +4069,11 @@ function stopAtEndOfQueue() {
   state.holdEnded = true;
   state.playing = false;
   cancelTransition();
-  currentAudio().pause();
+  if (isRemotePlayback()) {
+    postCastCommand("pause");
+  } else {
+    currentAudio().pause();
+  }
   updateNowPlaying();
   writeSession();
 }
@@ -3624,9 +4111,15 @@ function previousTrack() {
   if (!order.length) {
     return;
   }
-  const el = currentAudio();
-  if (el.currentTime > 3) {
-    el.currentTime = 0;
+  if (playbackPosition() > 3) {
+    if (isRemotePlayback()) {
+      postCastCommand("seek", { position: 0 });
+      state.remotePosition = 0;
+      state.remoteStatusAt = performance.now();
+    } else {
+      currentAudio().currentTime = 0;
+    }
+    lastAudioTime = 0;
     updateNowPlaying();
     writeSession();
     return;
@@ -4752,6 +5245,30 @@ playBtn.addEventListener("click", togglePlay);
 document.getElementById("nextBtn").addEventListener("click", () => nextTrack({ wrap: true }));
 document.getElementById("prevBtn").addEventListener("click", previousTrack);
 
+deviceBtn?.addEventListener("click", () => {
+  if (deviceDrawerIsOpen()) {
+    closeDeviceDrawer();
+  } else {
+    openDeviceDrawer();
+  }
+});
+
+deviceDrawerRoot?.addEventListener("click", (event) => {
+  if (event.target === deviceDrawerRoot) {
+    closeDeviceDrawer();
+    return;
+  }
+  const row = event.target.closest("[data-cast-device]");
+  if (row?.dataset.castDevice) {
+    selectPlaybackDevice(row.dataset.castDevice);
+  }
+});
+
+document.getElementById("deviceDrawerClose")?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  closeDeviceDrawer();
+});
+
 shuffleBtn.addEventListener("click", () => {
   setShuffle(!state.shuffle);
 });
@@ -4773,33 +5290,51 @@ likeBtn.addEventListener("click", () => {
 
 seekBar.addEventListener("input", () => {
   state.seeking = true;
-  const duration = currentAudio().duration || currentTrack()?.duration || 0;
+  const duration = playbackDuration() || currentTrack()?.duration || 0;
   elapsedEl.textContent = formatTime((Number(seekBar.value) / 1000) * duration);
   updateSlider(seekBar);
 });
 
 seekBar.addEventListener("change", () => {
-  const el = currentAudio();
-  const duration = el.duration || currentTrack()?.duration || 0;
-  el.currentTime = (Number(seekBar.value) / 1000) * duration;
-  lastAudioTime = el.currentTime;
+  const duration = playbackDuration() || currentTrack()?.duration || 0;
+  const position = (Number(seekBar.value) / 1000) * duration;
+  if (isRemotePlayback()) {
+    postCastCommand("seek", { position });
+    state.remotePosition = position;
+    state.remoteStatusAt = performance.now();
+  } else {
+    currentAudio().currentTime = position;
+  }
+  lastAudioTime = position;
   state.seeking = false;
   updateSlider(seekBar);
   writeSession();
 });
 
 volumeBar.addEventListener("input", () => {
+  if (isRemotePlayback() && !state.castVolumeAvailable) {
+    volumeBar.value = String(state.muted ? 0 : state.volume);
+    updateSlider(volumeBar);
+    return;
+  }
   state.volume = Number(volumeBar.value);
   state.muted = state.volume === 0;
   if (state.volume > 0) {
     state.lastVolume = state.volume;
   }
-  applyVolume();
+  if (isRemotePlayback()) {
+    postCastCommand("volume");
+  } else {
+    applyVolume();
+  }
   updateNowPlaying();
   writeSession();
 });
 
 muteBtn.addEventListener("click", () => {
+  if (isRemotePlayback() && !state.castVolumeAvailable) {
+    return;
+  }
   state.muted = !state.muted;
   if (state.muted) {
     state.lastVolume = state.volume || state.lastVolume;
@@ -4808,14 +5343,18 @@ muteBtn.addEventListener("click", () => {
     state.volume = state.lastVolume || 80;
     volumeBar.value = String(state.volume);
   }
-  applyVolume();
+  if (isRemotePlayback()) {
+    postCastCommand("volume");
+  } else {
+    applyVolume();
+  }
   updateNowPlaying();
   writeSession();
 });
 
 function bindPlaybackElement(el) {
   el.addEventListener("timeupdate", () => {
-    if (el !== currentAudio()) {
+    if (el !== currentAudio() || isRemotePlayback() || isConnectingPlayback()) {
       return;
     }
 
@@ -4857,7 +5396,7 @@ function bindPlaybackElement(el) {
   });
 
   el.addEventListener("ended", () => {
-    if (el !== currentAudio() || playbackTransitioning) {
+    if (el !== currentAudio() || playbackTransitioning || isRemotePlayback() || isConnectingPlayback()) {
       return;
     }
     if (state.repeat === "one") {
@@ -4870,7 +5409,7 @@ function bindPlaybackElement(el) {
   });
 
   el.addEventListener("play", () => {
-    if (el !== currentAudio()) {
+    if (el !== currentAudio() || isRemotePlayback() || isConnectingPlayback()) {
       return;
     }
     if (state.holdEnded && state.repeat !== "one") {
@@ -4885,7 +5424,7 @@ function bindPlaybackElement(el) {
   });
 
   el.addEventListener("pause", () => {
-    if (el !== currentAudio() || playbackTransitioning) {
+    if (el !== currentAudio() || playbackTransitioning || isRemotePlayback() || isConnectingPlayback()) {
       return;
     }
     if (!el.ended) {
@@ -4908,6 +5447,11 @@ window.addEventListener("pagehide", writeSession);
 
 document.addEventListener("keydown", (event) => {
   if (event.code === "Escape") {
+    if (deviceDrawerIsOpen()) {
+      event.preventDefault();
+      closeDeviceDrawer();
+      return;
+    }
     if (detailsModal && !detailsModal.hidden) {
       event.preventDefault();
       closeDetailsModal();
@@ -5001,6 +5545,7 @@ syncTopBarScroll();
 window.addEventListener("emp-library", (event) => bindLibrary(event.detail));
 window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.detail));
 window.addEventListener("emp-app-settings", (event) => applyHostAppSettings(event.detail));
+window.addEventListener("emp-cast", (event) => handleCastMessage(event.detail));
 if (window.__emp?.library) {
   bindLibrary(window.__emp.library);
 }
@@ -5008,3 +5553,4 @@ if (window.__emp?.library) {
 updateRepeatButton();
 updateSlider(volumeBar);
 updateSlider(seekBar);
+updateDeviceButton();

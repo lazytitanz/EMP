@@ -6,7 +6,7 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=39">
+  <link rel="stylesheet" href="css/player.css?v=41">
 </head>
 <body>
   <div class="app-shell">
@@ -137,6 +137,9 @@
       </div>
 
       <div class="player-right">
+        <button class="text-btn" type="button" id="deviceBtn" aria-label="Connect to a device" data-bs-toggle="tooltip" data-bs-title="Connect to a device">
+          <i class="bi bi-speaker"></i>
+        </button>
         <div class="volume">
           <button class="text-btn" type="button" id="muteBtn" aria-label="Mute">
             <i class="bi bi-volume-up-fill"></i>
@@ -147,8 +150,20 @@
     </footer>
   </div>
 
+  <div class="device-drawer-root" id="deviceDrawerRoot" hidden>
+    <aside class="device-drawer" role="dialog" aria-modal="true" aria-labelledby="deviceDrawerTitle">
+      <div class="device-drawer-head">
+        <h2 id="deviceDrawerTitle">Connect to a device</h2>
+        <button class="details-modal-close" type="button" id="deviceDrawerClose" aria-label="Close">
+          <i class="bi bi-x-lg"></i>
+        </button>
+      </div>
+      <div class="device-drawer-body" id="deviceDrawerBody"></div>
+    </aside>
+  </div>
+
   <script src="lib/bootstrap/5.3.8/bootstrap.bundle.min.js"></script>
   <script src="js/eq-presets.js?v=2"></script>
-  <script src="js/player.js?v=33"></script>
+  <script src="js/player.js?v=35"></script>
 </body>
 </html>

@@ -126,6 +126,7 @@ namespace EMP.Library
             List<AlbumInfo> albums = [];
             List<AlbumInfo> singles = [];
             List<TrackInfo> tracks = [];
+            Dictionary<string, LibraryMediaLocation> locations = new(StringComparer.OrdinalIgnoreCase);
 
             foreach (IGrouping<string, AudioFileInfo> group in albumGroups)
             {
@@ -171,11 +172,13 @@ namespace EMP.Library
 
                 foreach (AudioFileInfo file in albumFiles)
                 {
+                    string trackId = CreateId(file.FullPath);
+                    string trackArtist = string.IsNullOrWhiteSpace(file.Artist) ? artist : file.Artist;
                     tracks.Add(new TrackInfo
                     {
-                        Id = CreateId(file.FullPath),
+                        Id = trackId,
                         Title = file.Title,
-                        Artist = string.IsNullOrWhiteSpace(file.Artist) ? artist : file.Artist,
+                        Artist = trackArtist,
                         Album = title,
                         AlbumId = albumId,
                         TrackNumber = file.TrackNumber,
@@ -184,6 +187,18 @@ namespace EMP.Library
                         CoverUrl = coverUrl,
                         IsSingle = isSingle
                     });
+
+                    locations[trackId] = new LibraryMediaLocation
+                    {
+                        TrackId = trackId,
+                        FullPath = file.FullPath,
+                        RootPath = file.RootPath,
+                        Title = file.Title,
+                        Artist = trackArtist,
+                        Album = title,
+                        Duration = file.DurationSeconds,
+                        ArtworkPath = ResolveArtworkPath(artworkRoot, coverUrl)
+                    };
                 }
             }
 
@@ -203,7 +218,8 @@ namespace EMP.Library
                     .OrderBy(track => track.Artist, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(track => track.Album, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(track => track.TrackNumber)
-                    .ToArray()
+                    .ToArray(),
+                Locations = locations
             };
         }
 
@@ -354,6 +370,30 @@ namespace EMP.Library
             {
                 return null;
             }
+        }
+
+        private static string? ResolveArtworkPath(string artworkRoot, string? coverUrl)
+        {
+            if (string.IsNullOrWhiteSpace(coverUrl))
+            {
+                return null;
+            }
+
+            string fileName = Path.GetFileName(coverUrl.Replace('/', Path.DirectorySeparatorChar));
+            if (string.IsNullOrWhiteSpace(fileName) || fileName.Contains("..", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            string fullPath = Path.GetFullPath(Path.Combine(artworkRoot, fileName));
+            string root = Path.GetFullPath(artworkRoot);
+            if (!fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            return File.Exists(fullPath) ? fullPath : null;
         }
 
         public static string ToVirtualUrl(string hostName, string relativePath)

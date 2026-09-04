@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using EMP.Cast;
 using EMP.Library;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -30,6 +31,7 @@ namespace EMP.Hosting
 
         private static SystemMediaControls? systemMedia;
         private static MusicFolderWatchers? folderWatchers;
+        private static CastCoordinator? cast;
         private static WebView2? hostView;
         private static string artworkRoot = string.Empty;
         private static bool pageLoaded;
@@ -89,6 +91,9 @@ namespace EMP.Hosting
             folderWatchers?.Dispose();
             folderWatchers = new MusicFolderWatchers(() => PostToUi(() => RefreshLibrary()));
 
+            cast?.Dispose();
+            cast = new CastCoordinator(PostCastMessage);
+
             await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
                 """
                 window.__emp = window.__emp || { library: null };
@@ -108,6 +113,10 @@ namespace EMP.Hosting
                   }
                   if (message.type === 'appSettings') {
                     window.dispatchEvent(new CustomEvent('emp-app-settings', { detail: message }));
+                    return;
+                  }
+                  if (message.type === 'castDevices' || message.type === 'castStatus' || message.type === 'castError') {
+                    window.dispatchEvent(new CustomEvent('emp-cast', { detail: message }));
                   }
                 });
                 """);
@@ -161,6 +170,20 @@ namespace EMP.Hosting
                     {
                         HandleAppSettings(document.RootElement);
                     }
+                    else if (kind == "castDiscovery")
+                    {
+                        bool enabled = document.RootElement.TryGetProperty("enabled", out JsonElement enabledElement)
+                            && enabledElement.ValueKind == JsonValueKind.True;
+                        cast?.SetDiscoveryEnabled(enabled);
+                    }
+                    else if (kind == "castSelect")
+                    {
+                        HandleCastSelect(document.RootElement);
+                    }
+                    else if (kind == "castCommand")
+                    {
+                        HandleCastCommand(document.RootElement);
+                    }
                 }
                 catch (JsonException)
                 {
@@ -177,6 +200,9 @@ namespace EMP.Hosting
             folderWatchers = null;
             systemMedia?.Dispose();
             systemMedia = null;
+            cast?.Dispose();
+            cast = null;
+            LibraryMediaIndex.Clear();
             hostView = null;
             pageLoaded = false;
             MappedHosts.Clear();
@@ -209,6 +235,7 @@ namespace EMP.Hosting
             try
             {
                 MusicLibrary library = MusicLibraryScanner.Scan(folders, artworkRoot);
+                LibraryMediaIndex.Replace(library.Locations);
                 message = new LibraryMessage
                 {
                     Type = "library",
@@ -228,6 +255,7 @@ namespace EMP.Hosting
                 }
 
                 // Let a user-initiated rescan settle instead of spinning forever.
+                LibraryMediaIndex.Replace(new Dictionary<string, LibraryMediaLocation>(StringComparer.OrdinalIgnoreCase));
                 message = new LibraryMessage
                 {
                     Type = "library",
@@ -532,6 +560,51 @@ namespace EMP.Hosting
             _ = systemMedia.UpdateAsync(title, artist, album, playing, coverUrl);
         }
 
+        private static void HandleCastSelect(JsonElement message)
+        {
+            cast?.Select(
+                ReadString(message, "deviceId"),
+                ReadString(message, "trackId"),
+                ReadString(message, "nextTrackId"),
+                ReadDouble(message, "position"),
+                ReadBool(message, "playing"),
+                ReadDouble(message, "volume", 80),
+                ReadBool(message, "muted"));
+        }
+
+        private static void HandleCastCommand(JsonElement message)
+        {
+            cast?.Command(
+                ReadString(message, "action"),
+                ReadString(message, "trackId"),
+                ReadString(message, "nextTrackId"),
+                ReadDouble(message, "position"),
+                ReadBool(message, "playing"),
+                ReadDouble(message, "volume", 80),
+                ReadBool(message, "muted"));
+        }
+
+        private static void PostCastMessage(string type, object payload)
+        {
+            if (hostView?.CoreWebView2 is null)
+            {
+                return;
+            }
+
+            string json = JsonSerializer.Serialize(payload, JsonOptions);
+            PostToUi(() =>
+            {
+                try
+                {
+                    hostView?.CoreWebView2?.PostWebMessageAsJson(json);
+                }
+                catch (Exception)
+                {
+                    // The WebView may already be tearing down.
+                }
+            });
+        }
+
         private static void PostToUi(Action action)
         {
             if (hostView is null || hostView.IsDisposed)
@@ -553,6 +626,23 @@ namespace EMP.Hosting
             return message.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
                 ? value.GetString()
                 : null;
+        }
+
+        private static bool ReadBool(JsonElement message, string name)
+        {
+            return message.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.True;
+        }
+
+        private static double ReadDouble(JsonElement message, string name, double fallback = 0)
+        {
+            if (!message.TryGetProperty(name, out JsonElement value))
+            {
+                return fallback;
+            }
+
+            return value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out double number)
+                ? number
+                : fallback;
         }
 
         private sealed class LibraryMessage
