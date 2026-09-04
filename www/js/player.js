@@ -2175,11 +2175,14 @@ function renderEmpty() {
 }
 
 function trackRow(track, index, showAlbum, currentId, showCover = true) {
+  const current = currentId === track.id;
+  const playing = current && state.playing;
   return `
-    <div class="track-row${showAlbum ? " with-album" : ""}${showCover ? "" : " no-cover"}${currentId === track.id ? " playing" : ""}" data-play-id="${track.id}">
+    <div class="track-row${showAlbum ? " with-album" : ""}${showCover ? "" : " no-cover"}${current ? " playing" : ""}${playing ? " is-playing" : ""}" data-play-id="${track.id}">
       <div class="track-index">
         <span class="track-index-number">${index + 1}</span>
         <i class="bi bi-play-fill track-play-icon"></i>
+        ${nowEqMarkup("now-eq track-eq")}
       </div>
       <div class="track-main">${showCover ? coverMarkup(track, "playlist-cover") : ""}<span class="track-copy">
           <button class="track-title-btn" type="button" data-play-id="${track.id}">
@@ -2248,7 +2251,9 @@ function mountTrackVirtual(tracks, showAlbum) {
 function highlightPlaying() {
   const id = currentTrack()?.id;
   document.querySelectorAll(".track-row").forEach((row) => {
-    row.classList.toggle("playing", row.dataset.playId === id);
+    const current = row.dataset.playId === id;
+    row.classList.toggle("playing", current);
+    row.classList.toggle("is-playing", current && state.playing);
   });
   document.querySelectorAll(".track-name").forEach((name) => {
     const row = name.closest(".track-row");

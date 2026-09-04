@@ -2080,24 +2080,35 @@ img.album-hero-cover {
   color: var(--emp-muted);
 }
 
-.track-row:hover .track-index-number {
+.track-index-number,
+.track-play-icon,
+.track-eq {
+  grid-area: 1 / 1;
+}
+
+.track-row .track-play-icon,
+.track-row .track-eq {
   display: none;
 }
 
-.track-row .track-play-icon {
+.track-row:hover .track-index-number,
+.track-row.is-playing .track-index-number {
   display: none;
 }
 
-.track-row:hover .track-play-icon,
-.track-row.playing .track-play-icon {
+.track-row:hover .track-play-icon {
   display: inline;
 }
 
-.track-row.playing .track-index-number {
+.track-row.is-playing .track-eq {
+  display: flex;
+}
+
+.track-row.is-playing:hover .track-eq {
   display: none;
 }
 
-.track-row.playing .track-play-icon {
+.track-row.playing .track-index-number {
   color: var(--emp-green);
 }
 
@@ -2139,6 +2150,14 @@ img.album-hero-cover {
 .track-play-icon {
   font-size: 0.95rem;
   line-height: 1;
+}
+
+.track-eq {
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  height: 14px;
+  pointer-events: none;
 }
 
 .track-main {
