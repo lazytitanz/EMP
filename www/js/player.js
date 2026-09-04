@@ -76,6 +76,7 @@ const state = {
   recentAlbumIds: [],
   recentTrackIds: [],
   recentPlaylistIds: [],
+  recentHome: [],
   recentsFilter: "albums",
   playlists: [],
   playlistId: null,
@@ -213,6 +214,30 @@ function normalizeRecentsFilter(value) {
   return "albums";
 }
 
+function normalizeRecentHome(value, albumIds, playlistIds) {
+  if (Array.isArray(value) && value.length) {
+    return value
+      .filter((item) => item && (item.kind === "album" || item.kind === "playlist") && typeof item.id === "string")
+      .slice(0, MAX_RECENTS);
+  }
+
+  const albums = Array.isArray(albumIds) ? albumIds.filter((id) => typeof id === "string") : [];
+  const playlists = Array.isArray(playlistIds)
+    ? playlistIds.filter((id) => typeof id === "string" && id !== LIKED_PLAYLIST_ID)
+    : [];
+  const merged = [];
+  const max = Math.max(albums.length, playlists.length);
+  for (let i = 0; i < max && merged.length < MAX_RECENTS; i += 1) {
+    if (albums[i]) {
+      merged.push({ kind: "album", id: albums[i] });
+    }
+    if (playlists[i] && merged.length < MAX_RECENTS) {
+      merged.push({ kind: "playlist", id: playlists[i] });
+    }
+  }
+  return merged;
+}
+
 function normalizePlaylists(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -264,6 +289,7 @@ function writeSession() {
     recentAlbumIds: state.recentAlbumIds,
     recentTrackIds: state.recentTrackIds,
     recentPlaylistIds: state.recentPlaylistIds,
+    recentHome: state.recentHome,
     recentsFilter: state.recentsFilter,
     playlists: state.playlists,
     crossfade: state.crossfade,
@@ -327,6 +353,7 @@ function restoreEqualizerState(session) {
   state.sidebarSort = normalizeSidebarSort(session.sidebarSort);
   state.sidebarWidth = normalizeSidebarWidth(session.sidebarWidth);
   state.sidebarCollapsed = Boolean(session.sidebarCollapsed);
+  state.playlists = normalizePlaylists(session.playlists);
   if (Array.isArray(session.recentAlbumIds)) {
     state.recentAlbumIds = session.recentAlbumIds.filter((id) => typeof id === "string");
   }
@@ -336,8 +363,8 @@ function restoreEqualizerState(session) {
   if (Array.isArray(session.recentPlaylistIds)) {
     state.recentPlaylistIds = session.recentPlaylistIds.filter((id) => typeof id === "string");
   }
+  state.recentHome = normalizeRecentHome(session.recentHome, state.recentAlbumIds, state.recentPlaylistIds);
   state.recentsFilter = normalizeRecentsFilter(session.recentsFilter);
-  state.playlists = normalizePlaylists(session.playlists);
   state.crossfade = Boolean(session.crossfade);
   state.gapless = Boolean(session.gapless);
   state.normalizeVolume = Boolean(session.normalizeVolume);
@@ -578,6 +605,27 @@ function recentPlaylists(limit = MAX_RECENTS) {
     .slice(0, limit);
 }
 
+function recentHomeItems(limit = MAX_RECENTS) {
+  const items = [];
+  for (const entry of state.recentHome) {
+    if (items.length >= limit) {
+      break;
+    }
+    if (entry.kind === "album") {
+      const album = albumById(entry.id);
+      if (album) {
+        items.push({ kind: "album", album });
+      }
+    } else if (entry.kind === "playlist") {
+      const playlist = playlistById(entry.id);
+      if (playlist && !isLikedPlaylist(playlist)) {
+        items.push({ kind: "playlist", playlist });
+      }
+    }
+  }
+  return items;
+}
+
 function playlistsForMenu(query) {
   const needle = String(query ?? "").trim().toLowerCase();
   const rank = new Map(state.recentPlaylistIds.map((id, index) => [id, index]));
@@ -682,8 +730,21 @@ function recordRecentId(key, id) {
   state[key] = [id, ...state[key].filter((item) => item !== id)].slice(0, MAX_RECENTS);
 }
 
+function recordRecentHome(kind, id) {
+  if (!id || (kind !== "album" && kind !== "playlist")) {
+    return;
+  }
+  if (kind === "playlist" && (id === LIKED_PLAYLIST_ID || isLikedPlaylist(playlistById(id)))) {
+    return;
+  }
+
+  state.recentHome = [{ kind, id }, ...state.recentHome.filter((item) => item.kind !== kind || item.id !== id)]
+    .slice(0, MAX_RECENTS);
+}
+
 function recordRecentAlbum(albumId) {
   recordRecentId("recentAlbumIds", albumId);
+  recordRecentHome("album", albumId);
   renderLibraryList();
 }
 
@@ -694,6 +755,7 @@ function recordRecentTrack(trackId) {
 
 function recordRecentPlaylist(playlistId) {
   recordRecentId("recentPlaylistIds", playlistId);
+  recordRecentHome("playlist", playlistId);
   renderLibraryList();
 }
 
@@ -1404,6 +1466,23 @@ function albumCard(album, options) {
   `;
 }
 
+function playlistCard(playlist) {
+  const playing = isSidebarPlaylistPlaying(playlist.id);
+  const count = playlistTracks(playlist).length;
+  return `
+    <article class="media-card${playing ? " is-playing" : ""}" data-open-playlist="${playlist.id}">
+      <div class="media-cover-wrap">
+        ${playlistCoverMarkup(playlist, "media-cover")}
+        <button class="play-fab${playing ? " is-playing" : ""}" type="button" data-play-playlist="${playlist.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(playlist.name)}">
+          <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
+        </button>
+      </div>
+      <div class="media-title">${escapeHtml(playlist.name)}</div>
+      <div class="media-sub">Playlist • ${songLabel(count)}</div>
+    </article>
+  `;
+}
+
 function artistCard(artist) {
   return `
     <article class="media-card" data-open-artist="${escapeHtml(artist.name)}">
@@ -1497,17 +1576,30 @@ function quickPlaylistCard(playlist) {
 function homeQuickItems() {
   const items = [];
   const seenAlbums = new Set();
+  const seenPlaylists = new Set();
   const liked = likedPlaylist();
   if (liked) {
     items.push({ kind: "playlist", playlist: liked });
+    seenPlaylists.add(liked.id);
   }
 
-  for (const album of recentAlbums(MAX_RECENTS)) {
+  for (const item of recentHomeItems(MAX_RECENTS)) {
     if (items.length >= HOME_QUICK_SIZE) {
       break;
     }
-    items.push({ kind: "album", album });
-    seenAlbums.add(album.id);
+    if (item.kind === "album") {
+      if (seenAlbums.has(item.album.id)) {
+        continue;
+      }
+      items.push(item);
+      seenAlbums.add(item.album.id);
+    } else if (item.kind === "playlist") {
+      if (seenPlaylists.has(item.playlist.id)) {
+        continue;
+      }
+      items.push(item);
+      seenPlaylists.add(item.playlist.id);
+    }
   }
 
   if (items.length < HOME_QUICK_SIZE) {
@@ -1533,6 +1625,14 @@ function renderQuickCard(item) {
   return quickCard(item.album);
 }
 
+function shelfCard(item, subtitleMode) {
+  if (item?.kind === "playlist") {
+    return playlistCard(item.playlist);
+  }
+  const album = item?.kind === "album" ? item.album : item;
+  return albumCard(album, { subtitleMode });
+}
+
 function shelfSection(title, items, filter, { subtitleMode = "type" } = {}) {
   if (!items.length) {
     return "";
@@ -1548,7 +1648,7 @@ function shelfSection(title, items, filter, { subtitleMode = "type" } = {}) {
         </button>
         ${showAll ? `<button class="see-all" type="button" data-nav="albums" data-filter="${filter}">See all</button>` : ""}
       </div>
-      <div class="shelf-row">${shown.map((album) => albumCard(album, { subtitleMode })).join("")}</div>
+      <div class="shelf-row">${shown.map((item) => shelfCard(item, subtitleMode)).join("")}</div>
     </section>
   `;
 }
@@ -1560,14 +1660,17 @@ function renderHome() {
     return;
   }
 
-  const recents = recentAlbums();
+  const recents = recentHomeItems();
   const quick = homeQuickItems();
   const accentAlbum = quick.find((item) => item.kind === "album")?.album
-    || recents[0]
+    || recents.find((item) => item.kind === "album")?.album
     || albums[0]
     || singles[0]
     || null;
-  const accentPlaylist = !accentAlbum ? quick.find((item) => item.kind === "playlist")?.playlist : null;
+  const accentPlaylist = !accentAlbum
+    ? (quick.find((item) => item.kind === "playlist")?.playlist
+      || recents.find((item) => item.kind === "playlist")?.playlist)
+    : null;
   const coverUrl = accentAlbum?.coverUrl
     || (accentPlaylist ? playlistArtworkUrls(accentPlaylist)[0] : null)
     || null;
@@ -3278,6 +3381,9 @@ async function restoreSession() {
   if (!state.recentTrackIds.length) {
     state.recentTrackIds = [trackId];
   }
+  if (!state.recentHome.length) {
+    state.recentHome = normalizeRecentHome(null, state.recentAlbumIds, state.recentPlaylistIds);
+  }
   renderLibraryList();
 
   const restoredQueue = queue.length ? queue : state.library.tracks.map((track) => track.id);
@@ -4394,6 +4500,7 @@ document.body.addEventListener("click", (event) => {
       queue = albumQueueIds(album);
     } else if (state.view === "playlist" && playlist) {
       queue = playlistTracks(playlist).map((track) => track.id);
+      recordRecentPlaylist(playlist.id);
     } else if (state.view === "artist" && state.artist) {
       queue = artistQueueIds(state.artist);
     } else {

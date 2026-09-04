@@ -897,6 +897,11 @@ img.album-hero-cover {
   display: grid;
 }
 
+.media-cover.cover-mosaic {
+  display: grid;
+  overflow: hidden;
+}
+
 .album-hero-cover.cover-mosaic {
   display: grid;
   font-size: 0;
