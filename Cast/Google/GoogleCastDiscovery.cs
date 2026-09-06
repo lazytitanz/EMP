@@ -12,6 +12,7 @@ namespace EMP.Cast.Google
         private readonly Dictionary<string, CachedReceiver> devices = new(StringComparer.OrdinalIgnoreCase);
         private CancellationTokenSource? lifetime;
         private Task? loop;
+        private Task drain = Task.CompletedTask;
         private bool started;
 
         public event Action? Changed;
@@ -55,36 +56,50 @@ namespace EMP.Cast.Google
 
                 started = true;
                 lifetime = new CancellationTokenSource();
-                loop = Task.Run(() => RunAsync(lifetime.Token));
+                CancellationToken token = lifetime.Token;
+                Task previous = drain;
+                loop = Task.Run(async () =>
+                {
+                    // Waiting on the previous run keeps a restart from doubling up
+                    // the discovery loops that publish device changes.
+                    await previous.ConfigureAwait(false);
+                    await RunAsync(token).ConfigureAwait(false);
+                });
             }
         }
 
-        public void Stop()
+        public Task StopAsync()
         {
-            CancellationTokenSource? stopping;
-            Task? running;
             lock (gate)
             {
                 if (!started)
                 {
-                    return;
+                    return drain;
                 }
 
                 started = false;
-                stopping = lifetime;
-                running = loop;
+                CancellationTokenSource? stopping = lifetime;
+                Task? running = loop;
                 lifetime = null;
                 loop = null;
+                drain = Task.Run(() => DrainAsync(stopping, running));
+                return drain;
             }
+        }
 
+        private static async Task DrainAsync(CancellationTokenSource? stopping, Task? running)
+        {
             stopping?.Cancel();
-            try
+            if (running is not null)
             {
-                running?.Wait(TimeSpan.FromSeconds(2));
-            }
-            catch (Exception)
-            {
-                // Discovery must not block shutdown.
+                try
+                {
+                    await running.ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // The loop swallows its own failures; nothing to salvage here.
+                }
             }
 
             stopping?.Dispose();
@@ -92,7 +107,16 @@ namespace EMP.Cast.Google
 
         public void Dispose()
         {
-            Stop();
+            Task stopping = StopAsync();
+            try
+            {
+                stopping.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (Exception)
+            {
+                // Discovery must not block shutdown.
+            }
+
             lock (gate)
             {
                 devices.Clear();
@@ -106,7 +130,11 @@ namespace EMP.Cast.Google
             {
                 try
                 {
-                    IEnumerable<ChromecastReceiver> found = await locator.FindReceiversAsync(TimeSpan.FromSeconds(5));
+                    // FindReceiversAsync takes no token, so abandon it on cancellation
+                    // instead of letting the loop outlive Stop by a full scan window.
+                    IEnumerable<ChromecastReceiver> found = await locator
+                        .FindReceiversAsync(TimeSpan.FromSeconds(5))
+                        .WaitAsync(cancellationToken);
                     DateTime now = DateTime.UtcNow;
                     bool changed = false;
                     lock (gate)

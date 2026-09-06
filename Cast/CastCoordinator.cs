@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net;
+using System.Text;
 using EMP.Library;
 
 namespace EMP.Cast
@@ -26,6 +27,7 @@ namespace EMP.Cast
         private int pollFailures;
         private int pollBusy;
         private int leaving;
+        private string lastDevices = string.Empty;
 
         public CastCoordinator(Action<string, object> post)
         {
@@ -39,22 +41,25 @@ namespace EMP.Cast
 
         public void SetDiscoveryEnabled(bool enabled)
         {
+            bool release;
             lock (gate)
             {
                 ObjectDisposedException.ThrowIf(disposed, this);
-                if (enabled)
-                {
-                    discoveryHeld = true;
-                    broker.Start();
-                }
-                else
-                {
-                    discoveryHeld = false;
-                    if (session is null && connectingDeviceId is null)
-                    {
-                        broker.Stop();
-                    }
-                }
+                discoveryHeld = enabled;
+                release = !enabled && session is null && connectingDeviceId is null;
+            }
+
+            if (enabled)
+            {
+                // The UI may have reloaded and lost the device list it already had,
+                // so let the next post through even if nothing changed here.
+                Interlocked.Exchange(ref lastDevices, string.Empty);
+                broker.Start();
+            }
+            else if (release)
+            {
+                // This runs on the UI thread, so never wait for discovery to unwind.
+                _ = broker.StopAsync();
             }
 
             PostDevices();
@@ -391,7 +396,7 @@ namespace EMP.Cast
             await server.StopAsync();
             if (!discoveryHeld)
             {
-                broker.Stop();
+                await broker.StopAsync();
             }
 
             PostStatus("local", "local", currentTrackId, false, 0, 0, 80, false, false);
@@ -561,21 +566,46 @@ namespace EMP.Cast
 
         private void PostDevices()
         {
+            bool scanning = broker.Scanning || discoveryHeld;
+            var devices = broker.Devices.Select(device => new
+            {
+                id = device.Id,
+                name = device.Name,
+                type = device.Type,
+                protocolLabel = device.ProtocolLabel,
+                kind = device.Kind,
+                available = device.Available,
+                volume = device.Volume,
+                seek = device.Seek
+            }).ToArray();
+
+            // Cast and DLNA both announce the same devices repeatedly while scanning.
+            // Reposting every announcement floods the UI thread, so drop the ones
+            // that would not change what the drawer shows.
+            StringBuilder signature = new();
+            signature.Append(scanning);
+            foreach (var device in devices)
+            {
+                signature.Append('|').Append(device.id)
+                    .Append('\u001f').Append(device.name)
+                    .Append('\u001f').Append(device.protocolLabel)
+                    .Append('\u001f').Append(device.kind)
+                    .Append('\u001f').Append(device.available)
+                    .Append('\u001f').Append(device.volume)
+                    .Append('\u001f').Append(device.seek);
+            }
+
+            string current = signature.ToString();
+            if (Interlocked.Exchange(ref lastDevices, current) == current)
+            {
+                return;
+            }
+
             post("castDevices", new
             {
                 type = "castDevices",
-                scanning = broker.Scanning || discoveryHeld,
-                devices = broker.Devices.Select(device => new
-                {
-                    id = device.Id,
-                    name = device.Name,
-                    type = device.Type,
-                    protocolLabel = device.ProtocolLabel,
-                    kind = device.Kind,
-                    available = device.Available,
-                    volume = device.Volume,
-                    seek = device.Seek
-                }).ToArray()
+                scanning,
+                devices
             });
         }
 

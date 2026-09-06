@@ -99,7 +99,6 @@ const state = {
   playbackTarget: "local",
   connectingDeviceId: null,
   castDevices: [],
-  castScanning: false,
   castError: null,
   castVolumeAvailable: false,
   remotePosition: 0,
@@ -137,6 +136,10 @@ const muteBtn = document.getElementById("muteBtn");
 const deviceBtn = document.getElementById("deviceBtn");
 const deviceDrawerRoot = document.getElementById("deviceDrawerRoot");
 const deviceDrawerBody = document.getElementById("deviceDrawerBody");
+const deviceDrawerStatus = document.getElementById("deviceDrawerStatus");
+const deviceDrawerAlert = document.getElementById("deviceDrawerAlert");
+const deviceDrawerNote = document.getElementById("deviceDrawerNote");
+const deviceRescanBtn = document.getElementById("deviceRescan");
 
 const SESSION_KEY = "emp.playback";
 const LIKED_PLAYLIST_ID = "pl_liked";
@@ -152,6 +155,8 @@ const SEARCH_ALBUM_LIMIT = 12;
 const SEARCH_TRACK_LIMIT = 40;
 const TRACK_ROW_HEIGHT = 58;
 const ARTIST_INFO_TIMEOUT_MS = 15000;
+const DEVICE_SCAN_MS = 6000;
+const DEVICE_DRAWER_EXIT_MS = 280;
 const RESCAN_HOLD_MS = 1000;
 const RESCAN_EXPAND_MS = 220;
 const artistInfoCache = new Map();
@@ -166,8 +171,8 @@ let pendingHandoff = null;
 let remoteClock = 0;
 let remoteAdvanceAt = 0;
 let deviceDrawerCloseTimer = 0;
-let deviceScanStarted = 0;
-let deviceScanWaitTimer = 0;
+let deviceScanTimer = 0;
+let deviceScanUntil = 0;
 
 function readSession() {
   try {
@@ -722,72 +727,162 @@ function deviceDrawerIsOpen() {
   return Boolean(deviceDrawerRoot && !deviceDrawerRoot.hidden);
 }
 
+function deviceScanActive() {
+  return deviceScanUntil > Date.now();
+}
+
+function beginDeviceScan() {
+  deviceScanUntil = Date.now() + DEVICE_SCAN_MS;
+  window.clearTimeout(deviceScanTimer);
+  deviceScanTimer = window.setTimeout(() => {
+    deviceScanTimer = 0;
+    renderDeviceDrawer();
+  }, DEVICE_SCAN_MS + 150);
+}
+
+function deviceRowMarkup(options) {
+  const classes = ["device-row"];
+  if (options.active) {
+    classes.push("is-active");
+  }
+  if (options.offline) {
+    classes.push("is-offline");
+  }
+
+  let mark = "";
+  if (options.connecting) {
+    mark = '<span class="device-spinner" aria-hidden="true"></span>';
+  } else if (options.active) {
+    mark = state.playing ? nowEqMarkup() : '<i class="bi bi-check-lg" aria-hidden="true"></i>';
+  }
+
+  const tag = options.tag ? `<span class="device-row-tag">${escapeHtml(options.tag)}</span>` : "";
+  const status = options.status ? `<span>${escapeHtml(options.status)}</span>` : "";
+
+  return `
+    <button class="${classes.join(" ")}" type="button" data-cast-device="${escapeHtml(options.id)}"
+      aria-pressed="${options.active ? "true" : "false"}"${options.offline ? " disabled" : ""}>
+      <span class="device-row-icon" aria-hidden="true"><i class="bi ${options.icon}"></i></span>
+      <span class="device-row-copy">
+        <span class="device-row-name">${escapeHtml(options.name)}</span>
+        <span class="device-row-meta">${tag}${status}</span>
+      </span>
+      <span class="device-row-mark">${mark}</span>
+    </button>
+  `;
+}
+
+function deviceSkeletonMarkup(count) {
+  const row = `
+    <div class="device-skeleton" aria-hidden="true">
+      <span class="device-skeleton-icon"></span>
+      <div class="device-skeleton-copy">
+        <span class="device-skeleton-name"></span>
+        <span class="device-skeleton-meta"></span>
+      </div>
+    </div>
+  `;
+  return row.repeat(count);
+}
+
+function renderDeviceDrawerChrome(devices, scanning) {
+  if (deviceDrawerAlert) {
+    // Pinned outside the scrolling list so a connection failure stays visible.
+    deviceDrawerAlert.innerHTML = state.castError
+      ? `<div class="device-error">
+           <i class="bi bi-exclamation-circle-fill" aria-hidden="true"></i>
+           <span>${escapeHtml(state.castError)}</span>
+         </div>`
+      : "";
+    deviceDrawerAlert.hidden = !state.castError;
+  }
+
+  if (deviceDrawerStatus) {
+    let text = "Choose where to play";
+    if (isConnectingPlayback()) {
+      text = "Connecting…";
+    } else if (isRemotePlayback()) {
+      const active = devices.find((device) => device.id === state.playbackTarget);
+      text = active ? `Playing on ${active.name}` : "Playing on a remote device";
+    } else if (scanning && !devices.length) {
+      text = "Looking for devices…";
+    }
+    const dot = scanning && !isRemotePlayback()
+      ? '<span class="device-scan-dot" aria-hidden="true"></span>'
+      : "";
+    deviceDrawerStatus.innerHTML = `${dot}<span>${escapeHtml(text)}</span>`;
+  }
+
+  if (deviceDrawerNote) {
+    deviceDrawerNote.innerHTML = isRemotePlayback()
+      ? '<i class="bi bi-info-circle" aria-hidden="true"></i><span>Equalizer and sound processing stay on this computer.</span>'
+      : "";
+  }
+
+  if (deviceRescanBtn) {
+    // Left enabled so it keeps its place in the tab order; rescanDevices ignores
+    // the click while a scan is already running.
+    deviceRescanBtn.classList.toggle("is-scanning", scanning);
+    deviceRescanBtn.setAttribute("aria-disabled", scanning ? "true" : "false");
+  }
+}
+
 function renderDeviceDrawer() {
-  if (!deviceDrawerBody) {
+  if (!deviceDrawerBody || !deviceDrawerIsOpen()) {
     return;
   }
 
-  const localActive = !isRemotePlayback();
   const devices = Array.isArray(state.castDevices) ? state.castDevices : [];
-  const rows = devices.map((device) => {
-    const connected = state.playbackTarget === device.id;
-    const connecting = state.connectingDeviceId === device.id;
-    const icon = device.kind === "tv" ? "bi-tv" : "bi-speaker";
-    let mark = "";
-    if (connected) {
-      mark = '<i class="bi bi-check-lg"></i>';
-    } else if (connecting) {
-      mark = "…";
-    }
-    const meta = connecting ? "Connecting…" : (device.protocolLabel || "");
-    return `
-      <button class="device-row" type="button" data-cast-device="${escapeHtml(device.id)}">
-        <span class="device-row-icon" aria-hidden="true"><i class="bi ${icon}"></i></span>
-        <span class="device-row-copy">
-          <span class="device-row-name">${escapeHtml(device.name || "Device")}</span>
-          <span class="device-row-meta">${escapeHtml(meta)}</span>
-        </span>
-        <span class="device-row-mark">${mark}</span>
-      </button>
-    `;
-  }).join("");
+  const scanning = deviceScanActive();
+  const localActive = !isRemotePlayback() && !isConnectingPlayback();
 
-  let available = "";
-  if (!devices.length) {
-    const waited = Date.now() - (deviceScanStarted || Date.now()) > 8000;
-    available = !waited
-      ? `<div class="device-empty">
-           <div class="device-scan"><span class="device-scan-dot"></span>Looking for devices…</div>
-         </div>`
-      : `<div class="device-empty">
-           <h3>No devices found</h3>
-           <p>Make sure your devices are on the same network.</p>
-           ${state.castScanning ? `<div class="device-scan" style="margin-top:16px"><span class="device-scan-dot"></span>Looking for devices…</div>` : ""}
-         </div>`;
+  const local = deviceRowMarkup({
+    id: "local",
+    name: "This computer",
+    icon: "bi-pc-display",
+    active: localActive,
+    status: localActive ? "Playing here" : "Local playback"
+  });
+
+  let discovered;
+  if (devices.length) {
+    const rows = devices.map((device) => {
+      const active = state.playbackTarget === device.id;
+      const connecting = state.connectingDeviceId === device.id;
+      let status = "";
+      if (connecting) {
+        status = "Connecting…";
+      } else if (active) {
+        status = "Connected";
+      } else if (device.available === false) {
+        status = "Unavailable";
+      }
+      return deviceRowMarkup({
+        id: device.id,
+        name: device.name || "Device",
+        icon: device.kind === "tv" ? "bi-tv" : "bi-speaker",
+        tag: device.protocolLabel,
+        active,
+        connecting,
+        offline: device.available === false && !active && !connecting,
+        status
+      });
+    }).join("");
+    discovered = `<div class="device-section-label">Available devices</div>${rows}`;
+  } else if (scanning) {
+    discovered = `<div class="device-section-label">Available devices</div>${deviceSkeletonMarkup(3)}`;
   } else {
-    available = `<div class="device-section-label">Available devices</div>${rows}`;
+    discovered = `
+      <div class="device-empty">
+        <div class="device-empty-icon" aria-hidden="true"><i class="bi bi-wifi-off"></i></div>
+        <h3>No devices found</h3>
+        <p>Make sure your speaker or TV is switched on and joined to this network, then try again.</p>
+      </div>
+    `;
   }
 
-  const error = state.castError
-    ? `<div class="device-error">${escapeHtml(state.castError)}</div>`
-    : "";
-  const note = isRemotePlayback()
-    ? `<div class="device-note">Sound processing stays on this computer.</div>`
-    : "";
-
-  deviceDrawerBody.innerHTML = `
-    <button class="device-row" type="button" data-cast-device="local">
-      <span class="device-row-icon" aria-hidden="true"><i class="bi bi-pc-display"></i></span>
-      <span class="device-row-copy">
-        <span class="device-row-name">This computer</span>
-        <span class="device-row-meta">${localActive ? "Playing here" : "EMP"}</span>
-      </span>
-      <span class="device-row-mark">${localActive ? '<i class="bi bi-check-lg"></i>' : ""}</span>
-    </button>
-    ${available}
-    ${error}
-    ${note}
-  `;
+  deviceDrawerBody.innerHTML = `${local}${discovered}`;
+  renderDeviceDrawerChrome(devices, scanning);
 }
 
 function openDeviceDrawer() {
@@ -795,31 +890,49 @@ function openDeviceDrawer() {
     return;
   }
   window.clearTimeout(deviceDrawerCloseTimer);
-  window.clearTimeout(deviceScanWaitTimer);
-  deviceScanStarted = Date.now();
+  deviceDrawerCloseTimer = 0;
   deviceDrawerRoot.hidden = false;
   requestAnimationFrame(() => deviceDrawerRoot.classList.add("is-open"));
   state.castError = null;
   postCastDiscovery(true);
+  beginDeviceScan();
   renderDeviceDrawer();
-  deviceScanWaitTimer = window.setTimeout(() => {
-    if (deviceDrawerIsOpen()) {
-      renderDeviceDrawer();
-    }
-  }, 8200);
+  const first = deviceDrawerBody?.querySelector(".device-row:not([disabled])");
+  first?.focus({ preventScroll: true });
 }
 
 function closeDeviceDrawer() {
   if (!deviceDrawerRoot || deviceDrawerRoot.hidden) {
     return;
   }
+  window.clearTimeout(deviceScanTimer);
+  deviceScanTimer = 0;
+  deviceScanUntil = 0;
   deviceDrawerRoot.classList.remove("is-open");
+  window.clearTimeout(deviceDrawerCloseTimer);
   deviceDrawerCloseTimer = window.setTimeout(() => {
+    deviceDrawerCloseTimer = 0;
     deviceDrawerRoot.hidden = true;
-  }, 220);
+  }, DEVICE_DRAWER_EXIT_MS);
   if (!isRemotePlayback() && !isConnectingPlayback()) {
     postCastDiscovery(false);
   }
+  if (deviceDrawerRoot.contains(document.activeElement)) {
+    deviceBtn?.focus({ preventScroll: true });
+  }
+}
+
+function rescanDevices() {
+  if (deviceScanActive()) {
+    return;
+  }
+  state.castError = null;
+  // Cycling discovery restarts the SSDP and Cast searches straight away instead
+  // of waiting out the current polling interval.
+  postCastDiscovery(false);
+  postCastDiscovery(true);
+  beginDeviceScan();
+  renderDeviceDrawer();
 }
 
 function selectPlaybackDevice(deviceId) {
@@ -892,7 +1005,6 @@ function handleCastMessage(detail) {
 
   if (detail.type === "castDevices") {
     state.castDevices = Array.isArray(detail.devices) ? detail.devices : [];
-    state.castScanning = detail.scanning !== false;
     renderDeviceDrawer();
     return;
   }
@@ -5377,6 +5489,26 @@ deviceDrawerRoot?.addEventListener("click", (event) => {
 document.getElementById("deviceDrawerClose")?.addEventListener("click", (event) => {
   event.stopPropagation();
   closeDeviceDrawer();
+});
+
+deviceRescanBtn?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  rescanDevices();
+});
+
+deviceDrawerRoot?.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") {
+    return;
+  }
+  const focusable = [...deviceDrawerRoot.querySelectorAll("button:not([disabled])")];
+  if (!focusable.length) {
+    return;
+  }
+  const edge = event.shiftKey ? focusable[0] : focusable[focusable.length - 1];
+  if (document.activeElement === edge) {
+    event.preventDefault();
+    (event.shiftKey ? focusable[focusable.length - 1] : focusable[0]).focus();
+  }
 });
 
 shuffleBtn.addEventListener("click", () => {

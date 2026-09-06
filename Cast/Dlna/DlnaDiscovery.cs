@@ -17,6 +17,7 @@ namespace EMP.Cast.Dlna
         private CancellationTokenSource? lifetime;
         private Task? loop;
         private Task? notifyLoop;
+        private Task drain = Task.CompletedTask;
         private bool started;
 
         public event Action? Changed;
@@ -80,49 +81,63 @@ namespace EMP.Cast.Dlna
 
                 started = true;
                 lifetime = new CancellationTokenSource();
-                loop = Task.Run(() => RunAsync(lifetime.Token));
-                notifyLoop = Task.Run(() => ListenNotifyAsync(lifetime.Token));
+                CancellationToken token = lifetime.Token;
+                Task previous = drain;
+                // The NOTIFY listener owns UDP port 1900. Waiting for the previous
+                // run to release it keeps a restart from stacking up listeners that
+                // each re-broadcast every packet as a device change.
+                loop = Task.Run(async () =>
+                {
+                    await previous.ConfigureAwait(false);
+                    await RunAsync(token).ConfigureAwait(false);
+                });
+                notifyLoop = Task.Run(async () =>
+                {
+                    await previous.ConfigureAwait(false);
+                    await ListenNotifyAsync(token).ConfigureAwait(false);
+                });
             }
         }
 
-        public void Stop()
+        public Task StopAsync()
         {
-            CancellationTokenSource? stopping;
-            Task? running;
-            Task? notify;
             lock (gate)
             {
                 if (!started)
                 {
-                    return;
+                    return drain;
                 }
 
                 started = false;
-                stopping = lifetime;
-                running = loop;
-                notify = notifyLoop;
+                CancellationTokenSource? stopping = lifetime;
+                Task? running = loop;
+                Task? notify = notifyLoop;
                 lifetime = null;
                 loop = null;
                 notifyLoop = null;
+                drain = Task.Run(() => DrainAsync(stopping, running, notify));
+                return drain;
             }
+        }
 
+        private static async Task DrainAsync(CancellationTokenSource? stopping, Task? running, Task? notify)
+        {
             stopping?.Cancel();
-            try
+            foreach (Task? task in new[] { running, notify })
             {
-                running?.Wait(TimeSpan.FromSeconds(2));
-            }
-            catch (Exception)
-            {
-                // Discovery must not block shutdown.
-            }
+                if (task is null)
+                {
+                    continue;
+                }
 
-            try
-            {
-                notify?.Wait(TimeSpan.FromSeconds(2));
-            }
-            catch (Exception)
-            {
-                // Notify listener must not block shutdown.
+                try
+                {
+                    await task.ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // Each loop swallows its own failures; nothing to salvage here.
+                }
             }
 
             stopping?.Dispose();
@@ -130,7 +145,16 @@ namespace EMP.Cast.Dlna
 
         public void Dispose()
         {
-            Stop();
+            Task stopping = StopAsync();
+            try
+            {
+                stopping.Wait(TimeSpan.FromSeconds(3));
+            }
+            catch (Exception)
+            {
+                // Discovery must not block shutdown.
+            }
+
             lock (gate)
             {
                 devices.Clear();
@@ -188,15 +212,24 @@ namespace EMP.Cast.Dlna
                 }
 
                 DlnaLog.Write("SSDP NOTIFY listener started.");
+
+                // A receive already in flight does not observe the token, so close the
+                // socket on cancellation to unblock it and release port 1900 promptly.
+                UdpClient listening = client;
+                using CancellationTokenRegistration closing = cancellationToken.Register(listening.Dispose);
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    UdpReceiveResult result = await client.ReceiveAsync(cancellationToken);
+                    UdpReceiveResult result = await listening.ReceiveAsync(cancellationToken);
                     HandleSsdpPacket(Encoding.ASCII.GetString(result.Buffer), cancellationToken);
                 }
             }
             catch (OperationCanceledException)
             {
                 // Stopped.
+            }
+            catch (Exception) when (cancellationToken.IsCancellationRequested)
+            {
+                // The socket was closed to end the pending receive.
             }
             catch (Exception ex)
             {
@@ -205,6 +238,7 @@ namespace EMP.Cast.Dlna
             finally
             {
                 client?.Dispose();
+                DlnaLog.Write("SSDP NOTIFY listener stopped.");
             }
         }
 

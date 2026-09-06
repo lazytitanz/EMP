@@ -118,6 +118,7 @@ namespace EMP.Cast
 
         void Start();
 
-        void Stop();
+        // Callers run on the UI thread, so shutdown must never block it.
+        Task StopAsync();
     }
 }

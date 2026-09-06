@@ -4,6 +4,8 @@ namespace EMP.Cast
     {
         private readonly Google.GoogleCastDiscovery cast = new();
         private readonly Dlna.DlnaDiscovery dlna = new();
+        private readonly object gate = new();
+        private Task drain = Task.CompletedTask;
         private bool started;
 
         public DeviceBroker()
@@ -74,33 +76,40 @@ namespace EMP.Cast
 
         public void Start()
         {
-            if (started)
+            lock (gate)
             {
-                return;
+                if (started)
+                {
+                    return;
+                }
+
+                started = true;
+                Scanning = true;
             }
 
-            started = true;
-            Scanning = true;
             cast.Start();
             dlna.Start();
         }
 
-        public void Stop()
+        public Task StopAsync()
         {
-            if (!started)
+            lock (gate)
             {
-                return;
-            }
+                if (!started)
+                {
+                    return drain;
+                }
 
-            started = false;
-            Scanning = false;
-            cast.Stop();
-            dlna.Stop();
+                started = false;
+                Scanning = false;
+                drain = Task.WhenAll(cast.StopAsync(), dlna.StopAsync());
+                return drain;
+            }
         }
 
         public void Dispose()
         {
-            Stop();
+            _ = StopAsync();
             cast.Changed -= ChangedHandler;
             dlna.Changed -= ChangedHandler;
             dlna.DeviceLeft -= DeviceLeftHandler;
