@@ -3,8 +3,11 @@ using System.Runtime.InteropServices;
 namespace EMP.Hosting
 {
     /// <summary>
-    /// Borderless frame helper: resize-edge hit testing and maximize work-area bounds.
-    /// Caption drag is owned by WebView2 non-client regions (app-region), not HTCAPTION here.
+    /// Borderless frame helper: resize-edge hit testing, maximize work-area bounds,
+    /// and caption drag started from WebView pointer events (BeginDrag).
+    /// CSS app-region is used only on the dedicated window-chrome strip; the in-page
+    /// top bar uses BeginDrag because Chromium app-region ignores scroll occlusion.
+    /// Native WM_NCHITTEST never returns HTCAPTION.
     /// </summary>
     internal sealed class CustomWindowChrome
     {
@@ -13,6 +16,7 @@ namespace EMP.Hosting
         private const int WmDwmCompositionChanged = 0x031E;
 
         private const int HtClient = 1;
+        private const int HtCaption = 2;
         private const int HtLeft = 10;
         private const int HtRight = 11;
         private const int HtTop = 12;
@@ -22,6 +26,7 @@ namespace EMP.Hosting
         private const int HtBottomLeft = 16;
         private const int HtBottomRight = 17;
 
+        private const int WmNcLButtonDown = 0x00A1;
         private const int WsThickFrame = 0x00040000;
         private const int WsMinimizeBox = 0x00020000;
         private const int WsMaximizeBox = 0x00010000;
@@ -101,6 +106,25 @@ namespace EMP.Hosting
             form.WindowState = form.WindowState == FormWindowState.Maximized
                 ? FormWindowState.Normal
                 : FormWindowState.Maximized;
+        }
+
+        /// <summary>
+        /// Starts a native caption drag from a client-area pointer event.
+        /// Used for the in-page top bar where CSS app-region loses to scrolled content.
+        /// </summary>
+        public void BeginDrag()
+        {
+            if (!form.IsHandleCreated || form.WindowState == FormWindowState.Minimized)
+            {
+                return;
+            }
+
+            _ = NativeMethods.ReleaseCapture();
+            _ = NativeMethods.SendMessage(
+                form.Handle,
+                WmNcLButtonDown,
+                (IntPtr)HtCaption,
+                IntPtr.Zero);
         }
 
         private bool HandleNcHitTest(ref Message message)
@@ -237,6 +261,12 @@ namespace EMP.Hosting
 
         private static class NativeMethods
         {
+            [DllImport("user32.dll")]
+            public static extern bool ReleaseCapture();
+
+            [DllImport("user32.dll")]
+            public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
             [DllImport("dwmapi.dll", PreserveSig = true)]
             public static extern int DwmSetWindowAttribute(
                 IntPtr hwnd,

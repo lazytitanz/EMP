@@ -249,7 +249,7 @@ namespace EMP.Hosting
                 return;
             }
 
-            if (action is not ("minimize" or "maximizeToggle" or "close"))
+            if (action is not ("minimize" or "maximizeToggle" or "close" or "drag"))
             {
                 return;
             }

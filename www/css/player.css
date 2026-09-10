@@ -62,6 +62,7 @@ input {
   align-items: stretch;
   min-height: var(--window-chrome-height);
   background: transparent;
+  position: relative;
   app-region: drag;
   -webkit-app-region: drag;
   z-index: 30;
@@ -70,6 +71,9 @@ input {
 .window-chrome-drag {
   flex: 1 1 auto;
   min-width: 0;
+  min-height: 100%;
+  app-region: drag;
+  -webkit-app-region: drag;
 }
 
 .window-controls {
@@ -124,13 +128,16 @@ input {
   color: #fff;
 }
 
-.sidebar,
-.main-stage,
-.player-bar,
-.top-bar,
-.top-bar *,
-.sidebar *,
-.player-bar * {
+/* Window controls and in-page nav controls must not start a drag.
+   Do NOT mark .view-area (or other scrollers) as no-drag — Chromium's
+   app-region hit testing ignores scroll occlusion, so scrolled no-drag
+   content steals the title-bar drag region after you scroll a long page. */
+.top-bar .history-controls,
+.top-bar .circle-btn,
+.top-bar .top-search,
+.top-bar .top-search input,
+.top-bar .top-collection-play,
+.top-bar button {
   app-region: no-drag;
   -webkit-app-region: no-drag;
 }
@@ -1044,6 +1051,10 @@ img.album-hero-cover {
   z-index: 5;
   background: transparent;
   transition: background 0.18s ease, box-shadow 0.18s ease;
+  /* Drag is started via JS → native BeginDrag. CSS app-region on this
+     bar loses to scrolled playlist content (Chromium annotated-region bug). */
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .top-bar.is-scrolled {

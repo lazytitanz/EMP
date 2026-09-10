@@ -5783,6 +5783,35 @@ function postWindowAction(action) {
   window.chrome?.webview?.postMessage({ type: "window", action });
 }
 
+function isWindowDragExempt(target) {
+  return Boolean(
+    target?.closest?.(
+      "button, input, a, select, textarea, label, .window-control, .window-controls, .sidebar-resize, .slider"
+    )
+  );
+}
+
+function bindWindowDragRegion(element) {
+  if (!element) {
+    return;
+  }
+
+  element.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.detail > 1 || isWindowDragExempt(event.target)) {
+      return;
+    }
+    postWindowAction("drag");
+  });
+
+  element.addEventListener("dblclick", (event) => {
+    if (isWindowDragExempt(event.target)) {
+      return;
+    }
+    event.preventDefault();
+    postWindowAction("maximizeToggle");
+  });
+}
+
 function applyHostWindowState(detail) {
   const maximized = Boolean(detail?.maximized);
   document.documentElement.classList.toggle("is-window-maximized", maximized);
@@ -5814,6 +5843,9 @@ document.getElementById("winMaximize")?.addEventListener("click", () => {
 document.getElementById("winClose")?.addEventListener("click", () => {
   postWindowAction("close");
 });
+
+bindWindowDragRegion(document.getElementById("topBar"));
+bindWindowDragRegion(document.querySelector(".window-chrome-drag"));
 
 applySidebarLayout();
 syncSidebarSortUi();

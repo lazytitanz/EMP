@@ -159,6 +159,9 @@ namespace EMP.Forms
                     case "maximizeToggle":
                         windowChrome?.ToggleMaximize();
                         break;
+                    case "drag":
+                        windowChrome?.BeginDrag();
+                        break;
                     case "close":
                         Close();
                         break;
