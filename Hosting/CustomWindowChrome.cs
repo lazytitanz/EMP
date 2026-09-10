@@ -12,8 +12,11 @@ namespace EMP.Hosting
     internal sealed class CustomWindowChrome
     {
         private const int WmNcHitTest = 0x0084;
+        private const int WmNcCalcSize = 0x0083;
+        private const int WmNcActivate = 0x0086;
         private const int WmGetMinMaxInfo = 0x0024;
         private const int WmDwmCompositionChanged = 0x031E;
+        private const int WmNcLButtonDown = 0x00A1;
 
         private const int HtClient = 1;
         private const int HtCaption = 2;
@@ -26,21 +29,24 @@ namespace EMP.Hosting
         private const int HtBottomLeft = 16;
         private const int HtBottomRight = 17;
 
-        private const int WmNcLButtonDown = 0x00A1;
         private const int WsThickFrame = 0x00040000;
         private const int WsMinimizeBox = 0x00020000;
         private const int WsMaximizeBox = 0x00010000;
         private const int WsSysMenu = 0x00080000;
 
+        private const int SmCxFrame = 32;
+        private const int SmCyFrame = 33;
+        private const int SmCPaddedBorder = 92;
+
         private const int DwmwaWindowCornerPreference = 33;
         private const int DwmwaBorderColor = 34;
         private const int DwmwaCaptionColor = 35;
-        private const int DwmWcpDefault = 0;
+        private const int DwmwaVisibleFrameBorderThickness = 37;
         private const int DwmWcpDonotround = 1;
         private const int DwmWcpRound = 2;
-        // COLORREF black — hides the Win11 light system border that otherwise
-        // shows as a 1px white strip along the top of borderless windows.
-        private const int DwmColorBlack = 0x000000;
+        // DWMWA_COLOR_NONE — suppress the Win11 system border. Painting it black
+        // still flashes a light inactive outline when the window loses focus.
+        private const uint DwmColorNone = 0xFFFFFFFE;
 
         // Match EMP shell --gap so the resize margin reads as the existing black gutter.
         private const int ResizeBorderDip = 8;
@@ -82,11 +88,31 @@ namespace EMP.Hosting
         {
             switch (message.Msg)
             {
+                case WmNcCalcSize:
+                    // Client area fills the entire window so WS_THICKFRAME does not
+                    // leave an invisible non-client inset (maximize gaps / side strips).
+                    if (message.WParam != IntPtr.Zero)
+                    {
+                        message.Result = IntPtr.Zero;
+                        return true;
+                    }
+
+                    return false;
                 case WmNcHitTest:
                     return HandleNcHitTest(ref message);
                 case WmGetMinMaxInfo:
                     HandleGetMinMaxInfo(message.LParam);
                     message.Result = IntPtr.Zero;
+                    return true;
+                case WmNcActivate:
+                    // Keep processing activation, but skip the default non-client
+                    // redraw that paints the inactive white/light system border.
+                    message.Result = NativeMethods.DefWindowProc(
+                        form.Handle,
+                        WmNcActivate,
+                        message.WParam,
+                        (IntPtr)(-1));
+                    SyncFrameChrome();
                     return true;
                 case WmDwmCompositionChanged:
                     SyncFrameChrome();
@@ -194,14 +220,20 @@ namespace EMP.Hosting
             MinMaxInfo info = Marshal.PtrToStructure<MinMaxInfo>(lParam);
             Screen screen = Screen.FromHandle(form.Handle);
             Rectangle work = screen.WorkingArea;
-            Rectangle bounds = screen.Bounds;
+            Rectangle monitor = screen.Bounds;
 
-            info.PtMaxPosition.X = work.Left - bounds.Left;
-            info.PtMaxPosition.Y = work.Top - bounds.Top;
-            info.PtMaxSize.X = work.Width;
-            info.PtMaxSize.Y = work.Height;
-            info.PtMaxTrackSize.X = work.Width;
-            info.PtMaxTrackSize.Y = work.Height;
+            // Borderless + WS_THICKFRAME still reserves a resize frame when
+            // maximizing. Inflate so the visible client fills the work area
+            // instead of leaving desktop gaps on every side.
+            int frameX = GetFrameThickness(SmCxFrame);
+            int frameY = GetFrameThickness(SmCyFrame);
+
+            info.PtMaxPosition.X = work.Left - monitor.Left - frameX;
+            info.PtMaxPosition.Y = work.Top - monitor.Top - frameY;
+            info.PtMaxSize.X = work.Width + (frameX * 2);
+            info.PtMaxSize.Y = work.Height + (frameY * 2);
+            info.PtMaxTrackSize.X = info.PtMaxSize.X;
+            info.PtMaxTrackSize.Y = info.PtMaxSize.Y;
 
             Size min = form.MinimumSize;
             if (min.Width > 0)
@@ -215,6 +247,14 @@ namespace EMP.Hosting
             }
 
             Marshal.StructureToPtr(info, lParam, false);
+        }
+
+        private int GetFrameThickness(int frameMetric)
+        {
+            int dpi = form.IsHandleCreated ? form.DeviceDpi : 96;
+            int frame = NativeMethods.GetSystemMetricsForDpi(frameMetric, dpi);
+            int padded = NativeMethods.GetSystemMetricsForDpi(SmCPaddedBorder, dpi);
+            return Math.Max(0, frame + padded);
         }
 
         private int ResizeBorderThickness()
@@ -239,18 +279,25 @@ namespace EMP.Hosting
                     ref corner,
                     sizeof(int));
 
-                int borderColor = DwmColorBlack;
+                uint borderColor = DwmColorNone;
                 _ = NativeMethods.DwmSetWindowAttribute(
                     form.Handle,
                     DwmwaBorderColor,
                     ref borderColor,
-                    sizeof(int));
+                    sizeof(uint));
 
-                int captionColor = DwmColorBlack;
+                uint captionColor = DwmColorNone;
                 _ = NativeMethods.DwmSetWindowAttribute(
                     form.Handle,
                     DwmwaCaptionColor,
                     ref captionColor,
+                    sizeof(uint));
+
+                int borderThickness = 0;
+                _ = NativeMethods.DwmSetWindowAttribute(
+                    form.Handle,
+                    DwmwaVisibleFrameBorderThickness,
+                    ref borderThickness,
                     sizeof(int));
             }
             catch (Exception)
@@ -267,11 +314,24 @@ namespace EMP.Hosting
             [DllImport("user32.dll")]
             public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+            [DllImport("user32.dll")]
+            public static extern int GetSystemMetricsForDpi(int index, int dpi);
+
+            [DllImport("user32.dll")]
+            public static extern IntPtr DefWindowProc(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
             [DllImport("dwmapi.dll", PreserveSig = true)]
             public static extern int DwmSetWindowAttribute(
                 IntPtr hwnd,
                 int attribute,
                 ref int attributeValue,
+                int attributeSize);
+
+            [DllImport("dwmapi.dll", PreserveSig = true)]
+            public static extern int DwmSetWindowAttribute(
+                IntPtr hwnd,
+                int attribute,
+                ref uint attributeValue,
                 int attributeSize);
         }
 
