@@ -13,6 +13,12 @@
 [![C#](https://img.shields.io/badge/C%23-239120?logo=csharp&logoColor=white)](https://github.com/lazytitanz/EMP)
 [![GitHub last commit](https://img.shields.io/github/last-commit/lazytitanz/EMP)](https://github.com/lazytitanz/EMP/commits/main)
 
+## Download
+
+Download the latest Windows release from the [Releases page](https://github.com/lazytitanz/EMP/releases/latest).
+
+Extract the downloaded archive, then run **EMP.exe**. EMP does not require installation.
+
 EMP is a modern music player for Windows built around the music you already own.
 
 It combines a familiar, streaming-style interface with local playback, library management, playlists, audio controls, and network playback — without requiring a streaming service or account.
