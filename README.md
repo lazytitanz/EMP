@@ -11,49 +11,61 @@
 [![Windows](https://img.shields.io/badge/Windows-10%2B-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![.NET](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/download)
 [![C#](https://img.shields.io/badge/C%23-239120?logo=csharp&logoColor=white)](https://github.com/lazytitanz/EMP)
-[![Local only](https://img.shields.io/badge/playback-local%20only-1DB954)](#why-emp)
 [![GitHub last commit](https://img.shields.io/github/last-commit/lazytitanz/EMP)](https://github.com/lazytitanz/EMP/commits/main)
 
-EMP is a local music player for Windows. It was built to feel familiar if you already know Spotify, without streaming, accounts, social features, or AI.
+EMP is a modern music player for Windows built around the music you already own.
 
-Playback stays on your machine. EMP scans the folders you choose, plays the files that are already there, and keeps the rest of the app small on purpose.
-
-## Why EMP
-
-Streaming apps are useful, but they also come with a lot of extra surface: recommendations, cloud libraries, accounts, and now AI. EMP is the opposite of that.
-
-- **Familiar layout** — sidebar, library, search, and a bottom player bar
-- **Local only** — your files, your folders, no streaming catalog
-- **No AI** — no recommendations, generated playlists, or assistant features
-- **Simple by design** — play music, keep a library, and get out of the way
+It combines a familiar, streaming-style interface with local playback, library management, playlists, audio controls, and network playback — without requiring a streaming service or account.
 
 ## Features
 
-- Home, library, search, and settings
-- Albums, singles, artists, tracks, playlists, and Liked Songs
-- Home greeting with quick picks and recently played
-- Collapsible sidebar with library search and recents sorting
-- Grid or list library views, with colors pulled from album art
-- Shuffle, repeat, seek, volume, and system media controls
-- Crossfade, gapless playback, volume normalize, and an equalizer with presets
+### Your music library
+
+Add one or more music folders and EMP will organize your collection into albums, artists, singles, tracks, and playlists. Changes to your music folders are detected automatically, so your library stays up to date.
+
+- Albums, artists, singles, tracks, playlists, and Liked Songs
+- Library search with grid and list views
+- Recently played music and quick picks
 - Create, edit, and delete playlists
-- Artist pages with optional MusicBrainz genre and origin info
-- Watches your music folders and refreshes when files change
-- Tray icon, optional start with Windows, and taskbar playback buttons
-- Session restore so the last queue and position come back after a restart
+- Automatic library updates when files change
+- Optional artist information from MusicBrainz
+- Artwork-driven colors throughout the interface
 
-Supported audio types include MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, and ALAC.
+### Playback
 
-## Cast to a device
+EMP includes the controls you'd expect from a full desktop music player while keeping playback local to your PC.
 
-EMP can play on this computer or send audio to a speaker or TV on your local network.
+- Shuffle and repeat
+- Seek and volume controls
+- Crossfade and gapless playback
+- Volume normalization
+- Equalizer with presets
+- Windows system media controls
+- Taskbar playback controls
+- Session restore for your queue, track, and playback position
 
-- **Google Cast** — Chromecast and Cast-enabled speakers
-- **DLNA** — UPnP media renderers on the same LAN
+Supported audio formats include **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, and ALAC**.
 
-Open **Connect to a device** in the player bar, then pick a device. Files are served from your PC; there is no cloud streaming and no transcoding. If a device cannot play a format, switch back to this computer or use a file type that device supports.
+### Connect to a device
 
-Crossfade, gapless playback, and the equalizer apply to local playback.
+EMP can also play your music through compatible devices on your local network.
+
+- **Google Cast** — Chromecast and Cast-enabled speakers and displays
+- **DLNA / UPnP** — compatible TVs, speakers, and media renderers
+
+Open **Connect to a device** from the player bar and choose where you want to listen.
+
+When casting, the original audio file is served directly from your PC over your local network. EMP does not upload your music to a cloud service or transcode it.
+
+> Audio processing such as the equalizer, crossfade, and gapless playback applies to playback on this computer and is not applied when sending the original file to another device.
+
+## Why EMP?
+
+EMP is for people who keep their own music collection but still want the experience of a modern desktop music app.
+
+There is no streaming catalog to subscribe to and no account required to listen. Choose your music folders and EMP builds the experience around your collection.
+
+The goal is simple: **make a local music library feel as polished and convenient as a modern streaming app.**
 
 ## Requirements
 
@@ -63,18 +75,8 @@ Crossfade, gapless playback, and the equalizer apply to local playback.
 
 ## Build and run
 
+Clone the repository, then run:
+
 ```bash
 dotnet restore
 dotnet run
-```
-
-On first launch, EMP looks in your Windows Music folder. You can add more folders in Settings.
-
-## Settings
-
-Settings stay local on your PC. You can:
-
-- Choose which folders EMP scans, and rescan the library
-- Open EMP when you sign in to Windows (normal or minimized)
-- Minimize to the tray instead of quitting
-- Turn on crossfade, gapless playback, volume normalize, and the equalizer
