@@ -17,6 +17,7 @@
   --sidebar-max: 420px;
   --player-height: 90px;
   --top-bar-height: 56px;
+  --window-chrome-height: 32px;
   --gap: 8px;
   --radius: 8px;
 }
@@ -47,10 +48,97 @@ input {
 .app-shell {
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
-  grid-template-rows: 1fr var(--player-height);
-  gap: var(--gap);
+  grid-template-rows: var(--window-chrome-height) 1fr var(--player-height);
+  column-gap: var(--gap);
+  row-gap: 0;
   height: 100%;
-  padding: var(--gap);
+  padding: 0;
+}
+
+.window-chrome {
+  grid-row: 1;
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: stretch;
+  min-height: var(--window-chrome-height);
+  background: transparent;
+  app-region: drag;
+  -webkit-app-region: drag;
+  z-index: 30;
+}
+
+.window-chrome-drag {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.window-controls {
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  height: 100%;
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+.window-control {
+  width: 46px;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--emp-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: default;
+  transition: background 0.12s ease, color 0.12s ease;
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+.window-control i {
+  pointer-events: none;
+}
+
+.window-control:hover {
+  background: var(--emp-highlight);
+  color: var(--emp-text);
+}
+
+.window-control:active {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.window-control-close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+
+.window-control-close:active {
+  background: #b22a1b;
+  color: #fff;
+}
+
+.sidebar,
+.main-stage,
+.player-bar,
+.top-bar,
+.top-bar *,
+.sidebar *,
+.player-bar * {
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+html.is-window-maximized .sidebar,
+html.is-window-maximized .main-stage,
+html.is-window-maximized .player-bar {
+  border-radius: 0;
 }
 
 .sidebar,
@@ -61,7 +149,7 @@ input {
 }
 
 .sidebar {
-  grid-row: 1;
+  grid-row: 2;
   grid-column: 1;
   display: flex;
   flex-direction: column;
@@ -933,7 +1021,7 @@ img.album-hero-cover {
 }
 
 .main-stage {
-  grid-row: 1;
+  grid-row: 2;
   grid-column: 2;
   display: flex;
   flex-direction: column;
@@ -2291,7 +2379,9 @@ img.album-hero-cover {
 }
 
 .player-bar {
+  grid-row: 3;
   grid-column: 1 / -1;
+  margin-top: var(--gap);
   display: grid;
   grid-template-columns: 1.1fr 1.6fr 1.1fr;
   align-items: center;
@@ -3067,10 +3157,10 @@ img.details-cover {
 
 .device-drawer-root {
   position: fixed;
-  top: var(--gap);
-  left: var(--gap);
-  right: var(--gap);
-  bottom: calc(var(--player-height) + var(--gap) * 2);
+  top: var(--window-chrome-height);
+  left: 0;
+  right: 0;
+  bottom: calc(var(--player-height) + var(--gap));
   z-index: 45;
   display: flex;
   justify-content: flex-end;

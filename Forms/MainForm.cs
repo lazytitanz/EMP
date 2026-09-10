@@ -9,21 +9,30 @@ namespace EMP.Forms
         private TaskbarThumbnailToolbar? thumbnailToolbar;
         private NotifyIcon? trayIcon;
         private ContextMenuStrip? trayMenu;
+        private CustomWindowChrome? windowChrome;
+        private FormWindowState lastReportedWindowState;
 
         public MainForm()
         {
             InitializeComponent();
             ApplyWindowIcon();
+            windowChrome = new CustomWindowChrome(this);
+            windowChrome.Apply();
             AppSettingsStore.Load();
             StartupRegistration.Apply(AppSettingsStore.Current.StartupOnLogin);
             CreateTrayIcon();
             thumbnailToolbar = new TaskbarThumbnailToolbar(this, webView);
             WebUiHost.PlayingChanged += OnPlayingChanged;
+            WebUiHost.WindowActionRequested += OnWindowActionRequested;
+            WebUiHost.IsWindowMaximized = () => WindowState == FormWindowState.Maximized;
             AppSettingsStore.Changed += OnAppSettingsChanged;
             HandleCreated += MainForm_HandleCreated;
             Shown += MainForm_Shown;
             FormClosed += MainForm_FormClosed;
+            Resize += MainForm_Resize;
+            DpiChanged += MainForm_DpiChanged;
             WindowPlacementStore.Restore(this);
+            lastReportedWindowState = WindowState;
             if (IsAutostartLaunch() && AppSettingsStore.Current.StartupOnLogin == "minimized")
             {
                 WindowState = FormWindowState.Minimized;
@@ -31,6 +40,17 @@ namespace EMP.Forms
             if (IsHandleCreated)
             {
                 thumbnailToolbar.TryAdd();
+                windowChrome.SyncFrameChrome();
+            }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams createParams = base.CreateParams;
+                CustomWindowChrome.ModifyCreateParams(createParams);
+                return createParams;
             }
         }
 
@@ -61,9 +81,11 @@ namespace EMP.Forms
 
         private async void MainForm_Load(object sender, EventArgs e)
         {
+            windowChrome?.SyncFrameChrome();
             try
             {
                 await WebUiHost.InitializeAsync(webView);
+                PostWindowState();
             }
             catch (Exception ex)
             {
@@ -81,12 +103,30 @@ namespace EMP.Forms
 
         private void MainForm_HandleCreated(object? sender, EventArgs e)
         {
+            windowChrome?.SyncFrameChrome();
             thumbnailToolbar?.TryAdd();
         }
 
         private void MainForm_Shown(object? sender, EventArgs e)
         {
+            windowChrome?.SyncFrameChrome();
+            PostWindowState();
             BeginInvoke(() => thumbnailToolbar?.TryAdd());
+        }
+
+        private void MainForm_Resize(object? sender, EventArgs e)
+        {
+            windowChrome?.SyncFrameChrome();
+            if (WindowState != lastReportedWindowState)
+            {
+                lastReportedWindowState = WindowState;
+                PostWindowState();
+            }
+        }
+
+        private void MainForm_DpiChanged(object? sender, DpiChangedEventArgs e)
+        {
+            windowChrome?.SyncFrameChrome();
         }
 
         private void OnPlayingChanged(bool playing)
@@ -107,8 +147,45 @@ namespace EMP.Forms
             }
         }
 
+        private void OnWindowActionRequested(string action)
+        {
+            void Apply()
+            {
+                switch (action)
+                {
+                    case "minimize":
+                        windowChrome?.Minimize();
+                        break;
+                    case "maximizeToggle":
+                        windowChrome?.ToggleMaximize();
+                        break;
+                    case "close":
+                        Close();
+                        break;
+                }
+            }
+
+            if (IsHandleCreated && InvokeRequired)
+            {
+                BeginInvoke(Apply);
+                return;
+            }
+
+            Apply();
+        }
+
+        private void PostWindowState()
+        {
+            WebUiHost.PostWindowState(WindowState == FormWindowState.Maximized);
+        }
+
         protected override void WndProc(ref Message m)
         {
+            if (windowChrome?.HandleWndProc(ref m) == true)
+            {
+                return;
+            }
+
             if (thumbnailToolbar?.HandleWndProc(ref m) == true)
             {
                 return;
@@ -212,8 +289,11 @@ namespace EMP.Forms
         {
             AppSettingsStore.Changed -= OnAppSettingsChanged;
             WebUiHost.PlayingChanged -= OnPlayingChanged;
+            WebUiHost.WindowActionRequested -= OnWindowActionRequested;
+            WebUiHost.IsWindowMaximized = null;
             thumbnailToolbar?.Dispose();
             thumbnailToolbar = null;
+            windowChrome = null;
             if (trayIcon is not null)
             {
                 trayIcon.Visible = false;

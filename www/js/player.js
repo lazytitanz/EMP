@@ -5779,6 +5779,42 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach((element) => {
   element.addEventListener("blur", hideTooltip);
 });
 
+function postWindowAction(action) {
+  window.chrome?.webview?.postMessage({ type: "window", action });
+}
+
+function applyHostWindowState(detail) {
+  const maximized = Boolean(detail?.maximized);
+  document.documentElement.classList.toggle("is-window-maximized", maximized);
+
+  const button = document.getElementById("winMaximize");
+  const icon = button?.querySelector("[data-maximize-icon]");
+  if (!button || !icon) {
+    return;
+  }
+
+  const label = maximized ? "Restore" : "Maximize";
+  button.setAttribute("aria-label", label);
+  button.setAttribute("data-bs-title", label);
+  icon.classList.toggle("bi-square", !maximized);
+  icon.classList.toggle("bi-window-stack", maximized);
+
+  const tooltip = bootstrap.Tooltip.getInstance(button);
+  tooltip?.setContent({ ".tooltip-inner": label });
+}
+
+document.getElementById("winMinimize")?.addEventListener("click", () => {
+  postWindowAction("minimize");
+});
+
+document.getElementById("winMaximize")?.addEventListener("click", () => {
+  postWindowAction("maximizeToggle");
+});
+
+document.getElementById("winClose")?.addEventListener("click", () => {
+  postWindowAction("close");
+});
+
 applySidebarLayout();
 syncSidebarSortUi();
 updateLibraryChipsScroll();
@@ -5787,6 +5823,7 @@ syncTopBarScroll();
 window.addEventListener("emp-library", (event) => bindLibrary(event.detail));
 window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.detail));
 window.addEventListener("emp-app-settings", (event) => applyHostAppSettings(event.detail));
+window.addEventListener("emp-window-state", (event) => applyHostWindowState(event.detail));
 window.addEventListener("emp-cast", (event) => handleCastMessage(event.detail));
 if (window.__emp?.library) {
   bindLibrary(window.__emp.library);

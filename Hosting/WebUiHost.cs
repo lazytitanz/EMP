@@ -38,6 +38,10 @@ namespace EMP.Hosting
 
         public static event Action<bool>? PlayingChanged;
 
+        public static event Action<string>? WindowActionRequested;
+
+        public static Func<bool>? IsWindowMaximized { get; set; }
+
         public static async Task InitializeAsync(WebView2 webView)
         {
             ArgumentNullException.ThrowIfNull(webView);
@@ -73,6 +77,7 @@ namespace EMP.Hosting
             settings.AreDefaultContextMenusEnabled = false;
             settings.AreBrowserAcceleratorKeysEnabled = false;
             settings.IsWebMessageEnabled = true;
+            settings.IsNonClientRegionSupportEnabled = true;
 
             try
             {
@@ -117,6 +122,10 @@ namespace EMP.Hosting
                   }
                   if (message.type === 'castDevices' || message.type === 'castStatus' || message.type === 'castError') {
                     window.dispatchEvent(new CustomEvent('emp-cast', { detail: message }));
+                    return;
+                  }
+                  if (message.type === 'windowState') {
+                    window.dispatchEvent(new CustomEvent('emp-window-state', { detail: message }));
                   }
                 });
                 """);
@@ -128,6 +137,7 @@ namespace EMP.Hosting
                     pageLoaded = true;
                     RefreshLibrary();
                     PostAppSettings();
+                    PostWindowState(IsWindowMaximized?.Invoke() ?? false);
                 }
             };
 
@@ -184,6 +194,10 @@ namespace EMP.Hosting
                     {
                         HandleCastCommand(document.RootElement);
                     }
+                    else if (kind == "window")
+                    {
+                        HandleWindowAction(document.RootElement);
+                    }
                 }
                 catch (JsonException)
                 {
@@ -205,9 +219,42 @@ namespace EMP.Hosting
             LibraryMediaIndex.Clear();
             hostView = null;
             pageLoaded = false;
+            IsWindowMaximized = null;
             MappedHosts.Clear();
             RetainedHosts.Clear();
             ActiveMediaHosts.Clear();
+        }
+
+        public static void PostWindowState(bool maximized)
+        {
+            if (hostView?.CoreWebView2 is null)
+            {
+                return;
+            }
+
+            WindowStateMessage message = new()
+            {
+                Type = "windowState",
+                Maximized = maximized
+            };
+
+            hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
+        }
+
+        private static void HandleWindowAction(JsonElement message)
+        {
+            string? action = ReadString(message, "action");
+            if (string.IsNullOrWhiteSpace(action))
+            {
+                return;
+            }
+
+            if (action is not ("minimize" or "maximizeToggle" or "close"))
+            {
+                return;
+            }
+
+            WindowActionRequested?.Invoke(action);
         }
 
         private static void RefreshLibrary(string? requestId = null)
@@ -671,6 +718,13 @@ namespace EMP.Hosting
             public required string StartupOnLogin { get; init; }
 
             public required bool CloseMinimizes { get; init; }
+        }
+
+        private sealed class WindowStateMessage
+        {
+            public required string Type { get; init; }
+
+            public required bool Maximized { get; init; }
         }
 
         private sealed class ArtistInfoMessage

@@ -6,10 +6,25 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=44">
+  <link rel="stylesheet" href="css/player.css?v=45">
 </head>
 <body>
   <div class="app-shell">
+    <div class="window-chrome">
+      <div class="window-chrome-drag" aria-hidden="true"></div>
+      <div class="window-controls">
+        <button class="window-control" type="button" id="winMinimize" aria-label="Minimize" data-bs-toggle="tooltip" data-bs-title="Minimize">
+          <i class="bi bi-dash-lg" aria-hidden="true"></i>
+        </button>
+        <button class="window-control" type="button" id="winMaximize" aria-label="Maximize" data-bs-toggle="tooltip" data-bs-title="Maximize">
+          <i class="bi bi-square" aria-hidden="true" data-maximize-icon></i>
+        </button>
+        <button class="window-control window-control-close" type="button" id="winClose" aria-label="Close" data-bs-toggle="tooltip" data-bs-title="Close">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+    </div>
+
     <aside class="sidebar" id="sidebar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><img src="img/music.png" alt=""></span>
@@ -182,6 +197,6 @@
 
   <script src="lib/bootstrap/5.3.8/bootstrap.bundle.min.js"></script>
   <script src="js/eq-presets.js?v=2"></script>
-  <script src="js/player.js?v=37"></script>
+  <script src="js/player.js?v=38"></script>
 </body>
 </html>
