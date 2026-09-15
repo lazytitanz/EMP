@@ -148,7 +148,7 @@ const HOME_QUICK_SIZE = 6;
 const SIDEBAR_MIN = 200;
 const SIDEBAR_MAX = 420;
 const SIDEBAR_COLLAPSED = 72;
-const HOME_SHELF_SIZE = 14;
+const HOME_SHELF_SIZE = 32;
 const SIDEBAR_RECENTS = 12;
 const MAX_RECENTS = 24;
 const SEARCH_ALBUM_LIMIT = 12;
@@ -2217,20 +2217,45 @@ function shelfCard(item, subtitleMode) {
   return albumCard(album, { subtitleMode });
 }
 
+function homeShelfColumns() {
+  const rootStyles = getComputedStyle(document.documentElement);
+  const min = parseFloat(rootStyles.getPropertyValue("--home-card-min")) || 160;
+  const gap = parseFloat(rootStyles.getPropertyValue("--home-card-gap")) || 18;
+  const viewStyles = getComputedStyle(viewArea);
+  const pad = (parseFloat(viewStyles.paddingLeft) || 0) + (parseFloat(viewStyles.paddingRight) || 0);
+  const width = Math.max(0, viewArea.clientWidth - pad);
+  return Math.max(2, Math.floor((width + gap) / (min + gap)));
+}
+
+function syncHomeLayout() {
+  const cols = homeShelfColumns();
+  document.documentElement.style.setProperty("--home-cols", String(cols));
+  viewArea.querySelectorAll(".home-shelf").forEach((shelf) => {
+    const btn = shelf.querySelector(".see-all");
+    if (!btn) {
+      return;
+    }
+    const total = Number(shelf.dataset.total || 0);
+    btn.hidden = total <= cols;
+  });
+  return cols;
+}
+
 function shelfSection(title, items, filter, { subtitleMode = "type" } = {}) {
   if (!items.length) {
     return "";
   }
 
+  const cols = homeShelfColumns();
   const shown = items.slice(0, HOME_SHELF_SIZE);
-  const showAll = items.length > HOME_SHELF_SIZE;
+  const showAll = items.length > cols;
   return `
-    <section class="home-shelf">
+    <section class="home-shelf" data-total="${items.length}">
       <div class="section-head">
         <button class="section-title-btn" type="button" data-nav="albums" data-filter="${filter}">
           <h2>${title}</h2>
         </button>
-        ${showAll ? `<button class="see-all" type="button" data-nav="albums" data-filter="${filter}">See all</button>` : ""}
+        ${items.length > 2 ? `<button class="see-all" type="button" data-nav="albums" data-filter="${filter}"${showAll ? "" : " hidden"}>See all</button>` : ""}
       </div>
       <div class="shelf-row">${shown.map((item) => shelfCard(item, subtitleMode)).join("")}</div>
     </section>
@@ -2266,11 +2291,12 @@ function renderHome() {
     <div class="home-page">
       <h1 class="greeting">${greeting()}</h1>
       ${quick.length ? `<div class="quick-grid">${quick.map(renderQuickCard).join("")}</div>` : ""}
-      ${recents.length > HOME_QUICK_SIZE ? shelfSection("Recently played", recents, "all", { subtitleMode: "type" }) : ""}
+      ${recents.length > HOME_QUICK_SIZE ? shelfSection("Recently played", recents, "all", { subtitleMode: "artist" }) : ""}
       ${shelfSection("Albums", albumsByRecency(albums), "albums", { subtitleMode: "artist" })}
       ${shelfSection("Singles", albumsByRecency(singles), "singles", { subtitleMode: "artist" })}
     </div>
   `;
+  syncHomeLayout();
 }
 
 function catalogAlbums() {
@@ -5219,7 +5245,12 @@ window.addEventListener("resize", () => {
   closeEqPresetMenu();
   updateLibraryChipsScroll();
   syncTopBarScroll();
+  syncHomeLayout();
 });
+
+new ResizeObserver(() => {
+  syncHomeLayout();
+}).observe(viewArea);
 
 function syncTopBarScroll() {
   const topBar = document.querySelector(".top-bar");
@@ -5851,6 +5882,7 @@ applySidebarLayout();
 syncSidebarSortUi();
 updateLibraryChipsScroll();
 syncTopBarScroll();
+syncHomeLayout();
 
 window.addEventListener("emp-library", (event) => bindLibrary(event.detail));
 window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.detail));
