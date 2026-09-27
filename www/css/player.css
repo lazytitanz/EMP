@@ -3648,6 +3648,59 @@ img.details-cover {
   animation: emp-rescan-spin 900ms linear infinite;
 }
 
+.queue-section-label {
+  padding: 16px 12px 8px;
+  color: var(--emp-text);
+  font-size: 0.95rem;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.queue-section-label:first-child {
+  padding-top: 8px;
+}
+
+.queue-row {
+  padding: 6px 12px;
+}
+
+.queue-row-cover {
+  width: 48px;
+  height: 48px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  object-fit: cover;
+  font-size: 1.1rem;
+}
+
+.queue-row .device-row-name {
+  font-size: 0.95rem;
+}
+
+.queue-row .device-row-meta {
+  font-size: 0.8rem;
+}
+
+.queue-row.is-current .device-row-name {
+  color: var(--emp-green);
+}
+
+.queue-empty-note {
+  margin: 0;
+  padding: 4px 12px 8px;
+  color: var(--emp-muted);
+  font-size: 0.8rem;
+}
+
+.queue-more {
+  margin: 0;
+  padding: 12px 12px 8px;
+  color: var(--emp-subtle);
+  font-size: 0.74rem;
+}
+
 .text-btn.is-connecting {
   color: var(--emp-text);
 }

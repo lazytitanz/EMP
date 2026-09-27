@@ -63,6 +63,7 @@ const state = {
   artist: null,
   query: "",
   queue: [],
+  queueSource: null,
   shuffleBag: [],
   index: -1,
   playing: false,
@@ -140,6 +141,10 @@ const deviceDrawerStatus = document.getElementById("deviceDrawerStatus");
 const deviceDrawerAlert = document.getElementById("deviceDrawerAlert");
 const deviceDrawerNote = document.getElementById("deviceDrawerNote");
 const deviceRescanBtn = document.getElementById("deviceRescan");
+const queueBtn = document.getElementById("queueBtn");
+const queueDrawerRoot = document.getElementById("queueDrawerRoot");
+const queueDrawerBody = document.getElementById("queueDrawerBody");
+const queueDrawerStatus = document.getElementById("queueDrawerStatus");
 
 const SESSION_KEY = "emp.playback";
 const LIKED_PLAYLIST_ID = "pl_liked";
@@ -157,6 +162,8 @@ const TRACK_ROW_HEIGHT = 58;
 const ARTIST_INFO_TIMEOUT_MS = 15000;
 const DEVICE_SCAN_MS = 6000;
 const DEVICE_DRAWER_EXIT_MS = 280;
+const QUEUE_DRAWER_LIMIT = 100;
+const QUEUE_SOURCE_KINDS = ["album", "playlist", "artist", "recents", "library"];
 const RESCAN_HOLD_MS = 1000;
 const RESCAN_EXPAND_MS = 220;
 const artistInfoCache = new Map();
@@ -171,6 +178,8 @@ let pendingHandoff = null;
 let remoteClock = 0;
 let remoteAdvanceAt = 0;
 let deviceDrawerCloseTimer = 0;
+let queueDrawerCloseTimer = 0;
+let queueDrawerSignature = "";
 let deviceScanTimer = 0;
 let deviceScanUntil = 0;
 
@@ -237,6 +246,13 @@ function normalizeRecentsFilter(value) {
   return "albums";
 }
 
+function normalizeQueueSource(value) {
+  if (!value || !QUEUE_SOURCE_KINDS.includes(value.kind)) {
+    return null;
+  }
+  return typeof value.id === "string" ? { kind: value.kind, id: value.id } : { kind: value.kind };
+}
+
 function normalizeRecentHome(value, albumIds, playlistIds) {
   if (Array.isArray(value) && value.length) {
     return value
@@ -296,6 +312,7 @@ function writeSession() {
   const payload = {
     trackId: track?.id ?? null,
     queue: state.queue,
+    queueSource: state.queueSource,
     shuffleBag: state.shuffleBag,
     index: state.index,
     position: Number.isFinite(playbackPosition()) ? playbackPosition() : 0,
@@ -889,6 +906,7 @@ function openDeviceDrawer() {
   if (!deviceDrawerRoot) {
     return;
   }
+  closeQueueDrawer();
   window.clearTimeout(deviceDrawerCloseTimer);
   deviceDrawerCloseTimer = 0;
   deviceDrawerRoot.hidden = false;
@@ -919,6 +937,195 @@ function closeDeviceDrawer() {
   }
   if (deviceDrawerRoot.contains(document.activeElement)) {
     deviceBtn?.focus({ preventScroll: true });
+  }
+}
+
+function trapDrawerFocus(root, event) {
+  if (event.key !== "Tab") {
+    return;
+  }
+  const focusable = [...root.querySelectorAll("button:not([disabled])")];
+  if (!focusable.length) {
+    return;
+  }
+  const edge = event.shiftKey ? focusable[0] : focusable[focusable.length - 1];
+  if (document.activeElement === edge) {
+    event.preventDefault();
+    (event.shiftKey ? focusable[focusable.length - 1] : focusable[0]).focus();
+  }
+}
+
+function queueSourceLabel(source) {
+  switch (source?.kind) {
+    case "album":
+      return albumById(source.id)?.title ?? "";
+    case "playlist":
+      return playlistById(source.id)?.name ?? "";
+    case "artist":
+      return source.id ?? "";
+    case "recents":
+      return "Recently played";
+    case "library":
+      return "All tracks";
+    default:
+      return "";
+  }
+}
+
+function upcomingQueueIds() {
+  if (!currentTrack()) {
+    return [];
+  }
+  const order = activeOrder();
+  const after = order.slice(state.index + 1);
+  return state.repeat === "all" ? [...after, ...order.slice(0, state.index)] : after;
+}
+
+function queueRowMarkup(track, current = false) {
+  const mark = current && state.playing ? nowEqMarkup() : "";
+  return `
+    <button class="device-row queue-row${current ? " is-current" : ""}" type="button"
+      data-queue-track="${escapeHtml(track.id)}"${current ? " data-queue-current" : ""}>
+      ${coverMarkup(track, "queue-row-cover")}
+      <span class="device-row-copy">
+        <span class="device-row-name">${escapeHtml(track.title)}</span>
+        <span class="device-row-meta"><span>${escapeHtml(track.artist)}</span></span>
+      </span>
+      <span class="device-row-mark">${mark}</span>
+    </button>
+  `;
+}
+
+function queueDrawerIsOpen() {
+  return Boolean(queueDrawerRoot && !queueDrawerRoot.hidden);
+}
+
+function renderQueueDrawer() {
+  if (!queueDrawerBody || !queueDrawerIsOpen()) {
+    return;
+  }
+
+  const track = currentTrack();
+  const upcoming = upcomingQueueIds().map(trackById).filter(Boolean);
+  const shown = upcoming.slice(0, QUEUE_DRAWER_LIMIT);
+  const source = queueSourceLabel(state.queueSource);
+  // updateNowPlaying runs on every remote status poll, so skip redraws that
+  // would change nothing and reset hover and focus.
+  const signature = JSON.stringify([
+    track?.id ?? null,
+    state.playing,
+    state.shuffle,
+    source,
+    upcoming.length,
+    shown.map((item) => item.id)
+  ]);
+  if (signature === queueDrawerSignature) {
+    return;
+  }
+  queueDrawerSignature = signature;
+
+  if (queueDrawerStatus) {
+    let text = "Nothing playing";
+    if (track) {
+      text = upcoming.length ? `${songLabel(upcoming.length)} up next` : "Nothing up next";
+      if (state.shuffle) {
+        text += " · Shuffle on";
+      }
+    }
+    queueDrawerStatus.innerHTML = `<span>${escapeHtml(text)}</span>`;
+  }
+
+  if (!track) {
+    queueDrawerBody.innerHTML = `
+      <div class="device-empty">
+        <div class="device-empty-icon" aria-hidden="true"><i class="bi bi-music-note-list"></i></div>
+        <h3>Your queue is empty</h3>
+        <p>Play an album, playlist, or song to see what's coming up next.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const active = document.activeElement;
+  const hadFocus = queueDrawerBody.contains(active);
+  const focusedId = hadFocus && !active.hasAttribute("data-queue-current") ? active.dataset.queueTrack : "";
+
+  const heading = source ? `Next from: ${source}` : "Next up";
+  const rows = shown.length
+    ? shown.map((item) => queueRowMarkup(item)).join("")
+    : `<p class="queue-empty-note">You've reached the end of the queue.</p>`;
+  const hidden = upcoming.length - shown.length;
+  const more = hidden > 0 ? `<p class="queue-more">And ${songLabel(hidden)} more</p>` : "";
+
+  queueDrawerBody.innerHTML = `
+    <div class="queue-section-label">Now playing</div>
+    ${queueRowMarkup(track, true)}
+    <div class="queue-section-label">${escapeHtml(heading)}</div>
+    ${rows}
+    ${more}
+  `;
+
+  if (hadFocus) {
+    const target = (focusedId && queueDrawerBody.querySelector(`[data-queue-track="${CSS.escape(focusedId)}"]:not([data-queue-current])`))
+      || queueDrawerBody.querySelector("[data-queue-current]");
+    target?.focus({ preventScroll: true });
+  }
+}
+
+function openQueueDrawer() {
+  if (!queueDrawerRoot) {
+    return;
+  }
+  closeDeviceDrawer();
+  window.clearTimeout(queueDrawerCloseTimer);
+  queueDrawerCloseTimer = 0;
+  queueDrawerRoot.hidden = false;
+  queueBtn?.classList.add("active");
+  queueBtn?.setAttribute("aria-expanded", "true");
+  queueDrawerSignature = "";
+  renderQueueDrawer();
+  queueDrawerBody.scrollTop = 0;
+  requestAnimationFrame(() => {
+    if (queueDrawerCloseTimer) {
+      return;
+    }
+    queueDrawerRoot.classList.add("is-open");
+    // The root is visibility: hidden until is-open applies, which blocks focus.
+    requestAnimationFrame(() => {
+      if (queueDrawerCloseTimer) {
+        return;
+      }
+      const first = queueDrawerBody.querySelector("[data-queue-current]")
+        ?? queueDrawerRoot.querySelector("button:not([disabled])");
+      first?.focus({ preventScroll: true });
+    });
+  });
+}
+
+function closeQueueDrawer() {
+  if (!queueDrawerRoot || queueDrawerRoot.hidden) {
+    return;
+  }
+  queueDrawerRoot.classList.remove("is-open");
+  queueBtn?.classList.remove("active");
+  queueBtn?.setAttribute("aria-expanded", "false");
+  window.clearTimeout(queueDrawerCloseTimer);
+  queueDrawerCloseTimer = window.setTimeout(() => {
+    queueDrawerCloseTimer = 0;
+    queueDrawerRoot.hidden = true;
+  }, DEVICE_DRAWER_EXIT_MS);
+  if (queueDrawerRoot.contains(document.activeElement)) {
+    queueBtn?.focus({ preventScroll: true });
+  }
+}
+
+function playQueuedTrack(trackId, isCurrent) {
+  if (isCurrent) {
+    togglePlay();
+    return;
+  }
+  if (trackById(trackId)) {
+    playTrack(trackId, null, { keepBag: true });
   }
 }
 
@@ -1420,7 +1627,7 @@ function playPlaylist(playlistId, startId) {
   }
 
   recordRecentPlaylist(playlistId);
-  playTrack(queueStartId(ids, startId), ids);
+  playTrack(queueStartId(ids, startId), ids, { source: { kind: "playlist", id: playlistId } });
 }
 
 function setRecentsFilter(filter) {
@@ -3823,6 +4030,7 @@ function updateNowPlaying() {
     updateRepeatButton();
     updateSlider(seekBar);
     updateSlider(volumeBar);
+    renderQueueDrawer();
     postNowPlaying();
     return;
   }
@@ -3861,6 +4069,7 @@ function updateNowPlaying() {
   updateSlider(volumeBar);
   applyVolumeControls();
   updateDeviceButton();
+  renderQueueDrawer();
   postNowPlaying();
 }
 
@@ -3872,8 +4081,10 @@ async function playTrack(id, queueIds, options = {}) {
 
   if (queueIds) {
     state.queue = [...queueIds];
+    state.queueSource = normalizeQueueSource(options.source);
   } else if (!state.queue.length) {
     state.queue = state.library.tracks.map((track) => track.id);
+    state.queueSource = { kind: "library" };
   }
 
   if (state.shuffle) {
@@ -4034,6 +4245,7 @@ async function restoreSession() {
   }
 
   await playTrack(trackId, restoredQueue, {
+    source: queue.length ? session.queueSource : { kind: "library" },
     autoplay: false,
     recordRecent: false,
     keepBag: state.shuffle && state.shuffleBag.includes(trackId),
@@ -4192,7 +4404,7 @@ function playAlbum(albumId, startId) {
   if (!ids.length) {
     return;
   }
-  playTrack(queueStartId(ids, startId), ids);
+  playTrack(queueStartId(ids, startId), ids, { source: { kind: "album", id: albumId } });
 }
 
 function playArtist(name, startId) {
@@ -4200,7 +4412,7 @@ function playArtist(name, startId) {
   if (!ids.length) {
     return;
   }
-  playTrack(queueStartId(ids, startId), ids);
+  playTrack(queueStartId(ids, startId), ids, { source: { kind: "artist", id: name } });
 }
 
 function togglePlay() {
@@ -4208,7 +4420,7 @@ function togglePlay() {
   if (!track) {
     const first = state.library.tracks[0];
     if (first) {
-      playTrack(first.id, state.library.tracks.map((item) => item.id));
+      playTrack(first.id, state.library.tracks.map((item) => item.id), { source: { kind: "library" } });
     }
     return;
   }
@@ -5174,19 +5386,25 @@ document.body.addEventListener("click", (event) => {
     const album = albumById(state.albumId);
     const playlist = playlistById(state.playlistId);
     let queue;
+    let source;
     if (playButton.closest("#libraryList")) {
       queue = recentTracks(MAX_RECENTS).map((track) => track.id);
+      source = { kind: "recents" };
     } else if (state.view === "album" && album) {
       queue = albumQueueIds(album);
+      source = { kind: "album", id: album.id };
     } else if (state.view === "playlist" && playlist) {
       queue = playlistTracks(playlist).map((track) => track.id);
+      source = { kind: "playlist", id: playlist.id };
       recordRecentPlaylist(playlist.id);
     } else if (state.view === "artist" && state.artist) {
       queue = artistQueueIds(state.artist);
+      source = { kind: "artist", id: state.artist };
     } else {
       queue = state.library.tracks.map((track) => track.id);
+      source = { kind: "library" };
     }
-    playTrack(id, queue);
+    playTrack(id, queue, { source });
     return;
   }
 
@@ -5528,18 +5746,35 @@ deviceRescanBtn?.addEventListener("click", (event) => {
 });
 
 deviceDrawerRoot?.addEventListener("keydown", (event) => {
-  if (event.key !== "Tab") {
+  trapDrawerFocus(deviceDrawerRoot, event);
+});
+
+queueBtn?.addEventListener("click", () => {
+  if (queueDrawerRoot?.classList.contains("is-open")) {
+    closeQueueDrawer();
+  } else {
+    openQueueDrawer();
+  }
+});
+
+queueDrawerRoot?.addEventListener("click", (event) => {
+  if (event.target === queueDrawerRoot) {
+    closeQueueDrawer();
     return;
   }
-  const focusable = [...deviceDrawerRoot.querySelectorAll("button:not([disabled])")];
-  if (!focusable.length) {
-    return;
+  const row = event.target.closest("[data-queue-track]");
+  if (row?.dataset.queueTrack) {
+    playQueuedTrack(row.dataset.queueTrack, row.hasAttribute("data-queue-current"));
   }
-  const edge = event.shiftKey ? focusable[0] : focusable[focusable.length - 1];
-  if (document.activeElement === edge) {
-    event.preventDefault();
-    (event.shiftKey ? focusable[focusable.length - 1] : focusable[0]).focus();
-  }
+});
+
+document.getElementById("queueDrawerClose")?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  closeQueueDrawer();
+});
+
+queueDrawerRoot?.addEventListener("keydown", (event) => {
+  trapDrawerFocus(queueDrawerRoot, event);
 });
 
 shuffleBtn.addEventListener("click", () => {
@@ -5723,6 +5958,11 @@ document.addEventListener("keydown", (event) => {
     if (deviceDrawerIsOpen()) {
       event.preventDefault();
       closeDeviceDrawer();
+      return;
+    }
+    if (queueDrawerIsOpen()) {
+      event.preventDefault();
+      closeQueueDrawer();
       return;
     }
     if (detailsModal && !detailsModal.hidden) {

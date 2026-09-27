@@ -6,7 +6,7 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=51">
+  <link rel="stylesheet" href="css/player.css?v=52">
 </head>
 <body>
   <div class="app-shell">
@@ -144,6 +144,9 @@
       </div>
 
       <div class="player-right">
+        <button class="text-btn" type="button" id="queueBtn" aria-label="Queue" aria-expanded="false" data-bs-toggle="tooltip" data-bs-title="Queue">
+          <i class="bi bi-music-note-list"></i>
+        </button>
         <button class="text-btn" type="button" id="deviceBtn" aria-label="Connect to a device" data-bs-toggle="tooltip" data-bs-title="Connect to a device">
           <i class="bi bi-speaker"></i>
         </button>
@@ -196,8 +199,23 @@
     </aside>
   </div>
 
+  <div class="device-drawer-root" id="queueDrawerRoot" hidden>
+    <aside class="device-drawer" role="dialog" aria-modal="true" aria-labelledby="queueDrawerTitle">
+      <div class="device-drawer-head">
+        <div class="device-drawer-heading">
+          <h2 id="queueDrawerTitle">Queue</h2>
+          <p class="device-drawer-sub" id="queueDrawerStatus" role="status" aria-live="polite"></p>
+        </div>
+        <button class="device-drawer-close" type="button" id="queueDrawerClose" aria-label="Close">
+          <i class="bi bi-x-lg"></i>
+        </button>
+      </div>
+      <div class="device-drawer-body" id="queueDrawerBody"></div>
+    </aside>
+  </div>
+
   <script src="lib/bootstrap/5.3.8/bootstrap.bundle.min.js"></script>
   <script src="js/eq-presets.js?v=2"></script>
-  <script src="js/player.js?v=39"></script>
+  <script src="js/player.js?v=40"></script>
 </body>
 </html>
