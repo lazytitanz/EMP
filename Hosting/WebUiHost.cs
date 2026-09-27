@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using EMP.Cast;
 using EMP.Library;
+using EMP.Lyrics;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -32,6 +33,7 @@ namespace EMP.Hosting
         private static SystemMediaControls? systemMedia;
         private static MusicFolderWatchers? folderWatchers;
         private static CastCoordinator? cast;
+        private static LyricsService? lyrics;
         private static WebView2? hostView;
         private static string artworkRoot = string.Empty;
         private static bool pageLoaded;
@@ -99,6 +101,9 @@ namespace EMP.Hosting
             cast?.Dispose();
             cast = new CastCoordinator(PostCastMessage);
 
+            lyrics?.Dispose();
+            lyrics = new LyricsService();
+
             await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
                 """
                 window.__emp = window.__emp || { library: null };
@@ -114,6 +119,10 @@ namespace EMP.Hosting
                   }
                   if (message.type === 'artistInfo') {
                     window.dispatchEvent(new CustomEvent('emp-artist-info', { detail: message }));
+                    return;
+                  }
+                  if (message.type === 'lyrics') {
+                    window.dispatchEvent(new CustomEvent('emp-lyrics', { detail: message }));
                     return;
                   }
                   if (message.type === 'appSettings') {
@@ -176,6 +185,14 @@ namespace EMP.Hosting
                             _ = SendArtistInfoAsync(webView, name);
                         }
                     }
+                    else if (kind == "lyrics")
+                    {
+                        string? trackId = ReadString(document.RootElement, "trackId");
+                        if (!string.IsNullOrWhiteSpace(trackId))
+                        {
+                            _ = SendLyricsAsync(trackId);
+                        }
+                    }
                     else if (kind == "appSettings")
                     {
                         HandleAppSettings(document.RootElement);
@@ -216,6 +233,8 @@ namespace EMP.Hosting
             systemMedia = null;
             cast?.Dispose();
             cast = null;
+            lyrics?.Dispose();
+            lyrics = null;
             LibraryMediaIndex.Clear();
             hostView = null;
             pageLoaded = false;
@@ -552,6 +571,66 @@ namespace EMP.Hosting
             }
         }
 
+        private static async Task SendLyricsAsync(string trackId)
+        {
+            LyricsMessage message;
+            try
+            {
+                LyricsService? service = lyrics;
+                if (service is null)
+                {
+                    message = LyricsMessage.Unavailable(trackId, retryable: true);
+                }
+                else if (!LibraryMediaIndex.TryGet(trackId, out LibraryMediaLocation location))
+                {
+                    message = LyricsMessage.Unavailable(trackId, retryable: false);
+                }
+                else
+                {
+                    LyricsResult result = await service.GetAsync(new LyricsLookup
+                    {
+                        TrackId = location.TrackId,
+                        Title = location.Title,
+                        Artist = location.Artist,
+                        Album = location.Album,
+                        Duration = location.Duration
+                    });
+                    message = LyricsMessage.From(trackId, result);
+                }
+            }
+            catch (Exception)
+            {
+                message = LyricsMessage.Unavailable(trackId, retryable: true);
+            }
+
+            PostLyrics(message);
+        }
+
+        private static void PostLyrics(LyricsMessage message)
+        {
+            string json;
+            try
+            {
+                json = JsonSerializer.Serialize(message, JsonOptions);
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            PostToUi(() =>
+            {
+                try
+                {
+                    hostView?.CoreWebView2?.PostWebMessageAsJson(json);
+                }
+                catch (Exception)
+                {
+                    // The WebView may already be tearing down.
+                }
+            });
+        }
+
         private static void HandleAppSettings(JsonElement message)
         {
             string startupOnLogin = ReadString(message, "startupOnLogin") ?? AppSettingsStore.Current.StartupOnLogin;
@@ -740,6 +819,49 @@ namespace EMP.Hosting
             public string? BeginYear { get; init; }
 
             public string? Area { get; init; }
+        }
+
+        private sealed class LyricsMessage
+        {
+            public string Type { get; init; } = "lyrics";
+
+            public required string TrackId { get; init; }
+
+            public bool Available { get; init; }
+
+            public bool Synced { get; init; }
+
+            public string? SyncedLyrics { get; init; }
+
+            public string? PlainLyrics { get; init; }
+
+            public bool Instrumental { get; init; }
+
+            public bool Retryable { get; init; }
+
+            public static LyricsMessage Unavailable(string trackId, bool retryable) => new()
+            {
+                TrackId = trackId,
+                Retryable = retryable
+            };
+
+            public static LyricsMessage From(string trackId, LyricsResult result)
+            {
+                if (result.Status != LyricsStatus.Found)
+                {
+                    return Unavailable(trackId, retryable: result.Status == LyricsStatus.Failed);
+                }
+
+                return new LyricsMessage
+                {
+                    TrackId = trackId,
+                    Available = true,
+                    Synced = result.SyncedLyrics is not null,
+                    SyncedLyrics = result.SyncedLyrics,
+                    PlainLyrics = result.PlainLyrics,
+                    Instrumental = result.Instrumental
+                };
+            }
         }
     }
 }
