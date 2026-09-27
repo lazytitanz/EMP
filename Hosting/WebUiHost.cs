@@ -37,6 +37,8 @@ namespace EMP.Hosting
         private static WebView2? hostView;
         private static string artworkRoot = string.Empty;
         private static bool pageLoaded;
+        private static int storageRequested;
+        private static int storageMeasuring;
 
         public static event Action<bool>? PlayingChanged;
 
@@ -125,6 +127,10 @@ namespace EMP.Hosting
                     window.dispatchEvent(new CustomEvent('emp-lyrics', { detail: message }));
                     return;
                   }
+                  if (message.type === 'storage') {
+                    window.dispatchEvent(new CustomEvent('emp-storage', { detail: message }));
+                    return;
+                  }
                   if (message.type === 'appSettings') {
                     window.dispatchEvent(new CustomEvent('emp-app-settings', { detail: message }));
                     return;
@@ -192,6 +198,10 @@ namespace EMP.Hosting
                         {
                             _ = SendLyricsAsync(trackId);
                         }
+                    }
+                    else if (kind == "storage")
+                    {
+                        RequestStorageUsage();
                     }
                     else if (kind == "appSettings")
                     {
@@ -631,6 +641,57 @@ namespace EMP.Hosting
             });
         }
 
+        private static void RequestStorageUsage()
+        {
+            Interlocked.Exchange(ref storageRequested, 1);
+            if (Interlocked.CompareExchange(ref storageMeasuring, 1, 0) == 0)
+            {
+                _ = Task.Run(MeasureStorageUsage);
+            }
+        }
+
+        private static void MeasureStorageUsage()
+        {
+            do
+            {
+                try
+                {
+                    // Requests that arrive mid-measurement are folded into one more pass.
+                    while (Interlocked.Exchange(ref storageRequested, 0) == 1)
+                    {
+                        string json = JsonSerializer.Serialize(new StorageMessage
+                        {
+                            Type = "storage",
+                            LibraryBytes = StorageUsage.LibraryBytes(LibraryMediaIndex.CurrentPaths()),
+                            CacheBytes = StorageUsage.CacheBytes()
+                        }, JsonOptions);
+
+                        PostToUi(() =>
+                        {
+                            try
+                            {
+                                hostView?.CoreWebView2?.PostWebMessageAsJson(json);
+                            }
+                            catch (Exception)
+                            {
+                                // The WebView may already be tearing down.
+                            }
+                        });
+                    }
+                }
+                catch (Exception)
+                {
+                    // Storage figures are informational; the settings page keeps its last values.
+                }
+                finally
+                {
+                    Volatile.Write(ref storageMeasuring, 0);
+                }
+            }
+            while (Volatile.Read(ref storageRequested) == 1
+                && Interlocked.CompareExchange(ref storageMeasuring, 1, 0) == 0);
+        }
+
         private static void HandleAppSettings(JsonElement message)
         {
             string startupOnLogin = ReadString(message, "startupOnLogin") ?? AppSettingsStore.Current.StartupOnLogin;
@@ -819,6 +880,15 @@ namespace EMP.Hosting
             public string? BeginYear { get; init; }
 
             public string? Area { get; init; }
+        }
+
+        private sealed class StorageMessage
+        {
+            public required string Type { get; init; }
+
+            public required long LibraryBytes { get; init; }
+
+            public required long CacheBytes { get; init; }
         }
 
         private sealed class LyricsMessage

@@ -86,6 +86,14 @@ namespace EMP.Library
             return false;
         }
 
+        public static IReadOnlyList<string> CurrentPaths()
+        {
+            lock (Gate)
+            {
+                return current.Values.Select(static location => location.FullPath).ToArray();
+            }
+        }
+
         public static bool IsRetained(string trackId)
         {
             if (string.IsNullOrWhiteSpace(trackId))

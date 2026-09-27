@@ -691,7 +691,7 @@ namespace EMP.Library
 
         private static string AreaCachePath(string mbid) => Path.Combine(CacheRoot, "areas", $"{mbid}.json");
 
-        private static string CacheRoot => Path.Combine(
+        public static string CacheRoot => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "EMP",
             "MusicBrainz");

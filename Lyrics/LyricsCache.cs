@@ -18,11 +18,13 @@ namespace EMP.Lyrics
 
         private readonly string root;
 
+        public static string DefaultRoot => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "EMP",
+            "Lyrics");
+
         public LyricsCache()
-            : this(Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "EMP",
-                "Lyrics"))
+            : this(DefaultRoot)
         {
         }
 

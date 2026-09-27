@@ -180,6 +180,7 @@ let artistInfoRequestId = 0;
 let sessionRestored = false;
 let pendingRescanId = "";
 let rescanTimer = 0;
+let storageUsage = null;
 let lastSessionWrite = 0;
 let trackVirtual = null;
 let lastAudioTime = 0;
@@ -2915,6 +2916,7 @@ function renderSettings() {
         </div>
         ${equalizerMarkup}
       </section>
+      ${renderStorageSettingsGroup()}
     </div>
   `;
   try {
@@ -2922,6 +2924,54 @@ function renderSettings() {
   } catch {
     // Settings still render if the graph overlay cannot be drawn.
   }
+  window.chrome?.webview?.postMessage({ type: "storage" });
+}
+
+function formatMegabytes(bytes) {
+  const megabytes = Math.max(0, Number(bytes) || 0) / (1024 * 1024);
+  if (megabytes > 0 && megabytes < 10) {
+    return `${megabytes.toFixed(1)} MB`;
+  }
+  return `${Math.round(megabytes).toLocaleString()} MB`;
+}
+
+function storageValueText(key) {
+  return storageUsage ? formatMegabytes(storageUsage[key]) : "Calculating…";
+}
+
+function renderStorageSettingsGroup() {
+  return `
+    <section class="settings-group">
+      <h2>Storage</h2>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Music library</span>
+          <span class="settings-desc">Audio files in your music folders</span>
+        </div>
+        <span class="settings-value" data-storage-value="libraryBytes">${storageValueText("libraryBytes")}</span>
+      </div>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Cache</span>
+          <span class="settings-desc">Album artwork, lyrics and artist info EMP saves so it can load them faster</span>
+        </div>
+        <span class="settings-value" data-storage-value="cacheBytes">${storageValueText("cacheBytes")}</span>
+      </div>
+    </section>
+  `;
+}
+
+function applyStorageUsage(detail) {
+  storageUsage = {
+    libraryBytes: Number(detail?.libraryBytes) || 0,
+    cacheBytes: Number(detail?.cacheBytes) || 0
+  };
+  if (state.view !== "settings") {
+    return;
+  }
+  viewArea.querySelectorAll("[data-storage-value]").forEach((el) => {
+    el.textContent = storageValueText(el.dataset.storageValue);
+  });
 }
 
 function renderAlbum(albumId) {
@@ -6625,6 +6675,7 @@ syncHomeLayout();
 window.addEventListener("emp-library", (event) => bindLibrary(event.detail));
 window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.detail));
 window.addEventListener("emp-lyrics", (event) => applyLyricsResult(event.detail));
+window.addEventListener("emp-storage", (event) => applyStorageUsage(event.detail));
 window.addEventListener("emp-app-settings", (event) => applyHostAppSettings(event.detail));
 window.addEventListener("emp-window-state", (event) => applyHostWindowState(event.detail));
 window.addEventListener("emp-cast", (event) => handleCastMessage(event.detail));
