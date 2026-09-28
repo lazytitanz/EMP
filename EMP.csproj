@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>EMP</RootNamespace>
     <AssemblyName>EMP</AssemblyName>
-    <ApplicationIcon>www\img\music.ico</ApplicationIcon>
+    <ApplicationIcon>www\img\emp-icon.ico</ApplicationIcon>
     <GeneratePackageOnBuild>False</GeneratePackageOnBuild>
   </PropertyGroup>
 

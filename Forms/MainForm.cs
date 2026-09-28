@@ -56,7 +56,7 @@ namespace EMP.Forms
 
         private void ApplyWindowIcon()
         {
-            string iconPath = Path.Combine(AppContext.BaseDirectory, "www", "img", "music.ico");
+            string iconPath = Path.Combine(AppContext.BaseDirectory, "www", "img", "emp-icon.ico");
             if (File.Exists(iconPath))
             {
                 using FileStream stream = File.OpenRead(iconPath);

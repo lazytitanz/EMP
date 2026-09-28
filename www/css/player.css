@@ -208,7 +208,6 @@ html.is-window-maximized .player-bar {
 .brand-mark {
   width: 32px;
   height: 32px;
-  border-radius: 50%;
   overflow: hidden;
   flex-shrink: 0;
   background: transparent;

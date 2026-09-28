@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="www/img/music.png" alt="EMP" width="72" height="72">
+  <img src="www/img/emp-icon-512.png" alt="EMP" width="72" height="72">
 </p>
 
 <p align="center">
