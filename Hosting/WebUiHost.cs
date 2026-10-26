@@ -63,6 +63,7 @@ namespace EMP.Hosting
 
             IReadOnlyList<string> startupFolders = AppSettingsStore.ResolvedMusicFolders();
             Task<CachedMusicLibrary?> cacheLoadTask = Task.Run(() => LibraryCacheStore.TryLoad(startupFolders));
+            Task listenStatsLoadTask = Task.Run(ListenStatsStore.Load);
 
             CoreWebView2Environment environment = await CoreWebView2Environment.CreateAsync(
                 userDataFolder: UserDataFolder);
@@ -113,6 +114,7 @@ namespace EMP.Hosting
             lyrics = new LyricsService(OnSyncedLyricsUpgrade);
 
             CachedMusicLibrary? startupCache = await cacheLoadTask.ConfigureAwait(true);
+            await listenStatsLoadTask.ConfigureAwait(true);
             if (startupCache is not null)
             {
                 lastCompleteCache = startupCache;
@@ -205,6 +207,14 @@ namespace EMP.Hosting
                     {
                         HandleWindowAction(document.RootElement);
                     }
+                    else if (kind == "listenStatsUpdate")
+                    {
+                        HandleListenStatsUpdate(document.RootElement);
+                    }
+                    else if (kind == "listenStatsRequest")
+                    {
+                        PostListenStatsSnapshot();
+                    }
                 }
                 catch (JsonException)
                 {
@@ -226,6 +236,7 @@ namespace EMP.Hosting
             cast = null;
             lyrics?.Dispose();
             lyrics = null;
+            ListenStatsStore.FlushSync();
             LibraryMediaIndex.Clear();
             hostView = null;
             pageLoaded = false;
@@ -235,6 +246,73 @@ namespace EMP.Hosting
             MappedHosts.Clear();
             RetainedHosts.Clear();
             ActiveMediaHosts.Clear();
+        }
+
+        public static void ApplyListenStatsUpdatesFromJson(string? json)
+        {
+            if (string.IsNullOrWhiteSpace(json) || json == "null")
+            {
+                return;
+            }
+
+            try
+            {
+                using JsonDocument document = JsonDocument.Parse(json);
+                if (document.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement item in document.RootElement.EnumerateArray())
+                    {
+                        HandleListenStatsUpdate(item);
+                    }
+                }
+                else if (document.RootElement.ValueKind == JsonValueKind.String)
+                {
+                    // ExecuteScriptAsync may wrap a returned string again.
+                    ApplyListenStatsUpdatesFromJson(document.RootElement.GetString());
+                }
+            }
+            catch (JsonException)
+            {
+                // Ignore malformed flush payloads during shutdown.
+            }
+        }
+
+        private static void HandleListenStatsUpdate(JsonElement message)
+        {
+            string? token = ReadString(message, "sessionToken");
+            string? trackId = ReadString(message, "trackId");
+            long updateId = ReadInt64(message, "updateId");
+            long playCountDelta = ReadInt64(message, "playCountDelta");
+            long listenMsDelta = ReadInt64(message, "listenMsDelta");
+            long lastPlayedAt = ReadInt64(message, "lastPlayedAt");
+            ListenStatsStore.ApplyUpdate(token, updateId, trackId, playCountDelta, listenMsDelta, lastPlayedAt);
+        }
+
+        private static void PostListenStatsSnapshot()
+        {
+            if (hostView?.CoreWebView2 is null)
+            {
+                return;
+            }
+
+            Dictionary<string, object> tracks = new(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, TrackListenStats> pair in ListenStatsStore.Snapshot())
+            {
+                tracks[pair.Key] = new
+                {
+                    playCount = pair.Value.PlayCount,
+                    lastPlayedAt = pair.Value.LastPlayedAt,
+                    listenMs = pair.Value.ListenMs
+                };
+            }
+
+            var message = new
+            {
+                type = "listenStats",
+                tracks
+            };
+
+            hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
         }
 
         public static void PostWindowState(bool maximized)
@@ -480,6 +558,10 @@ namespace EMP.Hosting
                     }
                     if (message.type === 'windowState') {
                       window.dispatchEvent(new CustomEvent('emp-window-state', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'listenStats') {
+                      window.dispatchEvent(new CustomEvent('emp-listen-stats', { detail: message }));
                     }
                   });
                 }
@@ -1000,6 +1082,26 @@ namespace EMP.Hosting
             return value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out double number)
                 ? number
                 : fallback;
+        }
+
+        private static long ReadInt64(JsonElement message, string name)
+        {
+            if (!message.TryGetProperty(name, out JsonElement value) || value.ValueKind != JsonValueKind.Number)
+            {
+                return 0;
+            }
+
+            if (value.TryGetInt64(out long number))
+            {
+                return number;
+            }
+
+            if (value.TryGetDouble(out double asDouble))
+            {
+                return (long)asDouble;
+            }
+
+            return 0;
         }
 
         private sealed class LibraryMessage

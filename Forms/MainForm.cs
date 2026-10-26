@@ -268,8 +268,15 @@ namespace EMP.Forms
                 return;
             }
 
-            if (sessionSaved || webView.CoreWebView2 is null)
+            if (sessionSaved)
             {
+                return;
+            }
+
+            if (webView.CoreWebView2 is null)
+            {
+                ListenStatsStore.FlushSync();
+                sessionSaved = true;
                 return;
             }
 
@@ -277,13 +284,16 @@ namespace EMP.Forms
 
             try
             {
-                await webView.ExecuteScriptAsync("window.empSaveSession && window.empSaveSession();");
+                string result = await webView.ExecuteScriptAsync(
+                    "window.empFlushForClose ? window.empFlushForClose() : (window.empSaveSession && window.empSaveSession(), [])");
+                WebUiHost.ApplyListenStatsUpdatesFromJson(result);
             }
             catch (Exception)
             {
-                // The WebView may already be tearing down.
+                // The WebView may already be tearing down; persist whatever was already applied.
             }
 
+            ListenStatsStore.FlushSync();
             sessionSaved = true;
             BeginInvoke(Close);
         }
