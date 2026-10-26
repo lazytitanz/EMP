@@ -44,9 +44,24 @@ namespace EMP.Hosting
                 MusicBrainzClient.CacheRoot
             ];
 
-            return folders
+            long total = folders
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Sum(FolderBytes);
+
+            try
+            {
+                FileInfo libraryCache = new(LibraryCacheStore.FilePath);
+                if (libraryCache.Exists)
+                {
+                    total += libraryCache.Length;
+                }
+            }
+            catch (Exception)
+            {
+                // Report whatever could be counted.
+            }
+
+            return total;
         }
 
         private static long FolderBytes(string folder)

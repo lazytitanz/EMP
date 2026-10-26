@@ -61,9 +61,38 @@ namespace EMP.Lyrics
 
         public static bool IsUsable(LrclibRecord record)
         {
-            return !string.IsNullOrWhiteSpace(record.SyncedLyrics)
+            return HasParseableSyncedLyrics(record.SyncedLyrics)
                 || !string.IsNullOrWhiteSpace(record.PlainLyrics)
                 || record.Instrumental;
+        }
+
+        /// <summary>
+        /// True when <paramref name="text"/> contains at least one LRC timestamp with lyric text,
+        /// matching the frontend parser's minimum useful synchronized payload.
+        /// </summary>
+        public static bool HasParseableSyncedLyrics(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            foreach (string raw in text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                string rest = raw.Trim();
+                if (!rest.StartsWith('[') || !TryConsumeTimeTags(ref rest, out bool anyTime) || !anyTime)
+                {
+                    continue;
+                }
+
+                string lyric = StripWordTimestamps(rest).Trim();
+                if (lyric.Length > 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -112,7 +141,10 @@ namespace EMP.Lyrics
             return records ?? [];
         }
 
-        public static LrclibRecord? SelectBestMatch(LyricsLookup lookup, IEnumerable<LrclibRecord> records)
+        public static LrclibRecord? SelectBestMatch(
+            LyricsLookup lookup,
+            IEnumerable<LrclibRecord> records,
+            bool requireSynced = false)
         {
             (string localTitle, HashSet<string> localVersion) = SplitTitle(lookup.Title);
             if (localTitle.Length == 0)
@@ -131,7 +163,20 @@ namespace EMP.Lyrics
 
             foreach (LrclibRecord record in records)
             {
-                if (!IsUsable(record) || !ArtistNames(record.ArtistName).Overlaps(localArtists))
+                bool synced = HasParseableSyncedLyrics(record.SyncedLyrics);
+                if (requireSynced)
+                {
+                    if (!synced)
+                    {
+                        continue;
+                    }
+                }
+                else if (!IsUsable(record))
+                {
+                    continue;
+                }
+
+                if (!ArtistNames(record.ArtistName).Overlaps(localArtists))
                 {
                     continue;
                 }
@@ -163,7 +208,6 @@ namespace EMP.Lyrics
                 }
 
                 int albumScore = AlbumScore(localAlbum, SplitTitle(record.AlbumName).Core);
-                bool synced = !string.IsNullOrWhiteSpace(record.SyncedLyrics);
                 bool better = best is null
                     || albumScore > bestAlbumScore
                     || (albumScore == bestAlbumScore && difference < bestDifference)
@@ -178,6 +222,93 @@ namespace EMP.Lyrics
             }
 
             return best;
+        }
+
+        private static bool TryConsumeTimeTags(ref string rest, out bool anyTime)
+        {
+            anyTime = false;
+            while (rest.Length > 0 && rest[0] == '[')
+            {
+                int close = rest.IndexOf(']');
+                if (close <= 1)
+                {
+                    return anyTime;
+                }
+
+                string tag = rest[1..close];
+                rest = rest[(close + 1)..].TrimStart();
+                if (!IsLrcTimeTag(tag))
+                {
+                    // Metadata such as [ar:] / [offset:] — not a lyric time tag.
+                    return anyTime;
+                }
+
+                anyTime = true;
+            }
+
+            return true;
+        }
+
+        private static bool IsLrcTimeTag(string tag)
+        {
+            // mm:ss, mm:ss.xx, or mm:ss:xx
+            int colon = tag.IndexOf(':');
+            if (colon <= 0 || colon >= tag.Length - 1)
+            {
+                return false;
+            }
+
+            if (!int.TryParse(tag[..colon], NumberStyles.None, CultureInfo.InvariantCulture, out int minutes)
+                || minutes < 0
+                || minutes > 999)
+            {
+                return false;
+            }
+
+            string secondsPart = tag[(colon + 1)..];
+            int separator = secondsPart.IndexOfAny(['.', ':']);
+            string whole = separator < 0 ? secondsPart : secondsPart[..separator];
+            if (!int.TryParse(whole, NumberStyles.None, CultureInfo.InvariantCulture, out int seconds)
+                || seconds is < 0 or >= 60)
+            {
+                return false;
+            }
+
+            if (separator < 0)
+            {
+                return true;
+            }
+
+            string fraction = secondsPart[(separator + 1)..];
+            return fraction.Length is >= 1 and <= 3
+                && int.TryParse(fraction, NumberStyles.None, CultureInfo.InvariantCulture, out _);
+        }
+
+        private static string StripWordTimestamps(string text)
+        {
+            // Enhanced LRC word timestamps like <00:01.00>
+            Span<char> buffer = text.Length <= 512 ? stackalloc char[text.Length] : new char[text.Length];
+            int length = 0;
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (text[i] == '<')
+                {
+                    int close = text.IndexOf('>', i + 1);
+                    if (close > i)
+                    {
+                        string inner = text[(i + 1)..close];
+                        if (IsLrcTimeTag(inner))
+                        {
+                            i = close;
+                            continue;
+                        }
+                    }
+                }
+
+                buffer[length++] = text[i];
+            }
+
+            return new string(buffer[..length]).Replace("  ", " ", StringComparison.Ordinal);
         }
 
         public void Dispose()

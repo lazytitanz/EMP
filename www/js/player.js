@@ -159,6 +159,13 @@ const SIDEBAR_RECENTS = 12;
 const MAX_RECENTS = 24;
 const SEARCH_ALBUM_LIMIT = 12;
 const SEARCH_TRACK_LIMIT = 40;
+const SEARCH_ARTIST_LIMIT = 6;
+const SEARCH_PLAYLIST_LIMIT = 6;
+const SEARCH_SHOW_MORE_BATCH = 12;
+const SEARCH_HISTORY_KEY = "emp.searchHistory.v1";
+const SEARCH_HISTORY_MAX = 8;
+const SEARCH_HISTORY_MIN_LEN = 2;
+const SEARCH_HISTORY_IDLE_MS = 2500;
 const TRACK_ROW_HEIGHT = 58;
 const ARTIST_INFO_TIMEOUT_MS = 15000;
 const DEVICE_SCAN_MS = 6000;
@@ -176,8 +183,12 @@ const LYRICS_FOCUS_RATIO = 0.35;
 const RESCAN_HOLD_MS = 1000;
 const RESCAN_EXPAND_MS = 220;
 const artistInfoCache = new Map();
+/** Session-scoped: confirmed empty MusicBrainz lookups (not timeouts/errors). */
+const artistInfoEmptyCache = new Set();
 let artistInfoRequestId = 0;
+let artistInfoPendingName = null;
 let sessionRestored = false;
+let libraryContentFingerprint = "";
 let pendingRescanId = "";
 let rescanTimer = 0;
 let storageUsage = null;
@@ -191,6 +202,15 @@ let deviceDrawerCloseTimer = 0;
 let queueDrawerCloseTimer = 0;
 let queueDrawerSignature = "";
 let renderSeq = 0;
+let focusSearchOnRender = true;
+let searchHistoryIdleTimer = 0;
+let searchExpand = {
+  queryKey: "",
+  artists: SEARCH_ARTIST_LIMIT,
+  playlists: SEARCH_PLAYLIST_LIMIT,
+  albums: SEARCH_ALBUM_LIMIT,
+  tracks: SEARCH_TRACK_LIMIT
+};
 let lyricsTrackId = null;
 const lyricsEntries = new Map();
 let lyricsRequestTimer = 0;
@@ -1543,6 +1563,13 @@ function createPlaylist(name, trackId) {
   state.playlists = [...state.playlists, playlist];
   recordRecentPlaylist(playlist.id);
   writeSession();
+  if (state.view === "playlists" || state.view === "search") {
+    if (state.view === "search") {
+      focusSearchOnRender = false;
+    }
+    render(historyStack[historyIndex]);
+    focusSearchOnRender = true;
+  }
   return playlist;
 }
 
@@ -1563,9 +1590,7 @@ function addTrackToPlaylist(playlistId, trackId) {
 
   recordRecentPlaylist(playlist.id);
   writeSession();
-  if (state.view === "playlist" && state.playlistId === playlist.id) {
-    render(historyStack[historyIndex]);
-  }
+  refreshAfterPlaylistChange(playlist.id);
   return true;
 }
 
@@ -1588,9 +1613,7 @@ function likeTrack(trackId) {
     state.playlists = [...state.playlists, playlist];
     recordRecentPlaylist(playlist.id);
     writeSession();
-    if (state.view === "playlist" && state.playlistId === playlist.id) {
-      render(historyStack[historyIndex]);
-    }
+    refreshAfterPlaylistChange(playlist.id);
     return;
   }
 
@@ -1611,11 +1634,7 @@ function unlikeTrack(trackId) {
 
   playlist.trackIds = playlist.trackIds.filter((id) => id !== trackId);
   writeSession();
-  if (state.view === "playlist" && state.playlistId === playlist.id) {
-    render(historyStack[historyIndex]);
-  } else {
-    renderLibraryList();
-  }
+  refreshAfterPlaylistChange(playlist.id);
 }
 
 function removeTrackFromPlaylist(playlistId, trackId) {
@@ -1631,11 +1650,7 @@ function removeTrackFromPlaylist(playlistId, trackId) {
 
   playlist.trackIds = playlist.trackIds.filter((id) => id !== trackId);
   writeSession();
-  if (state.view === "playlist" && state.playlistId === playlist.id) {
-    render(historyStack[historyIndex]);
-  } else {
-    renderLibraryList();
-  }
+  refreshAfterPlaylistChange(playlist.id);
 }
 
 function playPlaylist(playlistId, startId) {
@@ -1664,7 +1679,22 @@ function syncRecentsChips() {
 }
 
 function isLibraryView(view = state.view) {
-  return view === "albums" || view === "album" || view === "artist" || view === "tracks" || view === "playlist";
+  return view === "albums" || view === "album" || view === "artist" || view === "tracks" || view === "playlist" || view === "playlists";
+}
+
+function refreshAfterPlaylistChange(playlistId) {
+  renderLibraryList();
+  if (
+    state.view === "playlists"
+    || state.view === "search"
+    || (state.view === "playlist" && (!playlistId || state.playlistId === playlistId))
+  ) {
+    if (state.view === "search") {
+      focusSearchOnRender = false;
+    }
+    render(historyStack[historyIndex]);
+    focusSearchOnRender = true;
+  }
 }
 
 function syncNavIcons(entry) {
@@ -1746,9 +1776,55 @@ function syncSidebarSortUi() {
   }
 }
 
-function applySidebarLayout() {
+function ensureTooltip(element, options = {}) {
+  let tooltip = bootstrap.Tooltip.getInstance(element);
+  if (tooltip) {
+    return tooltip;
+  }
+
+  tooltip = new bootstrap.Tooltip(element, {
+    trigger: "hover",
+    delay: { show: 250, hide: 0 },
+    ...options
+  });
+
+  const hideTooltip = () => tooltip.hide();
+  element.addEventListener("click", hideTooltip);
+  element.addEventListener("mouseleave", hideTooltip);
+  element.addEventListener("blur", hideTooltip);
+  return tooltip;
+}
+
+function syncSidebarRailTooltips() {
+  document.querySelectorAll("[data-sidebar-rail-tooltip]").forEach((element) => {
+    const title = element.getAttribute("data-sidebar-rail-tooltip") || element.getAttribute("aria-label") || "";
+    element.setAttribute("data-bs-title", title);
+
+    let tooltip = bootstrap.Tooltip.getInstance(element);
+    if (state.sidebarCollapsed) {
+      if (!tooltip) {
+        tooltip = ensureTooltip(element, { title });
+      } else {
+        tooltip.setContent({ ".tooltip-inner": title });
+        tooltip.enable();
+      }
+    } else if (tooltip) {
+      tooltip.hide();
+      tooltip.disable();
+    }
+  });
+}
+
+function applySidebarLayout(options = {}) {
   if (!sidebar) {
     return;
+  }
+
+  const animate = options.animate !== false;
+  if (!animate) {
+    document.documentElement.classList.add("is-sidebar-resizing");
+  } else {
+    document.documentElement.classList.remove("is-sidebar-resizing");
   }
 
   const width = state.sidebarCollapsed ? SIDEBAR_COLLAPSED : state.sidebarWidth;
@@ -1760,12 +1836,16 @@ function applySidebarLayout() {
     const icon = sidebarCollapseBtn.querySelector("i");
     const label = state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar";
     if (icon) {
-      icon.className = state.sidebarCollapsed ? "bi bi-arrows-angle-expand" : "bi bi-arrows-angle-contract";
+      icon.className = state.sidebarCollapsed ? "bi bi-chevron-bar-right" : "bi bi-chevron-bar-left";
     }
-    sidebarCollapseBtn.setAttribute("aria-label", label);
-    const tip = bootstrap.Tooltip.getInstance(sidebarCollapseBtn);
-    tip?.setContent({ ".tooltip-inner": label });
-    sidebarCollapseBtn.setAttribute("data-bs-title", label);
+    setTooltipTitle(sidebarCollapseBtn, label);
+  }
+
+  syncSidebarRailTooltips();
+
+  if (!animate) {
+    void document.documentElement.offsetWidth;
+    document.documentElement.classList.remove("is-sidebar-resizing");
   }
 }
 
@@ -1842,6 +1922,7 @@ function libraryFilterChips() {
       <button class="chip${state.view === "albums" && state.albumFilter === "singles" ? " active" : ""}" type="button" data-nav="albums" data-filter="singles">Singles</button>
       <button class="chip${state.view === "albums" && state.albumFilter === "artists" ? " active" : ""}" type="button" data-nav="albums" data-filter="artists">Artist</button>
       <button class="chip${state.view === "tracks" ? " active" : ""}" type="button" data-nav="tracks">Tracks</button>
+      <button class="chip${state.view === "playlists" ? " active" : ""}" type="button" data-nav="playlists">Playlists</button>
     </div>
   `;
 }
@@ -2071,6 +2152,58 @@ async function setStageAccentFromArt(coverUrl, fallbackColor, depth = 320) {
   setStageAccent(fallbackColor, depth);
 }
 
+/** Soften an accent for Home only — does not mutate extractVibrantColor / cache. */
+function softenHomeAccent(color) {
+  const rgb = parseColor(color);
+  if (!rgb) {
+    return color;
+  }
+  let [h, s, l] = rgbToHsl(rgb);
+  s = Math.min(s * 0.7, 0.52);
+  l = Math.min(0.38, Math.max(0.16, l * 0.82));
+  const out = hslToRgb([h, s, l]);
+  return `rgb(${out[0]}, ${out[1]}, ${out[2]})`;
+}
+
+function mixRgbColors(left, right, amount) {
+  const a = parseColor(left);
+  const b = parseColor(right);
+  if (!a || !b) {
+    return left;
+  }
+  const t = Math.min(1, Math.max(0, amount));
+  return `rgb(${a.map((channel, index) => Math.round(channel + (b[index] - channel) * t)).join(", ")})`;
+}
+
+function setHomeStageAccent(color, depth = 400) {
+  const soft = softenHomeAccent(color);
+  if (!soft) {
+    mainStage.style.background = "";
+    mainStage.style.setProperty("--stage-accent-bar", "");
+    return;
+  }
+  const mid = mixRgbColors(soft, "#121212", 0.58);
+  const midStop = Math.round(depth * 0.52);
+  mainStage.style.background =
+    `linear-gradient(180deg, ${soft} 0%, ${mid} ${midStop}px, var(--emp-bg) ${depth}px)`;
+  mainStage.style.setProperty("--stage-accent-bar", darkenColor(soft, 0.5) || "");
+}
+
+async function setHomeStageAccentFromArt(coverUrl, fallbackColor, depth = 400) {
+  const seq = renderSeq;
+  if (coverUrl) {
+    const color = await extractVibrantColor(coverUrl);
+    if (seq !== renderSeq) {
+      return;
+    }
+    if (color) {
+      setHomeStageAccent(color, depth);
+      return;
+    }
+  }
+  setHomeStageAccent(fallbackColor, depth);
+}
+
 function setStageSolid(color) {
   mainStage.style.background = color;
   mainStage.style.setProperty("--stage-accent-bar", color);
@@ -2138,7 +2271,317 @@ function lyricsBackgroundColor(color) {
 }
 
 function matchesQuery(text, query) {
-  return text.toLowerCase().includes(query);
+  return normalizeSearchText(text).includes(query);
+}
+
+function normalizeSearchText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeSearchQuery(raw) {
+  return normalizeSearchText(raw);
+}
+
+function scoreField(text, query) {
+  if (!query) {
+    return 0;
+  }
+  const normalized = normalizeSearchText(text);
+  if (!normalized) {
+    return 0;
+  }
+  if (normalized === query) {
+    return 100;
+  }
+  if (normalized.startsWith(query)) {
+    return 80;
+  }
+  if (normalized.includes(` ${query}`) || normalized.includes(query)) {
+    return normalized.includes(` ${query}`) ? 60 : 50;
+  }
+  return 0;
+}
+
+function scoreEntity(primary, secondaries, query) {
+  const primaryScore = scoreField(primary, query);
+  let secondaryScore = 0;
+  for (const field of secondaries || []) {
+    secondaryScore = Math.max(secondaryScore, scoreField(field, query));
+  }
+  if (!primaryScore && !secondaryScore) {
+    return 0;
+  }
+  if (primaryScore) {
+    return primaryScore;
+  }
+  return Math.max(0, secondaryScore - 25);
+}
+
+const SEARCH_TYPE_TIEBREAK = {
+  artist: 4,
+  playlist: 3,
+  album: 2,
+  song: 1
+};
+
+function compareScored(left, right) {
+  if (right.score !== left.score) {
+    return right.score - left.score;
+  }
+  const typeDelta = (SEARCH_TYPE_TIEBREAK[right.type] || 0) - (SEARCH_TYPE_TIEBREAK[left.type] || 0);
+  if (typeDelta) {
+    return typeDelta;
+  }
+  const nameCmp = compareText(left.sortName, right.sortName);
+  if (nameCmp) {
+    return nameCmp;
+  }
+  return left.index - right.index;
+}
+
+function searchArtists(query) {
+  const byName = new Map();
+  for (const artist of catalogArtists()) {
+    const key = String(artist.name ?? "").toLowerCase();
+    byName.set(key, {
+      ...artist,
+      trackCount: tracksByArtist(artist.name).length
+    });
+  }
+  for (const track of state.library.tracks) {
+    const key = String(track.artist ?? "").toLowerCase();
+    if (!key || byName.has(key)) {
+      continue;
+    }
+    byName.set(key, {
+      name: track.artist,
+      albums: [],
+      coverUrl: track.coverUrl,
+      color: track.color,
+      trackCount: tracksByArtist(track.artist).length
+    });
+  }
+
+  return [...byName.values()]
+    .map((artist, index) => {
+      const score = scoreEntity(artist.name, [], query);
+      if (!score) {
+        return null;
+      }
+      return {
+        type: "artist",
+        score,
+        sortName: artist.name,
+        index,
+        artist
+      };
+    })
+    .filter(Boolean)
+    .sort(compareScored);
+}
+
+function searchPlaylists(query) {
+  return state.playlists
+    .map((playlist, index) => {
+      const score = scoreEntity(playlist.name, [], query);
+      if (!score) {
+        return null;
+      }
+      return {
+        type: "playlist",
+        score,
+        sortName: playlist.name,
+        index,
+        playlist
+      };
+    })
+    .filter(Boolean)
+    .sort(compareScored);
+}
+
+function searchAlbums(query) {
+  return allAlbums()
+    .map((album, index) => {
+      const score = scoreEntity(album.title, [album.artist], query);
+      if (!score) {
+        return null;
+      }
+      return {
+        type: "album",
+        score,
+        sortName: album.title,
+        index,
+        album
+      };
+    })
+    .filter(Boolean)
+    .sort(compareScored);
+}
+
+function searchSongs(query) {
+  return state.library.tracks
+    .map((track, index) => {
+      const score = scoreEntity(track.title, [track.artist, track.album], query);
+      if (!score) {
+        return null;
+      }
+      return {
+        type: "song",
+        score,
+        sortName: track.title,
+        index,
+        track
+      };
+    })
+    .filter(Boolean)
+    .sort(compareScored);
+}
+
+function buildSearchResults(rawQuery) {
+  const query = normalizeSearchQuery(rawQuery);
+  if (!query) {
+    return {
+      query,
+      artists: [],
+      playlists: [],
+      albums: [],
+      songs: [],
+      top: null,
+      total: 0
+    };
+  }
+
+  const artists = searchArtists(query);
+  const playlists = searchPlaylists(query);
+  const albums = searchAlbums(query);
+  const songs = searchSongs(query);
+  const top = [...artists, ...playlists, ...albums, ...songs].sort(compareScored)[0] ?? null;
+
+  return {
+    query,
+    artists,
+    playlists,
+    albums,
+    songs,
+    top,
+    total: artists.length + playlists.length + albums.length + songs.length
+  };
+}
+
+function resetSearchExpand(queryKey) {
+  if (searchExpand.queryKey === queryKey) {
+    return;
+  }
+  searchExpand = {
+    queryKey,
+    artists: SEARCH_ARTIST_LIMIT,
+    playlists: SEARCH_PLAYLIST_LIMIT,
+    albums: SEARCH_ALBUM_LIMIT,
+    tracks: SEARCH_TRACK_LIMIT
+  };
+}
+
+function readSearchHistory() {
+  try {
+    const raw = localStorage.getItem(SEARCH_HISTORY_KEY);
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .filter((item) => typeof item === "string" && item.trim())
+      .map((item) => item.trim())
+      .slice(0, SEARCH_HISTORY_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function writeSearchHistory(entries) {
+  try {
+    localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(entries.slice(0, SEARCH_HISTORY_MAX)));
+  } catch {
+    // Ignore quota / private mode failures.
+  }
+}
+
+function isMeaningfulSearchQuery(raw, { forIdle = false } = {}) {
+  const trimmed = String(raw ?? "").trim();
+  if (trimmed.length < SEARCH_HISTORY_MIN_LEN) {
+    return false;
+  }
+  if (forIdle) {
+    return trimmed.length >= 3 || /\s/.test(trimmed);
+  }
+  return true;
+}
+
+function commitSearchHistory(raw) {
+  const trimmed = String(raw ?? "").trim();
+  if (!isMeaningfulSearchQuery(trimmed)) {
+    return;
+  }
+  const existing = readSearchHistory();
+  const next = [
+    trimmed,
+    ...existing.filter((item) => item.toLowerCase() !== trimmed.toLowerCase())
+  ].slice(0, SEARCH_HISTORY_MAX);
+  writeSearchHistory(next);
+}
+
+function removeSearchHistoryEntry(term) {
+  const needle = String(term ?? "").trim().toLowerCase();
+  writeSearchHistory(readSearchHistory().filter((item) => item.toLowerCase() !== needle));
+}
+
+function clearSearchHistory() {
+  writeSearchHistory([]);
+}
+
+function scheduleSearchHistoryIdleCommit() {
+  window.clearTimeout(searchHistoryIdleTimer);
+  searchHistoryIdleTimer = window.setTimeout(() => {
+    if (state.view !== "search") {
+      return;
+    }
+    if (!isMeaningfulSearchQuery(state.query, { forIdle: true })) {
+      return;
+    }
+    commitSearchHistory(state.query);
+  }, SEARCH_HISTORY_IDLE_MS);
+}
+
+function clearSearchHistoryIdleCommit() {
+  window.clearTimeout(searchHistoryIdleTimer);
+  searchHistoryIdleTimer = 0;
+}
+
+function updateSearchQuery(query, { focus = false, commit = false } = {}) {
+  state.query = query;
+  const entry = { view: "search", query: state.query };
+  historyStack[historyIndex] = entry;
+  focusSearchOnRender = focus;
+  if (commit) {
+    commitSearchHistory(state.query);
+    clearSearchHistoryIdleCommit();
+  }
+  if (state.view === "search") {
+    renderSearch({ preserveFocus: false });
+    searchInput.value = state.query;
+    if (focus) {
+      searchInput.focus();
+    }
+  } else {
+    render(entry);
+  }
+  focusSearchOnRender = true;
 }
 
 function sortChips({ showLayout = false } = {}) {
@@ -2196,11 +2639,13 @@ function render(entry) {
   topSearch.classList.toggle("d-none", entry.view !== "search");
   if (entry.view === "search") {
     searchInput.value = state.query;
-    searchInput.focus();
+    if (focusSearchOnRender) {
+      searchInput.focus();
+    }
   }
 
   if (entry.view === "home") {
-    setStageAccent("#1e3b2a");
+    setHomeStageAccent("#1e3b2a");
     renderHome();
   } else if (entry.view === "search") {
     setStageAccent("#1f1f1f");
@@ -2211,6 +2656,9 @@ function render(entry) {
   } else if (entry.view === "tracks") {
     setStageAccent("#121826");
     renderAllTracks();
+  } else if (entry.view === "playlists") {
+    setStageAccent("#2a1a3a");
+    renderPlaylistsLibrary();
   } else if (entry.view === "album") {
     renderAlbum(entry.albumId);
   } else if (entry.view === "playlist") {
@@ -2422,6 +2870,87 @@ function libraryArtistRow(artist) {
   `;
 }
 
+function libraryPlaylistRow(playlist) {
+  const playing = isSidebarPlaylistPlaying(playlist.id);
+  const count = playlistTracks(playlist).length;
+  return `
+    <div class="playlist-row${playing ? " is-playing" : ""}">
+      <button class="playlist-item library-row${state.view === "playlist" && state.playlistId === playlist.id ? " active" : ""}" type="button" data-open-playlist="${playlist.id}">
+        <span class="playlist-cover-wrap">
+          ${playlistCoverMarkup(playlist, "playlist-cover")}
+        </span>
+        <span class="playlist-meta">
+          <span class="playlist-title">${escapeHtml(playlist.name)}</span>
+          <span class="playlist-sub">Playlist • ${songLabel(count)}</span>
+        </span>
+      </button>
+      <button class="playlist-play${playing ? " is-playing" : ""}" type="button" tabindex="-1" data-play-playlist="${playlist.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(playlist.name)}">
+        <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
+      </button>
+    </div>
+  `;
+}
+
+function catalogPlaylists() {
+  const liked = likedPlaylist();
+  const rank = new Map(state.recentPlaylistIds.map((id, index) => [id, index]));
+  const others = state.playlists.filter((playlist) => !isLikedPlaylist(playlist));
+  let ordered;
+  if (state.librarySort === "title") {
+    ordered = [...others].sort((left, right) => compareText(left.name, right.name));
+  } else {
+    ordered = [...others].sort((left, right) => {
+      const leftRank = rank.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+      const rightRank = rank.get(right.id) ?? Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank;
+      }
+      return compareText(left.name, right.name);
+    });
+  }
+  return liked ? [liked, ...ordered] : ordered;
+}
+
+function renderPlaylistsLibrary() {
+  const playlists = catalogPlaylists();
+  const userPlaylists = playlists.filter((playlist) => !isLikedPlaylist(playlist));
+  const list = state.libraryLayout === "list";
+  const body = playlists.length
+    ? (list
+      ? `<div class="library-list">${playlists.map(libraryPlaylistRow).join("")}</div>`
+      : `<div class="card-grid">${playlists.map(playlistCard).join("")}</div>`)
+    : "";
+  const emptyHint = !userPlaylists.length
+    ? `<p class="text-secondary mt-3">Create a playlist from the sidebar to organize your library.</p>`
+    : "";
+
+  if (!playlists.length) {
+    viewArea.innerHTML = `
+      <h1 class="greeting">Playlists</h1>
+      <div class="library-toolbar">
+        ${libraryFilterChips()}
+        ${sortChips({ showLayout: true })}
+      </div>
+      <div class="empty-state">
+        <h2>No playlists yet</h2>
+        <p>Create a playlist from the sidebar to start organizing your music.</p>
+      </div>
+    `;
+    return;
+  }
+
+  viewArea.innerHTML = `
+    <h1 class="greeting">Playlists</h1>
+    <div class="library-toolbar">
+      ${libraryFilterChips()}
+      ${sortChips({ showLayout: true })}
+    </div>
+    <p class="collection-stat">${playlists.length} ${playlists.length === 1 ? "playlist" : "playlists"}</p>
+    ${body}
+    ${emptyHint}
+  `;
+}
+
 function quickCard(album) {
   const playing = isSidebarAlbumPlaying(album.id);
   return `
@@ -2433,7 +2962,7 @@ function quickCard(album) {
         ${playing ? nowEqMarkup("now-eq quick-eq") : ""}
         <span class="quick-title">${escapeHtml(album.title)}</span>
       </button>
-      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" tabindex="-1" data-play-album="${album.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(album.title)}">
+      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" data-play-album="${album.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(album.title)}">
         <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
       </button>
     </div>
@@ -2451,7 +2980,7 @@ function quickPlaylistCard(playlist) {
         ${playing ? nowEqMarkup("now-eq quick-eq") : ""}
         <span class="quick-title">${escapeHtml(playlist.name)}</span>
       </button>
-      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" tabindex="-1" data-play-playlist="${playlist.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(playlist.name)}">
+      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" data-play-playlist="${playlist.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(playlist.name)}">
         <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
       </button>
     </div>
@@ -2542,7 +3071,7 @@ function syncHomeLayout() {
   return cols;
 }
 
-function shelfSection(title, items, filter, { subtitleMode = "type" } = {}) {
+function shelfSection(title, items, filter, { subtitleMode = "type", shelf = "" } = {}) {
   if (!items.length) {
     return "";
   }
@@ -2550,8 +3079,10 @@ function shelfSection(title, items, filter, { subtitleMode = "type" } = {}) {
   const cols = homeShelfColumns();
   const shown = items.slice(0, HOME_SHELF_SIZE);
   const showAll = items.length > cols;
+  const shelfClass = shelf ? ` home-shelf-${shelf}` : "";
+  const shelfAttr = shelf ? ` data-shelf="${shelf}"` : "";
   return `
-    <section class="home-shelf" data-total="${items.length}">
+    <section class="home-shelf${shelfClass}"${shelfAttr} data-total="${items.length}">
       <div class="section-head">
         <button class="section-title-btn" type="button" data-nav="albums" data-filter="${filter}">
           <h2>${title}</h2>
@@ -2585,14 +3116,14 @@ function renderHome() {
     || (accentPlaylist ? playlistArtworkUrls(accentPlaylist)[0] : null)
     || null;
   const fallbackAccent = accentAlbum?.color || "#1e3b2a";
-  setStageAccent(fallbackAccent, 300);
-  setStageAccentFromArt(coverUrl, fallbackAccent, 300);
+  setHomeStageAccent(fallbackAccent);
+  setHomeStageAccentFromArt(coverUrl, fallbackAccent);
 
   viewArea.innerHTML = `
     <div class="home-page">
       <h1 class="greeting">${greeting()}</h1>
       ${quick.length ? `<div class="quick-grid">${quick.map(renderQuickCard).join("")}</div>` : ""}
-      ${recents.length > HOME_QUICK_SIZE ? shelfSection("Recently played", recents, "all", { subtitleMode: "artist" }) : ""}
+      ${recents.length > HOME_QUICK_SIZE ? shelfSection("Recently played", recents, "all", { subtitleMode: "artist", shelf: "recent" }) : ""}
       ${shelfSection("Albums", albumsByRecency(albums), "albums", { subtitleMode: "artist" })}
       ${shelfSection("Singles", albumsByRecency(singles), "singles", { subtitleMode: "artist" })}
     </div>
@@ -2675,41 +3206,349 @@ function renderAllTracks() {
   mountTrackVirtual(tracks, true);
 }
 
-function renderSearch() {
-  const query = state.query.trim().toLowerCase();
-  if (!query) {
-    viewArea.innerHTML = `
-      <h1 class="greeting">Search</h1>
-      <p class="text-secondary">Find albums, singles, and tracks in your library.</p>
-    `;
-    return;
+function searchShowMoreButton(kind, label, shown, total) {
+  if (shown >= total) {
+    return "";
+  }
+  const remaining = total - shown;
+  const next = Math.min(SEARCH_SHOW_MORE_BATCH, remaining);
+  return `
+    <button class="search-show-more" type="button" data-search-more="${kind}">
+      Show more ${label} (${next})
+    </button>
+  `;
+}
+
+function searchRecentMarkup() {
+  const recent = readSearchHistory();
+  if (!recent.length) {
+    return "";
+  }
+  return `
+    <section class="search-recent" aria-label="Recent searches">
+      <div class="section-head">
+        <h2>Recent searches</h2>
+        <button class="see-all" type="button" data-search-clear-history>Clear history</button>
+      </div>
+      <ul class="search-recent-list">
+        ${recent.map((term) => `
+          <li class="search-recent-item">
+            <button class="search-recent-query" type="button" data-search-recent="${escapeHtml(term)}">
+              <i class="bi bi-clock-history" aria-hidden="true"></i>
+              <span>${escapeHtml(term)}</span>
+            </button>
+            <button class="search-recent-remove" type="button" data-search-remove="${escapeHtml(term)}" aria-label="Remove ${escapeHtml(term)} from recent searches">
+              <i class="bi bi-x-lg" aria-hidden="true"></i>
+            </button>
+          </li>
+        `).join("")}
+      </ul>
+    </section>
+  `;
+}
+
+function searchBrowseMarkup() {
+  return `
+    <section class="search-browse" aria-label="Browse your library">
+      <div class="section-head">
+        <h2>Browse your library</h2>
+      </div>
+      <div class="search-browse-grid">
+        <button class="search-browse-tile search-browse-artists" type="button" data-nav="albums" data-filter="artists">
+          <i class="bi bi-people-fill" aria-hidden="true"></i>
+          <span>Artists</span>
+        </button>
+        <button class="search-browse-tile search-browse-albums" type="button" data-nav="albums" data-filter="albums">
+          <i class="bi bi-disc-fill" aria-hidden="true"></i>
+          <span>Albums</span>
+        </button>
+        <button class="search-browse-tile search-browse-songs" type="button" data-nav="tracks">
+          <i class="bi bi-music-note-beamed" aria-hidden="true"></i>
+          <span>Songs</span>
+        </button>
+        <button class="search-browse-tile search-browse-playlists" type="button" data-nav="playlists">
+          <i class="bi bi-music-note-list" aria-hidden="true"></i>
+          <span>Playlists</span>
+        </button>
+      </div>
+    </section>
+  `;
+}
+
+function searchTopResultMarkup(top) {
+  if (!top) {
+    return "";
   }
 
-  const albums = allAlbums().filter((album) =>
-    matchesQuery(`${album.title} ${album.artist}`, query));
-  const tracks = state.library.tracks.filter((track) =>
-    matchesQuery(`${track.title} ${track.artist} ${track.album}`, query));
-  const shownAlbums = albums.slice(0, SEARCH_ALBUM_LIMIT);
-  const shownTracks = tracks.slice(0, SEARCH_TRACK_LIMIT);
+  if (top.type === "song") {
+    const track = top.track;
+    return `
+      <section class="search-results-section search-top-section" aria-label="Top result">
+        <div class="section-head"><h2>Top result</h2></div>
+        <div class="search-top-result search-top-song">
+          <button class="search-top-main" type="button" data-play-id="${track.id}" aria-label="Play ${escapeHtml(track.title)}">
+            ${coverMarkup(track, "search-top-cover")}
+            <span class="search-top-copy">
+              <span class="search-top-title">${escapeHtml(track.title)}</span>
+              <span class="search-top-meta">Song • ${escapeHtml(track.artist)}${track.album ? ` • ${escapeHtml(track.album)}` : ""}</span>
+            </span>
+          </button>
+        </div>
+      </section>
+    `;
+  }
+
+  if (top.type === "artist") {
+    const artist = top.artist;
+    const releases = artist.albums?.length || 0;
+    const songs = artist.trackCount || tracksByArtist(artist.name).length;
+    const meta = releases
+      ? `${releases} ${releases === 1 ? "release" : "releases"}`
+      : songLabel(songs);
+    return `
+      <section class="search-results-section search-top-section" aria-label="Top result">
+        <div class="section-head"><h2>Top result</h2></div>
+        <div class="search-top-result">
+          <button class="search-top-main" type="button" data-open-artist="${escapeHtml(artist.name)}">
+            ${coverMarkup(artist, "search-top-cover artist-cover")}
+            <span class="search-top-copy">
+              <span class="search-top-title">${escapeHtml(artist.name)}</span>
+              <span class="search-top-meta">Artist • ${meta}</span>
+            </span>
+          </button>
+          <button class="play-fab search-top-play" type="button" data-play-artist="${escapeHtml(artist.name)}" title="Play" aria-label="Play ${escapeHtml(artist.name)}">
+            <i class="bi bi-play-fill"></i>
+          </button>
+        </div>
+      </section>
+    `;
+  }
+
+  if (top.type === "album") {
+    const album = top.album;
+    return `
+      <section class="search-results-section search-top-section" aria-label="Top result">
+        <div class="section-head"><h2>Top result</h2></div>
+        <div class="search-top-result">
+          <button class="search-top-main" type="button" data-open-album="${album.id}">
+            ${coverMarkup(album, "search-top-cover")}
+            <span class="search-top-copy">
+              <span class="search-top-title">${escapeHtml(album.title)}</span>
+              <span class="search-top-meta">${album.isSingle ? "Single" : "Album"} • ${escapeHtml(album.artist)}</span>
+            </span>
+          </button>
+          <button class="play-fab search-top-play" type="button" data-play-album="${album.id}" title="Play" aria-label="Play ${escapeHtml(album.title)}">
+            <i class="bi bi-play-fill"></i>
+          </button>
+        </div>
+      </section>
+    `;
+  }
+
+  if (top.type === "playlist") {
+    const playlist = top.playlist;
+    const count = playlistTracks(playlist).length;
+    return `
+      <section class="search-results-section search-top-section" aria-label="Top result">
+        <div class="section-head"><h2>Top result</h2></div>
+        <div class="search-top-result">
+          <button class="search-top-main" type="button" data-open-playlist="${playlist.id}">
+            ${playlistCoverMarkup(playlist, "search-top-cover")}
+            <span class="search-top-copy">
+              <span class="search-top-title">${escapeHtml(playlist.name)}</span>
+              <span class="search-top-meta">Playlist • ${songLabel(count)}</span>
+            </span>
+          </button>
+          <button class="play-fab search-top-play" type="button" data-play-playlist="${playlist.id}" title="Play" aria-label="Play ${escapeHtml(playlist.name)}">
+            <i class="bi bi-play-fill"></i>
+          </button>
+        </div>
+      </section>
+    `;
+  }
+
+  return "";
+}
+
+function searchArtistCard(artist) {
+  const releases = artist.albums?.length || 0;
+  const sub = releases
+    ? `Artist • ${releases} ${releases === 1 ? "release" : "releases"}`
+    : `Artist • ${songLabel(artist.trackCount || tracksByArtist(artist.name).length)}`;
+  return `
+    <article class="media-card" data-open-artist="${escapeHtml(artist.name)}">
+      <div class="media-cover-wrap">
+        ${coverMarkup(artist, "media-cover artist-cover")}
+        <button class="play-fab" type="button" data-play-artist="${escapeHtml(artist.name)}" title="Play" aria-label="Play ${escapeHtml(artist.name)}">
+          <i class="bi bi-play-fill"></i>
+        </button>
+      </div>
+      <div class="media-title">${escapeHtml(artist.name)}</div>
+      <div class="media-sub">${sub}</div>
+    </article>
+  `;
+}
+
+function renderSearchLanding() {
+  const emptyLibrary = !state.library.tracks.length;
+  if (emptyLibrary && !musicFolders().length) {
+    return `
+      <div class="search-landing">
+        <p class="search-tagline text-secondary">Find your next favorite song in your library.</p>
+        ${searchBrowseMarkup()}
+        <div class="empty-state search-empty-library">
+          <h2>No music found</h2>
+          <p>Add a music folder to start building your library.</p>
+          <button class="pill-btn empty-cta" type="button" data-add-folder>Add music folder</button>
+        </div>
+      </div>
+    `;
+  }
+  if (emptyLibrary) {
+    return `
+      <div class="search-landing">
+        <p class="search-tagline text-secondary">Find your next favorite song in your library.</p>
+        ${searchBrowseMarkup()}
+        <div class="empty-state search-empty-library">
+          <h2>No music found</h2>
+          <p>EMP couldn’t find tracks in your music folders. Add albums there, then refresh your library.</p>
+          <button class="pill-btn empty-cta" type="button" data-nav="settings">Open Settings</button>
+        </div>
+      </div>
+    `;
+  }
+  return `
+    <div class="search-landing">
+      <p class="search-tagline text-secondary">Find your next favorite song in your library.</p>
+      ${searchRecentMarkup()}
+      ${searchBrowseMarkup()}
+    </div>
+  `;
+}
+
+function renderSearchResultsBody(results) {
+  if (!state.library.tracks.length && !state.playlists.length) {
+    return `
+      <div class="search-results">
+        <div class="empty-state">
+          <h2>No music found</h2>
+          <p>Add a music folder to start building your library.</p>
+          <button class="pill-btn empty-cta" type="button" data-add-folder>Add music folder</button>
+        </div>
+      </div>
+    `;
+  }
+
+  if (!results.total) {
+    return `
+      <div class="search-results search-no-results">
+        <h2 class="search-no-results-title">No results for “${escapeHtml(state.query)}”</h2>
+        <p class="text-secondary">Try a different song, artist, album, or playlist name.</p>
+      </div>
+    `;
+  }
+
+  resetSearchExpand(results.query);
+  const shownArtists = results.artists.slice(0, searchExpand.artists);
+  const shownPlaylists = results.playlists.slice(0, searchExpand.playlists);
+  const shownAlbums = results.albums.slice(0, searchExpand.albums);
+  const shownSongs = results.songs.slice(0, searchExpand.tracks);
+
+  const artistSection = shownArtists.length ? `
+    <section class="search-results-section" aria-label="Artists">
+      <div class="section-head"><h2>Artists</h2></div>
+      <div class="card-grid">${shownArtists.map((item) => searchArtistCard(item.artist)).join("")}</div>
+      ${searchShowMoreButton("artists", "artists", shownArtists.length, results.artists.length)}
+    </section>
+  ` : "";
+
+  const playlistSection = shownPlaylists.length ? `
+    <section class="search-results-section" aria-label="Playlists">
+      <div class="section-head"><h2>Playlists</h2></div>
+      <div class="card-grid">${shownPlaylists.map((item) => playlistCard(item.playlist)).join("")}</div>
+      ${searchShowMoreButton("playlists", "playlists", shownPlaylists.length, results.playlists.length)}
+    </section>
+  ` : "";
+
+  const albumSection = shownAlbums.length ? `
+    <section class="search-results-section" aria-label="Albums and singles">
+      <div class="section-head"><h2>Albums &amp; singles</h2></div>
+      <div class="card-grid search-album-grid">${shownAlbums.map((item) => albumCard(item.album)).join("")}</div>
+      ${searchShowMoreButton("albums", "albums", shownAlbums.length, results.albums.length)}
+    </section>
+  ` : "";
+
+  const songSection = shownSongs.length ? `
+    <section class="search-results-section" aria-label="Songs">
+      <div class="section-head"><h2>Songs</h2></div>
+      ${trackTable(shownSongs.map((item) => item.track), { showAlbum: true })}
+      ${searchShowMoreButton("tracks", "songs", shownSongs.length, results.songs.length)}
+    </section>
+  ` : "";
+
+  return `
+    <div class="search-results">
+      <div class="visually-hidden" aria-live="polite">${results.total} ${results.total === 1 ? "result" : "results"}</div>
+      ${searchTopResultMarkup(results.top)}
+      ${artistSection}
+      ${playlistSection}
+      ${albumSection}
+      ${songSection}
+    </div>
+  `;
+}
+
+function renderSearch({ preserveFocus = false } = {}) {
+  const queryKey = normalizeSearchQuery(state.query);
+  const scrollTop = preserveFocus ? viewArea.scrollTop : 0;
+  const activeMore = preserveFocus
+    ? document.activeElement?.getAttribute?.("data-search-more") || null
+    : null;
+
+  let body;
+  if (!queryKey) {
+    body = renderSearchLanding();
+  } else {
+    body = renderSearchResultsBody(buildSearchResults(state.query));
+  }
 
   viewArea.innerHTML = `
-    <h1 class="greeting">Search</h1>
-    ${shownAlbums.length ? `
-      <div class="section-head">
-        <h2>Albums</h2>
-        ${albums.length > SEARCH_ALBUM_LIMIT ? `<span class="see-all">Showing ${shownAlbums.length} of ${albums.length}</span>` : ""}
-      </div>
-      <div class="card-grid">${shownAlbums.map(albumCard).join("")}</div>
-    ` : ""}
-    ${shownTracks.length ? `
-      <div class="section-head ${shownAlbums.length ? "mt-4" : ""}">
-        <h2>Songs</h2>
-        ${tracks.length > SEARCH_TRACK_LIMIT ? `<span class="see-all">Showing ${shownTracks.length} of ${tracks.length}</span>` : ""}
-      </div>
-      ${trackTable(shownTracks, { showAlbum: true })}
-    ` : ""}
-    ${!albums.length && !tracks.length ? `<p class="text-secondary">No results for “${escapeHtml(state.query)}”.</p>` : ""}
+    <div class="search-page">
+      <h1 class="greeting">Search</h1>
+      ${body}
+    </div>
   `;
+
+  if (preserveFocus) {
+    viewArea.scrollTop = scrollTop;
+    if (activeMore) {
+      const button = viewArea.querySelector(`[data-search-more="${activeMore}"]`);
+      if (button) {
+        button.focus();
+      } else {
+        const heading = viewArea.querySelector(".search-results-section h2");
+        if (heading) {
+          heading.setAttribute("tabindex", "-1");
+          heading.focus({ preventScroll: true });
+        }
+      }
+    }
+  }
+}
+
+function expandSearchResults(kind) {
+  const key = normalizeSearchQuery(state.query);
+  resetSearchExpand(key);
+  if (kind === "artists") {
+    searchExpand.artists += SEARCH_SHOW_MORE_BATCH;
+  } else if (kind === "playlists") {
+    searchExpand.playlists += SEARCH_SHOW_MORE_BATCH;
+  } else if (kind === "albums") {
+    searchExpand.albums += SEARCH_SHOW_MORE_BATCH;
+  } else if (kind === "tracks") {
+    searchExpand.tracks += SEARCH_SHOW_MORE_BATCH;
+  }
+  renderSearch({ preserveFocus: true });
 }
 
 function renderEqualizerPanel() {
@@ -2991,23 +3830,25 @@ function renderAlbum(albumId) {
 
   viewArea.innerHTML = `
     <div class="album-page">
-      <div class="album-hero">
-        ${coverMarkup(album, "album-hero-cover")}
-        <div class="album-hero-text">
-          <div class="album-kicker">${album.isSingle ? "Single" : "Album"}</div>
-          <h1>${escapeHtml(album.title)}</h1>
-          <div class="album-meta">
-            ${coverMarkup(album, "album-meta-avatar")}
-            <button class="inline-link album-artist-link" type="button" data-open-artist="${escapeHtml(album.artist)}">${escapeHtml(album.artist)}</button>
-            ${album.year ? `<span class="album-meta-dot">•</span><span>${album.year}</span>` : ""}
-            <span class="album-meta-dot">•</span>
-            <span>${songLabel(tracks.length)}</span>
-            <span class="album-meta-dot">•</span>
-            <span>${formatCollectionDuration(totalDuration)}</span>
+      <div class="album-page-content">
+        <div class="album-hero">
+          ${coverMarkup(album, "album-hero-cover")}
+          <div class="album-hero-text">
+            <div class="album-kicker">${album.isSingle ? "Single" : "Album"}</div>
+            <h1>${escapeHtml(album.title)}</h1>
+            <div class="album-meta">
+              ${coverMarkup(album, "album-meta-avatar")}
+              <button class="inline-link album-artist-link" type="button" data-open-artist="${escapeHtml(album.artist)}">${escapeHtml(album.artist)}</button>
+              ${album.year ? `<span class="album-meta-dot">•</span><span>${album.year}</span>` : ""}
+              <span class="album-meta-dot">•</span>
+              <span>${songLabel(tracks.length)}</span>
+              <span class="album-meta-dot">•</span>
+              <span>${formatCollectionDuration(totalDuration)}</span>
+            </div>
           </div>
         </div>
+        ${collectionActionsMarkup(album.title, `data-play-album="${album.id}"`)}
       </div>
-      ${collectionActionsMarkup(album.title, `data-play-album="${album.id}"`)}
       <div class="track-panel">
         ${trackTable(tracks, { showAlbum: false, showCover: false, showHeader: true })}
       </div>
@@ -3035,22 +3876,27 @@ function renderPlaylist(playlistId) {
 
   viewArea.innerHTML = `
     <div class="album-page">
-      <div class="album-hero">
-        ${playlistCoverMarkup(playlist, "album-hero-cover")}
-        <div class="album-hero-text">
-          <div class="album-kicker">Playlist</div>
-          <h1>${escapeHtml(playlist.name)}</h1>
-          <div class="album-meta">
-            <span>${songLabel(tracks.length)}</span>
-            <span class="album-meta-dot">•</span>
-            <span>${formatCollectionDuration(totalDuration)}</span>
+      <div class="album-page-content">
+        <div class="album-hero">
+          ${playlistCoverMarkup(playlist, "album-hero-cover")}
+          <div class="album-hero-text">
+            <div class="album-kicker">Playlist</div>
+            <h1>${escapeHtml(playlist.name)}</h1>
+            <div class="album-meta">
+              <span>${songLabel(tracks.length)}</span>
+              <span class="album-meta-dot">•</span>
+              <span>${formatCollectionDuration(totalDuration)}</span>
+            </div>
           </div>
         </div>
+        ${collectionActionsMarkup(playlist.name, `data-play-playlist="${playlist.id}"`, { more: true })}
+        ${tracks.length
+          ? ""
+          : `<p class="text-secondary">This playlist is empty. Right-click a track on an album to add songs.</p>`}
       </div>
-      ${collectionActionsMarkup(playlist.name, `data-play-playlist="${playlist.id}"`, { more: true })}
       ${tracks.length
         ? `<div class="track-panel">${trackTable(tracks, { showAlbum: true, showCover: true, showHeader: true })}</div>`
-        : `<p class="text-secondary">This playlist is empty. Right-click a track on an album to add songs.</p>`}
+        : ""}
     </div>
   `;
 }
@@ -3076,34 +3922,38 @@ function renderArtist(name) {
 
   viewArea.innerHTML = `
     <div class="album-page">
-      <div class="album-hero">
-        ${coverMarkup(albums[0] || tracks[0], "album-hero-cover")}
-        <div class="album-hero-text">
-          <div class="album-kicker">Artist</div>
-          <h1>${escapeHtml(name)}</h1>
-          <div class="artist-profile" data-artist-profile aria-live="polite"></div>
-          <div class="album-meta">
-            <span>${albums.length} ${albums.length === 1 ? "release" : "releases"}</span>
-            <span class="album-meta-dot">•</span>
-            <span>${songLabel(tracks.length)}</span>
+      <div class="album-page-content">
+        <div class="album-hero">
+          ${coverMarkup(albums[0] || tracks[0], "album-hero-cover")}
+          <div class="album-hero-text">
+            <div class="album-kicker">Artist</div>
+            <h1>${escapeHtml(name)}</h1>
+            <div class="artist-profile" data-artist-profile aria-live="polite"></div>
+            <div class="album-meta">
+              <span>${albums.length} ${albums.length === 1 ? "release" : "releases"}</span>
+              <span class="album-meta-dot">•</span>
+              <span>${songLabel(tracks.length)}</span>
+            </div>
           </div>
         </div>
+        ${tracks.length ? collectionActionsMarkup(name, `data-play-artist="${escapeHtml(name)}"`) : ""}
+        ${albums.length ? `
+          <div class="section-head">
+            <h2>Discography</h2>
+          </div>
+          <div class="card-grid">${albums.map(albumCard).join("")}</div>
+        ` : ""}
+        ${tracks.length ? `
+          <div class="section-head">
+            <h2>Songs</h2>
+          </div>
+        ` : `<p class="text-secondary">No music found for this artist.</p>`}
       </div>
-      ${tracks.length ? collectionActionsMarkup(name, `data-play-artist="${escapeHtml(name)}"`) : ""}
-      ${albums.length ? `
-        <div class="section-head">
-          <h2>Discography</h2>
-        </div>
-        <div class="card-grid">${albums.map(albumCard).join("")}</div>
-      ` : ""}
       ${tracks.length ? `
-        <div class="section-head ${albums.length ? "mt-4" : ""}">
-          <h2>Songs</h2>
-        </div>
         <div class="track-panel">
           ${trackTable(tracks, { showAlbum: true, showHeader: true })}
         </div>
-      ` : `<p class="text-secondary">No music found for this artist.</p>`}
+      ` : ""}
     </div>
   `;
 
@@ -3112,33 +3962,67 @@ function renderArtist(name) {
 
 function requestArtistInfo(name) {
   const requestId = ++artistInfoRequestId;
-  const cached = artistInfoCache.get(name.toLowerCase());
+  const key = String(name || "").toLowerCase();
+  artistInfoPendingName = name;
+
+  const cached = artistInfoCache.get(key);
   if (cached && hasArtistProfileData(cached)) {
-    applyArtistInfo(cached);
+    applyArtistInfo(cached, { fromCache: true });
+    return;
+  }
+
+  if (artistInfoEmptyCache.has(key)) {
+    clearArtistProfile();
     return;
   }
 
   showArtistInfoLoading();
   window.chrome?.webview?.postMessage({ type: "artistInfo", name });
   window.setTimeout(() => {
+    // Host does not echo request IDs — guard with local requestId + view/artist.
     if (requestId !== artistInfoRequestId) {
+      return;
+    }
+    if (state.view !== "artist" || !artistsMatch(name, state.artist)) {
       return;
     }
 
     const slot = artistProfileSlot();
     if (slot?.querySelector(".artist-profile-loading")) {
+      // Timeout/no response: clear skeleton only; leave retryable (no empty cache).
       clearArtistProfile();
     }
   }, ARTIST_INFO_TIMEOUT_MS);
 }
 
-function applyArtistInfo(info) {
-  if (!info?.name || state.view !== "artist" || !artistsMatch(info.name, state.artist)) {
+function applyArtistInfo(info, { fromCache = false } = {}) {
+  // Malformed host payloads: ignore without caching (remain retryable).
+  if (!info?.name || typeof info.name !== "string") {
     return;
   }
 
-  if (hasArtistProfileData(info)) {
-    artistInfoCache.set(info.name.toLowerCase(), info);
+  const key = info.name.toLowerCase();
+  const hasData = hasArtistProfileData(info);
+
+  // Session caches update from well-formed host replies even if the user navigated away.
+  // Timeouts never call this path, so they stay retryable.
+  if (!fromCache) {
+    if (hasData) {
+      artistInfoCache.set(key, info);
+      artistInfoEmptyCache.delete(key);
+    } else if (!hasArtistProfileData(artistInfoCache.get(key))) {
+      // Confirmed empty lookup only — do not overwrite a prior positive cache.
+      artistInfoEmptyCache.add(key);
+    }
+  }
+
+  // Preserve host contract (no requestId echo). Never mutate another artist's UI.
+  if (state.view !== "artist" || !artistsMatch(info.name, state.artist)) {
+    return;
+  }
+
+  if (!fromCache && artistInfoPendingName && !artistsMatch(info.name, artistInfoPendingName)) {
+    return;
   }
 
   const slot = artistProfileSlot();
@@ -3146,18 +4030,29 @@ function applyArtistInfo(info) {
     return;
   }
 
-  const html = artistProfileMarkup(info);
-  if (!html) {
-    clearArtistProfile();
+  if (hasData) {
+    const html = artistProfileMarkup(info);
+    if (!html) {
+      if (slot.querySelector(".artist-profile-loading")) {
+        clearArtistProfile();
+      }
+      return;
+    }
+
+    const wasLoading = Boolean(slot.querySelector(".artist-profile-loading"));
+    slot.classList.remove("is-loading");
+    slot.setAttribute("aria-busy", "false");
+    slot.innerHTML = wasLoading
+      ? `<div class="artist-profile-ready">${html}</div>`
+      : html;
     return;
   }
 
-  const wasLoading = Boolean(slot.querySelector(".artist-profile-loading"));
-  slot.classList.remove("is-loading");
-  slot.setAttribute("aria-busy", "false");
-  slot.innerHTML = wasLoading
-    ? `<div class="artist-profile-ready">${html}</div>`
-    : html;
+  // Empty host reply: drop skeleton only. Never clear already-rendered metadata
+  // if a late empty arrives after a good response.
+  if (slot.querySelector(".artist-profile-loading")) {
+    clearArtistProfile();
+  }
 }
 
 function showArtistInfoLoading() {
@@ -3374,6 +4269,12 @@ function requestLyrics(trackId) {
     return;
   }
   const entry = lyricsEntries.get(trackId);
+  // Plain-only cache may still receive a background synchronized upgrade from the host.
+  // Soft-refresh without a loading skeleton so the host can schedule that check.
+  if (entry?.status === "ready" && !entry.synced) {
+    window.chrome?.webview?.postMessage({ type: "lyrics", trackId });
+    return;
+  }
   if (entry && !(entry.retryable && Date.now() - entry.at > LYRICS_RETRY_MS)) {
     return;
   }
@@ -3413,6 +4314,7 @@ function applyLyricsResult(detail) {
     return;
   }
 
+  const previous = lyricsEntries.get(trackId);
   const plain = trimBlankLines(detail.plainLyrics);
   let entry;
   if (!detail.available) {
@@ -3431,6 +4333,21 @@ function applyLyricsResult(detail) {
   }
   entry.at = Date.now();
   setLyricsEntry(trackId, entry);
+
+  // Soft-refresh of unchanged lyrics must not reset scroll or flash the page.
+  // Plain→synced upgrades fall through and re-render with the active line synced.
+  const samePlain = previous?.status === "ready"
+    && !previous.synced
+    && entry.status === "ready"
+    && !entry.synced
+    && previous.plain === entry.plain;
+  const sameSynced = previous?.status === "ready"
+    && previous.synced
+    && entry.status === "ready"
+    && entry.synced;
+  if (samePlain || sameSynced) {
+    return;
+  }
 
   // Responses for songs that are no longer playing only update the cache, never the page.
   if (state.view === "lyrics" && currentTrack()?.id === trackId && lyricsTrackId === trackId) {
@@ -4837,11 +5754,7 @@ function updatePlaylistDetails(playlistId, name, description) {
   }
   playlist.description = String(description ?? "").trim();
   writeSession();
-  if (state.view === "playlist" && state.playlistId === playlist.id) {
-    render(historyStack[historyIndex]);
-  } else {
-    renderLibraryList();
-  }
+  refreshAfterPlaylistChange(playlist.id);
 }
 
 function collectionActionsMarkup(label, playAttrs, { more = false } = {}) {
@@ -5135,11 +6048,18 @@ function bindLibrary(library) {
     && (button.classList.contains("is-scanning") || button.classList.contains("is-success"));
   const matched = requestId !== "" && requestId === pendingRescanId;
   const failed = matched && library.failed === true;
+  const fingerprint = typeof library.contentFingerprint === "string"
+    ? library.contentFingerprint
+    : "";
+  const unchanged = !failed
+    && fingerprint !== ""
+    && fingerprint === libraryContentFingerprint
+    && sessionRestored;
   if (matched) {
     pendingRescanId = "";
   }
 
-  if (!failed) {
+  if (!failed && !unchanged) {
     const previousTracks = captureActiveTracks();
     state.library = {
       rootPath: library.rootPath ?? "",
@@ -5149,13 +6069,22 @@ function bindLibrary(library) {
       tracks: library.tracks ?? []
     };
     retainActiveTracks(previousTracks);
+    if (fingerprint) {
+      libraryContentFingerprint = fingerprint;
+    }
+  } else if (!failed && fingerprint) {
+    libraryContentFingerprint = fingerprint;
   }
 
   // While the button animates, only its own library message may re-render the view.
   if (matched && busy) {
     finishRescan(button, failed);
-  } else if (!busy) {
+  } else if (!busy && !unchanged) {
+    if (state.view === "search") {
+      focusSearchOnRender = false;
+    }
     render(historyStack[historyIndex]);
+    focusSearchOnRender = true;
   }
 
   if (!sessionRestored) {
@@ -5164,7 +6093,9 @@ function bindLibrary(library) {
     return;
   }
 
-  updateNowPlaying();
+  if (!unchanged) {
+    updateNowPlaying();
+  }
 }
 
 function isTypingTarget(target) {
@@ -5420,7 +6351,16 @@ function closeDeleteModal() {
 function deletePlaylist(playlistId) {
   state.playlists = state.playlists.filter((p) => p.id !== playlistId);
   writeSession();
-  navigate({ view: "home" });
+  renderLibraryList();
+  if (state.view === "playlists" || state.view === "playlist") {
+    navigate({ view: "playlists" });
+  } else if (state.view === "search") {
+    focusSearchOnRender = false;
+    render(historyStack[historyIndex]);
+    focusSearchOnRender = true;
+  } else {
+    navigate({ view: "home" });
+  }
 }
 
 function contextPlaylistListHtml() {
@@ -5732,6 +6672,51 @@ document.body.addEventListener("click", (event) => {
   const sortButton = event.target.closest("[data-sort]");
   const layoutButton = event.target.closest("[data-layout]");
   const navButton = event.target.closest("[data-nav]");
+  const searchMoreButton = event.target.closest("[data-search-more]");
+  const searchRecentButton = event.target.closest("[data-search-recent]");
+  const searchRemoveButton = event.target.closest("[data-search-remove]");
+  const searchClearHistoryButton = event.target.closest("[data-search-clear-history]");
+
+  if (searchMoreButton) {
+    event.preventDefault();
+    expandSearchResults(searchMoreButton.dataset.searchMore);
+    return;
+  }
+
+  if (searchRemoveButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    removeSearchHistoryEntry(searchRemoveButton.dataset.searchRemove);
+    if (state.view === "search" && !normalizeSearchQuery(state.query)) {
+      renderSearch({ preserveFocus: true });
+    }
+    return;
+  }
+
+  if (searchClearHistoryButton) {
+    event.preventDefault();
+    clearSearchHistory();
+    if (state.view === "search" && !normalizeSearchQuery(state.query)) {
+      renderSearch({ preserveFocus: true });
+    }
+    return;
+  }
+
+  if (searchRecentButton) {
+    event.preventDefault();
+    updateSearchQuery(searchRecentButton.dataset.searchRecent || "", { focus: true, commit: true });
+    return;
+  }
+
+  if (
+    state.view === "search"
+    && normalizeSearchQuery(state.query)
+    && (playPlaylistButton || playlistButton || playAlbumButton || playArtistButton
+      || artistButton || albumButton || playButton)
+  ) {
+    commitSearchHistory(state.query);
+    clearSearchHistoryIdleCommit();
+  }
 
   if (settingButton) {
     event.preventDefault();
@@ -6190,6 +7175,11 @@ document.querySelector("[data-chips-scroll] .library-chips")?.addEventListener("
   let startX = 0;
   let startWidth = state.sidebarWidth;
 
+  const setResizing = (active) => {
+    sidebar.classList.toggle("is-resizing", active);
+    document.documentElement.classList.toggle("is-sidebar-resizing", active);
+  };
+
   const onMove = (event) => {
     if (!dragging) {
       return;
@@ -6204,7 +7194,7 @@ document.querySelector("[data-chips-scroll] .library-chips")?.addEventListener("
       return;
     }
     dragging = false;
-    sidebar.classList.remove("is-resizing");
+    setResizing(false);
     document.body.style.cursor = "";
     writeSession();
     updateLibraryChipsScroll();
@@ -6218,7 +7208,7 @@ document.querySelector("[data-chips-scroll] .library-chips")?.addEventListener("
     dragging = true;
     startX = event.clientX;
     startWidth = state.sidebarWidth;
-    sidebar.classList.add("is-resizing");
+    setResizing(true);
     document.body.style.cursor = "col-resize";
     sidebarResize.setPointerCapture?.(event.pointerId);
   });
@@ -6249,7 +7239,33 @@ searchInput.addEventListener("input", () => {
   state.query = searchInput.value;
   const entry = { view: "search", query: state.query };
   historyStack[historyIndex] = entry;
-  render(entry);
+  renderSearch({ preserveFocus: false });
+  scheduleSearchHistoryIdleCommit();
+});
+
+searchInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    clearSearchHistoryIdleCommit();
+    if (isMeaningfulSearchQuery(state.query)) {
+      commitSearchHistory(state.query);
+    }
+    renderSearch({ preserveFocus: false });
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    clearSearchHistoryIdleCommit();
+    if (state.query) {
+      state.query = "";
+      historyStack[historyIndex] = { view: "search", query: "" };
+      searchInput.value = "";
+      renderSearch();
+      searchInput.focus();
+    } else {
+      searchInput.blur();
+    }
+  }
 });
 
 nowCover.addEventListener("click", openNowPlayingAlbum);
@@ -6666,7 +7682,7 @@ document.getElementById("winClose")?.addEventListener("click", () => {
 bindWindowDragRegion(document.getElementById("topBar"));
 bindWindowDragRegion(document.querySelector(".window-chrome-drag"));
 
-applySidebarLayout();
+applySidebarLayout({ animate: false });
 syncSidebarSortUi();
 updateLibraryChipsScroll();
 syncTopBarScroll();

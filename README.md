@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="www/img/promo.png" alt="EMP — a cleaner way to listen">
+  <img src="www/img/EMP%20Music%20Player%20Showcase.png" alt="EMP — a cleaner way to listen">
 </p>
 
 <h1 align="center">EMP</h1>
@@ -24,7 +24,7 @@
   </a>
 </p>
 
-EMP combines a familiar, streaming-style interface with local playback, library management, playlists, audio controls, and network playback — without requiring a streaming service or account.
+EMP combines a familiar, streaming-style interface with local playback, library management, playlists, lyrics, audio controls, and network playback — without requiring a streaming service or account.
 
 ## Download
 
@@ -42,6 +42,7 @@ Download the Windows release, extract the archive, and run **EMP.exe**. No insta
 Add one or more music folders and EMP will organize your collection automatically. Changes to your music folders are detected as they happen, keeping your library up to date.
 
 - Albums, artists, singles, tracks, playlists, and Liked Songs
+- Dedicated Playlists library view with grid and list layouts
 - Library search with grid and list views
 - Recently played music and quick picks
 - Create, edit, and delete playlists
@@ -49,12 +50,32 @@ Add one or more music folders and EMP will organize your collection automaticall
 - Optional artist information from MusicBrainz
 - Artwork-driven colors throughout the interface
 
+### Search
+
+Find anything in your library from a polished Search experience — not just a simple filter.
+
+- Landing page with recent searches and Browse your library shortcuts
+- Results for artists, playlists, albums & singles, and songs
+- Prominent Top result with the right play or open action
+- Relevance ranking across your local collection
+- Show more controls for large result sets
+
+### Lyrics
+
+Follow along with the current track in a full lyrics panel.
+
+- Synced lyrics with active-line highlighting when timing is available
+- Plain lyrics fallback when synced lines are not available
+- Cover-tinted lyrics stage that matches the playing track
+- Local caching so lyrics load quickly on repeat listens
+
 ### Playback
 
 Everything you'd expect from a modern desktop player, with your music playing directly from your PC.
 
 - Shuffle and repeat
 - Seek and volume controls
+- Queue drawer for now playing and upcoming tracks
 - Crossfade and gapless playback
 - Volume normalization
 - Equalizer with presets
@@ -105,3 +126,4 @@ Clone the repository, then run:
 ```bash
 dotnet restore
 dotnet run
+```

@@ -54,7 +54,20 @@ namespace EMP.Lyrics
         public string? PlainLyrics { get; init; }
 
         public bool Instrumental { get; init; }
+
+        public bool HasSyncedLyrics => !string.IsNullOrWhiteSpace(SyncedLyrics);
+
+        public bool HasPlainLyrics => !string.IsNullOrWhiteSpace(PlainLyrics);
+
+        public bool IsPlainOnly =>
+            Status == LyricsStatus.Found && HasPlainLyrics && !HasSyncedLyrics;
     }
+
+    /// <summary>
+    /// A usable cache hit. <see cref="EligibleForSyncedUpgrade"/> is true only for plain-only
+    /// entries whose last synchronized recheck is missing (legacy) or older than the interval.
+    /// </summary>
+    internal readonly record struct LyricsCacheHit(LyricsResult Result, bool EligibleForSyncedUpgrade);
 
     internal sealed class CachedLyrics
     {
@@ -81,5 +94,11 @@ namespace EMP.Lyrics
         public bool Instrumental { get; init; }
 
         public DateTimeOffset RetrievedAt { get; init; }
+
+        /// <summary>
+        /// When EMP last successfully checked LRCLIB for a synchronized upgrade of plain lyrics.
+        /// Absent on legacy cache files and on entries that already include synchronized lyrics.
+        /// </summary>
+        public DateTimeOffset? SyncedUpgradeCheckedAt { get; init; }
     }
 }

@@ -6,7 +6,7 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=55">
+  <link rel="stylesheet" href="css/player.css?v=66">
 </head>
 <body>
   <div class="app-shell">
@@ -14,18 +14,21 @@
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"><img src="img/emp-icon-512.png" alt=""></span>
         <span class="brand-name">EMP</span>
+        <button class="icon-btn brand-collapse-btn" type="button" id="sidebarCollapseBtn" aria-label="Collapse sidebar" data-bs-toggle="tooltip" data-bs-title="Collapse sidebar">
+          <i class="bi bi-chevron-bar-left"></i>
+        </button>
       </div>
 
       <nav class="nav-stack" aria-label="Primary">
-        <button class="nav-item active" type="button" data-nav="home">
+        <button class="nav-item active" type="button" data-nav="home" data-sidebar-rail-tooltip="Home" aria-label="Home">
           <i class="bi bi-house-fill"></i>
           <span class="nav-label">Home</span>
         </button>
-        <button class="nav-item" type="button" data-nav="search">
+        <button class="nav-item" type="button" data-nav="search" data-sidebar-rail-tooltip="Search" aria-label="Search">
           <i class="bi bi-search"></i>
           <span class="nav-label">Search</span>
         </button>
-        <button class="nav-item" type="button" data-nav="settings">
+        <button class="nav-item" type="button" data-nav="settings" data-sidebar-rail-tooltip="Settings" aria-label="Settings">
           <i class="bi bi-gear"></i>
           <span class="nav-label">Settings</span>
         </button>
@@ -33,7 +36,7 @@
 
       <div class="library-panel">
         <div class="library-header">
-          <button class="library-title-btn" type="button" data-nav="albums" id="libraryTitleBtn" aria-label="Your Library">
+          <button class="library-title-btn" type="button" data-nav="albums" id="libraryTitleBtn" data-sidebar-rail-tooltip="Your Library" aria-label="Your Library">
             <i class="bi bi-collection-play"></i>
             <span class="nav-label">Your Library</span>
           </button>
@@ -43,9 +46,6 @@
             </button>
             <button class="icon-btn" type="button" id="refreshBtn" aria-label="Refresh library" data-bs-toggle="tooltip" data-bs-title="Refresh library">
               <i class="bi bi-arrow-clockwise"></i>
-            </button>
-            <button class="icon-btn" type="button" id="sidebarCollapseBtn" aria-label="Collapse sidebar" data-bs-toggle="tooltip" data-bs-title="Collapse sidebar">
-              <i class="bi bi-arrows-angle-contract"></i>
             </button>
           </div>
         </div>
@@ -102,7 +102,11 @@
       </header>
 
       <section class="view-area" id="viewArea">
-        <div class="loading-state">Scanning your music library…</div>
+        <div class="loading-state" role="status" aria-live="polite">
+          <img class="loading-mark" src="img/emp-icon-512.png" alt="" width="48" height="48">
+          <p class="loading-title">Loading your library</p>
+          <p class="loading-copy">Preparing your music…</p>
+        </div>
       </section>
     </main>
 
@@ -219,6 +223,6 @@
 
   <script src="lib/bootstrap/5.3.8/bootstrap.bundle.min.js"></script>
   <script src="js/eq-presets.js?v=2"></script>
-  <script src="js/player.js?v=43"></script>
+  <script src="js/player.js?v=48"></script>
 </body>
 </html>

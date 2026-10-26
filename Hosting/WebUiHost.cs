@@ -39,6 +39,9 @@ namespace EMP.Hosting
         private static bool pageLoaded;
         private static int storageRequested;
         private static int storageMeasuring;
+        private static readonly LibraryScanCoordinator ScanCoordinator = new();
+        private static CachedMusicLibrary? lastCompleteCache;
+        private static string? lastDeliveredFingerprint;
 
         public static event Action<bool>? PlayingChanged;
 
@@ -58,6 +61,9 @@ namespace EMP.Hosting
 
             Directory.CreateDirectory(UserDataFolder);
 
+            IReadOnlyList<string> startupFolders = AppSettingsStore.ResolvedMusicFolders();
+            Task<CachedMusicLibrary?> cacheLoadTask = Task.Run(() => LibraryCacheStore.TryLoad(startupFolders));
+
             CoreWebView2Environment environment = await CoreWebView2Environment.CreateAsync(
                 userDataFolder: UserDataFolder);
 
@@ -73,7 +79,7 @@ namespace EMP.Hosting
             hostView = webView;
             // WebView2 ignores hosts registered after the current page's resource
             // loader exists. Map known library roots before the first navigation.
-            SyncVirtualHosts(AppSettingsStore.ResolvedMusicFolders());
+            SyncVirtualHosts(startupFolders);
 
             CoreWebView2Settings settings = webView.CoreWebView2.Settings;
             settings.IsStatusBarEnabled = false;
@@ -104,46 +110,20 @@ namespace EMP.Hosting
             cast = new CastCoordinator(PostCastMessage);
 
             lyrics?.Dispose();
-            lyrics = new LyricsService();
+            lyrics = new LyricsService(OnSyncedLyricsUpgrade);
 
+            CachedMusicLibrary? startupCache = await cacheLoadTask.ConfigureAwait(true);
+            if (startupCache is not null)
+            {
+                lastCompleteCache = startupCache;
+                lastDeliveredFingerprint = startupCache.ContentFingerprint;
+                LibraryMediaIndex.Replace(startupCache.Library.Locations);
+            }
+
+            // Single document-created registration: message bridge + optional cached library.
+            // Must complete before Navigate so warm starts hydrate before first paint.
             await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
-                """
-                window.__emp = window.__emp || { library: null };
-                window.chrome.webview.addEventListener('message', (event) => {
-                  const message = event.data;
-                  if (!message || !message.type) {
-                    return;
-                  }
-                  if (message.type === 'library') {
-                    window.__emp.library = message;
-                    window.dispatchEvent(new CustomEvent('emp-library', { detail: message }));
-                    return;
-                  }
-                  if (message.type === 'artistInfo') {
-                    window.dispatchEvent(new CustomEvent('emp-artist-info', { detail: message }));
-                    return;
-                  }
-                  if (message.type === 'lyrics') {
-                    window.dispatchEvent(new CustomEvent('emp-lyrics', { detail: message }));
-                    return;
-                  }
-                  if (message.type === 'storage') {
-                    window.dispatchEvent(new CustomEvent('emp-storage', { detail: message }));
-                    return;
-                  }
-                  if (message.type === 'appSettings') {
-                    window.dispatchEvent(new CustomEvent('emp-app-settings', { detail: message }));
-                    return;
-                  }
-                  if (message.type === 'castDevices' || message.type === 'castStatus' || message.type === 'castError') {
-                    window.dispatchEvent(new CustomEvent('emp-cast', { detail: message }));
-                    return;
-                  }
-                  if (message.type === 'windowState') {
-                    window.dispatchEvent(new CustomEvent('emp-window-state', { detail: message }));
-                  }
-                });
-                """);
+                BuildDocumentCreatedScript(startupCache));
 
             webView.CoreWebView2.NavigationCompleted += (_, args) =>
             {
@@ -237,6 +217,7 @@ namespace EMP.Hosting
 
         public static void Shutdown()
         {
+            ScanCoordinator.Shutdown();
             folderWatchers?.Dispose();
             folderWatchers = null;
             systemMedia?.Dispose();
@@ -248,6 +229,8 @@ namespace EMP.Hosting
             LibraryMediaIndex.Clear();
             hostView = null;
             pageLoaded = false;
+            lastCompleteCache = null;
+            lastDeliveredFingerprint = null;
             IsWindowMaximized = null;
             MappedHosts.Clear();
             RetainedHosts.Clear();
@@ -297,55 +280,235 @@ namespace EMP.Hosting
                 return;
             }
 
-            PostLibrary(folders, requestId);
+            RequestLibraryScan(requestId);
         }
 
-        private static void PostLibrary(IReadOnlyList<string> folders, string? requestId = null)
+        private static void RequestLibraryScan(string? requestId = null)
         {
             if (hostView?.CoreWebView2 is null)
             {
                 return;
             }
 
-            LibraryMessage message;
+            string root = artworkRoot;
+            ScanCoordinator.Request(requestId, scanGeneration =>
+            {
+                _ = Task.Run(() => RunLibraryScan(scanGeneration, root));
+            });
+        }
+
+        private static void RunLibraryScan(int scanGeneration, string scanArtworkRoot)
+        {
+            IReadOnlyList<string> folders = AppSettingsStore.ResolvedMusicFolders();
+            LibraryScanResult result;
             try
             {
-                MusicLibrary library = MusicLibraryScanner.Scan(folders, artworkRoot);
-                LibraryMediaIndex.Replace(library.Locations);
-                message = new LibraryMessage
+                MusicLibrary scanned = MusicLibraryScanner.Scan(folders, scanArtworkRoot);
+                MusicLibrary merged = LibraryCacheStore.MergeUnavailableFromCache(
+                    scanned,
+                    folders,
+                    lastCompleteCache);
+                string fingerprint = LibraryCacheStore.ComputeFingerprint(merged);
+                result = new LibraryScanResult
                 {
-                    Type = "library",
-                    RequestId = requestId,
-                    RootPath = library.RootPath,
-                    Folders = library.Folders,
-                    Albums = library.Albums,
-                    Singles = library.Singles,
-                    Tracks = library.Tracks
+                    Failed = false,
+                    Folders = folders,
+                    Library = merged,
+                    Fingerprint = fingerprint,
+                    PreserveDiskCache = LibraryCacheStore.ShouldPreserveDiskCache(scanned, lastCompleteCache)
                 };
             }
             catch (Exception)
             {
-                if (requestId is null)
+                result = new LibraryScanResult
                 {
-                    return;
-                }
-
-                // Let a user-initiated rescan settle instead of spinning forever.
-                LibraryMediaIndex.Replace(new Dictionary<string, LibraryMediaLocation>(StringComparer.OrdinalIgnoreCase));
-                message = new LibraryMessage
-                {
-                    Type = "library",
-                    RequestId = requestId,
                     Failed = true,
-                    RootPath = string.Empty,
-                    Folders = [],
-                    Albums = [],
-                    Singles = [],
-                    Tracks = []
+                    Folders = folders,
+                    Library = new MusicLibrary(),
+                    Fingerprint = string.Empty,
+                    PreserveDiskCache = true
                 };
             }
 
+            PostToUi(() => DeliverLibraryScan(scanGeneration, result));
+        }
+
+        private static void DeliverLibraryScan(int scanGeneration, LibraryScanResult result)
+        {
+            if (!ScanCoordinator.IsCurrent(scanGeneration) || hostView?.CoreWebView2 is null)
+            {
+                return;
+            }
+
+            IReadOnlyList<string> requestIds = ScanCoordinator.TakeCompletionRequestIds();
+            bool hasManualRefresh = requestIds.Count > 0;
+
+            if (result.Failed)
+            {
+                if (hasManualRefresh)
+                {
+                    foreach (string requestId in requestIds)
+                    {
+                        PostLibraryMessage(new LibraryMessage
+                        {
+                            Type = "library",
+                            RequestId = requestId,
+                            Failed = true,
+                            ContentFingerprint = lastDeliveredFingerprint,
+                            RootPath = lastCompleteCache?.Library.RootPath ?? string.Empty,
+                            Folders = lastCompleteCache?.Library.Folders ?? [],
+                            Albums = lastCompleteCache?.Library.Albums ?? [],
+                            Singles = lastCompleteCache?.Library.Singles ?? [],
+                            Tracks = lastCompleteCache?.Library.Tracks ?? []
+                        });
+                    }
+                }
+
+                _ = ScanCoordinator.TryStartFollowUp(scanGeneration, next =>
+                {
+                    string root = artworkRoot;
+                    _ = Task.Run(() => RunLibraryScan(next, root));
+                });
+                return;
+            }
+
+            LibraryMediaIndex.Replace(result.Library.Locations);
+
+            bool unchanged = string.Equals(
+                result.Fingerprint,
+                lastDeliveredFingerprint,
+                StringComparison.Ordinal);
+
+            if (!unchanged || hasManualRefresh)
+            {
+                lastDeliveredFingerprint = result.Fingerprint;
+
+                if (requestIds.Count == 0)
+                {
+                    PostLibraryMessage(ToLibraryMessage(result.Library, result.Fingerprint, requestId: null));
+                }
+                else
+                {
+                    foreach (string requestId in requestIds)
+                    {
+                        PostLibraryMessage(ToLibraryMessage(result.Library, result.Fingerprint, requestId));
+                    }
+                }
+            }
+
+            if (!result.PreserveDiskCache && LibraryCacheStore.IsCompleteScan(result.Library))
+            {
+                lastCompleteCache = new CachedMusicLibrary
+                {
+                    ContentFingerprint = result.Fingerprint,
+                    FolderPaths = result.Folders,
+                    Library = result.Library
+                };
+                LibraryCacheStore.Save(result.Folders, result.Library, result.Fingerprint);
+            }
+
+            _ = ScanCoordinator.TryStartFollowUp(scanGeneration, next =>
+            {
+                string root = artworkRoot;
+                _ = Task.Run(() => RunLibraryScan(next, root));
+            });
+        }
+
+        private static LibraryMessage ToLibraryMessage(MusicLibrary library, string fingerprint, string? requestId)
+        {
+            return new LibraryMessage
+            {
+                Type = "library",
+                RequestId = requestId,
+                ContentFingerprint = fingerprint,
+                RootPath = library.RootPath,
+                Folders = library.Folders,
+                Albums = library.Albums,
+                Singles = library.Singles,
+                Tracks = library.Tracks
+            };
+        }
+
+        private static void PostLibraryMessage(LibraryMessage message)
+        {
+            if (hostView?.CoreWebView2 is null)
+            {
+                return;
+            }
+
             hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
+        }
+
+        private static string BuildDocumentCreatedScript(CachedMusicLibrary? startupCache)
+        {
+            const string bridge = """
+                window.__emp = window.__emp || {};
+                if (typeof window.__emp.library === 'undefined') {
+                  window.__emp.library = null;
+                }
+                if (!window.__emp.__bridgeBound) {
+                  window.__emp.__bridgeBound = true;
+                  window.chrome.webview.addEventListener('message', (event) => {
+                    const message = event.data;
+                    if (!message || !message.type) {
+                      return;
+                    }
+                    if (message.type === 'library') {
+                      window.__emp.library = message;
+                      window.dispatchEvent(new CustomEvent('emp-library', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'artistInfo') {
+                      window.dispatchEvent(new CustomEvent('emp-artist-info', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'lyrics') {
+                      window.dispatchEvent(new CustomEvent('emp-lyrics', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'storage') {
+                      window.dispatchEvent(new CustomEvent('emp-storage', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'appSettings') {
+                      window.dispatchEvent(new CustomEvent('emp-app-settings', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'castDevices' || message.type === 'castStatus' || message.type === 'castError') {
+                      window.dispatchEvent(new CustomEvent('emp-cast', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'windowState') {
+                      window.dispatchEvent(new CustomEvent('emp-window-state', { detail: message }));
+                    }
+                  });
+                }
+                """;
+
+            if (startupCache is null)
+            {
+                return bridge;
+            }
+
+            LibraryMessage hydrate = ToLibraryMessage(
+                startupCache.Library,
+                startupCache.ContentFingerprint,
+                requestId: null);
+            string json = JsonSerializer.Serialize(hydrate, JsonOptions);
+            return bridge + "window.__emp.library = " + json + ";";
+        }
+
+        private sealed class LibraryScanResult
+        {
+            public required bool Failed { get; init; }
+
+            public required IReadOnlyList<string> Folders { get; init; }
+
+            public required MusicLibrary Library { get; init; }
+
+            public required string Fingerprint { get; init; }
+
+            public required bool PreserveDiskCache { get; init; }
         }
 
         private static void PostAppSettings()
@@ -536,7 +699,9 @@ namespace EMP.Hosting
             }
             catch (Exception)
             {
-                profile = new MusicBrainzClient.ArtistProfile { Name = name };
+                // Leave the UI retryable: JS timeout clears the skeleton without
+                // session-caching an empty result. Message shape unchanged.
+                return;
             }
 
             PostArtistInfo(webView, profile);
@@ -614,6 +779,11 @@ namespace EMP.Hosting
             }
 
             PostLyrics(message);
+        }
+
+        private static void OnSyncedLyricsUpgrade(LyricsLookup lookup, LyricsResult result)
+        {
+            PostLyrics(LyricsMessage.From(lookup.TrackId, result));
         }
 
         private static void PostLyrics(LyricsMessage message)
@@ -839,6 +1009,8 @@ namespace EMP.Hosting
             public string? RequestId { get; init; }
 
             public bool Failed { get; init; }
+
+            public string? ContentFingerprint { get; init; }
 
             public required string RootPath { get; init; }
 
