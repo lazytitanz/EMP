@@ -63,7 +63,7 @@ namespace EMP.Hosting
 
             IReadOnlyList<string> startupFolders = AppSettingsStore.ResolvedMusicFolders();
             Task<CachedMusicLibrary?> cacheLoadTask = Task.Run(() => LibraryCacheStore.TryLoad(startupFolders));
-            Task listenStatsLoadTask = Task.Run(ListenStatsStore.Load);
+            Task listenStatsLoadTask = Task.Run(ListenStatsCoordinator.Load);
 
             CoreWebView2Environment environment = await CoreWebView2Environment.CreateAsync(
                 userDataFolder: UserDataFolder);
@@ -236,7 +236,7 @@ namespace EMP.Hosting
             cast = null;
             lyrics?.Dispose();
             lyrics = null;
-            ListenStatsStore.FlushSync();
+            ListenStatsCoordinator.FlushSync();
             LibraryMediaIndex.Clear();
             hostView = null;
             pageLoaded = false;
@@ -285,7 +285,52 @@ namespace EMP.Hosting
             long playCountDelta = ReadInt64(message, "playCountDelta");
             long listenMsDelta = ReadInt64(message, "listenMsDelta");
             long lastPlayedAt = ReadInt64(message, "lastPlayedAt");
-            ListenStatsStore.ApplyUpdate(token, updateId, trackId, playCountDelta, listenMsDelta, lastPlayedAt);
+            Dictionary<string, long>? dayListenMsDelta = ReadDayListenMsDelta(message);
+            ListenStatsCoordinator.ApplyUpdate(
+                token,
+                updateId,
+                trackId,
+                playCountDelta,
+                listenMsDelta,
+                lastPlayedAt,
+                dayListenMsDelta);
+        }
+
+        private static Dictionary<string, long>? ReadDayListenMsDelta(JsonElement message)
+        {
+            if (!message.TryGetProperty("dayListenMsDelta", out JsonElement dayElement)
+                || dayElement.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            Dictionary<string, long> days = new(StringComparer.Ordinal);
+            foreach (JsonProperty property in dayElement.EnumerateObject())
+            {
+                if (string.IsNullOrWhiteSpace(property.Name))
+                {
+                    continue;
+                }
+
+                long value = 0;
+                if (property.Value.ValueKind == JsonValueKind.Number
+                    && property.Value.TryGetInt64(out long parsed))
+                {
+                    value = parsed;
+                }
+                else if (property.Value.ValueKind == JsonValueKind.String
+                    && long.TryParse(property.Value.GetString(), out parsed))
+                {
+                    value = parsed;
+                }
+
+                if (value > 0)
+                {
+                    days[property.Name] = value;
+                }
+            }
+
+            return days.Count > 0 ? days : null;
         }
 
         private static void PostListenStatsSnapshot()

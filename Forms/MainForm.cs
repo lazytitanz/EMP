@@ -275,7 +275,7 @@ namespace EMP.Forms
 
             if (webView.CoreWebView2 is null)
             {
-                ListenStatsStore.FlushSync();
+                ListenStatsCoordinator.FlushSync();
                 sessionSaved = true;
                 return;
             }
@@ -293,7 +293,7 @@ namespace EMP.Forms
                 // The WebView may already be tearing down; persist whatever was already applied.
             }
 
-            ListenStatsStore.FlushSync();
+            ListenStatsCoordinator.FlushSync();
             sessionSaved = true;
             BeginInvoke(Close);
         }

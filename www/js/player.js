@@ -240,7 +240,10 @@ function createListenOccurrence(trackId, durationSec) {
     trackId,
     listenMs: 0,
     sentListenMs: 0,
+    dayListenMs: {},
+    sentDayListenMs: {},
     checkpointMs: 0,
+    wallCheckpointMs: 0,
     playCounted: false,
     playCountSent: false,
     lastPlayedAt: 0,
@@ -546,7 +549,7 @@ function normalizeSongsSortDir(value) {
   return value === "desc" ? "desc" : "asc";
 }
 
-function advanceListenOccurrence(occ, now, progressing) {
+function advanceListenOccurrence(occ, now, progressing, wallNow = Date.now()) {
   if (!occ || occ.finalized) {
     return;
   }
@@ -554,10 +557,40 @@ function advanceListenOccurrence(occ, now, progressing) {
     const delta = now - occ.checkpointMs;
     if (delta > 0 && delta < 120000) {
       occ.listenMs += delta;
+      const split = globalThis.EmpListenDateSplit;
+      if (split?.splitListenMsByLocalDate) {
+        const buckets = split.splitListenMsByLocalDate(delta, wallNow, occ.wallCheckpointMs || 0);
+        split.addDayBuckets(occ.dayListenMs, buckets);
+      } else {
+        const key = split?.localDateKey?.(wallNow)
+          || (() => {
+            const d = new Date(wallNow);
+            const m = String(d.getMonth() + 1).padStart(2, "0");
+            const day = String(d.getDate()).padStart(2, "0");
+            return `${d.getFullYear()}-${m}-${day}`;
+          })();
+        occ.dayListenMs[key] = (Math.floor(Number(occ.dayListenMs[key])) || 0) + Math.floor(delta);
+      }
       maybeQualifyListen(occ);
     }
   }
   occ.checkpointMs = progressing ? now : 0;
+  occ.wallCheckpointMs = progressing ? wallNow : 0;
+}
+
+function listenOccurrenceDayDelta(occ) {
+  const split = globalThis.EmpListenDateSplit;
+  if (split?.dayBucketsDelta) {
+    return split.dayBucketsDelta(occ.dayListenMs, occ.sentDayListenMs);
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(occ.dayListenMs || {})) {
+    const delta = Math.floor(Number(value) || 0) - Math.floor(Number(occ.sentDayListenMs?.[key]) || 0);
+    if (delta > 0) {
+      out[key] = delta;
+    }
+  }
+  return out;
 }
 
 function listenOccurrenceHasUnsent(occ) {
@@ -567,16 +600,28 @@ function listenOccurrenceHasUnsent(occ) {
   const listenMsDelta = Math.floor(occ.listenMs) - Math.floor(occ.sentListenMs);
   const playCountDelta = occ.playCounted && !occ.playCountSent ? 1 : 0;
   const lastPlayedAt = occ.lastPlayedAt > occ.lastPlayedAtSent ? occ.lastPlayedAt : 0;
-  return listenMsDelta > 0 || playCountDelta > 0 || lastPlayedAt > 0;
+  const dayDelta = listenOccurrenceDayDelta(occ);
+  return listenMsDelta > 0 || playCountDelta > 0 || lastPlayedAt > 0 || Object.keys(dayDelta).length > 0;
 }
 
-function markListenOccurrenceSent(occ, listenMsDelta, playCountDelta, lastPlayedAt) {
+function markListenOccurrenceSent(occ, listenMsDelta, playCountDelta, lastPlayedAt, dayListenMsDelta) {
   occ.sentListenMs += listenMsDelta;
   if (playCountDelta > 0) {
     occ.playCountSent = true;
   }
   if (lastPlayedAt > 0) {
     occ.lastPlayedAtSent = lastPlayedAt;
+  }
+  const split = globalThis.EmpListenDateSplit;
+  if (split?.markDayBucketsSent) {
+    split.markDayBucketsSent(occ.sentDayListenMs, dayListenMsDelta);
+  } else if (dayListenMsDelta) {
+    for (const [key, value] of Object.entries(dayListenMsDelta)) {
+      const n = Math.floor(Number(value));
+      if (n > 0) {
+        occ.sentDayListenMs[key] = (Math.floor(Number(occ.sentDayListenMs[key])) || 0) + n;
+      }
+    }
   }
 }
 
@@ -609,7 +654,8 @@ function buildListenStatsPayloads() {
     const listenMsDelta = Math.max(0, Math.floor(occ.listenMs) - Math.floor(occ.sentListenMs));
     const playCountDelta = occ.playCounted && !occ.playCountSent ? 1 : 0;
     const lastPlayedAt = occ.lastPlayedAt > occ.lastPlayedAtSent ? occ.lastPlayedAt : 0;
-    if (listenMsDelta <= 0 && playCountDelta <= 0 && lastPlayedAt <= 0) {
+    const dayListenMsDelta = listenOccurrenceDayDelta(occ);
+    if (listenMsDelta <= 0 && playCountDelta <= 0 && lastPlayedAt <= 0 && Object.keys(dayListenMsDelta).length === 0) {
       continue;
     }
     listenUpdateId += 1;
@@ -618,6 +664,7 @@ function buildListenStatsPayloads() {
       listenMsDelta,
       playCountDelta,
       lastPlayedAt,
+      dayListenMsDelta,
       message: {
         type: "listenStatsUpdate",
         sessionToken: listenSessionToken,
@@ -625,7 +672,8 @@ function buildListenStatsPayloads() {
         trackId: occ.trackId,
         playCountDelta,
         listenMsDelta,
-        lastPlayedAt: lastPlayedAt > 0 ? lastPlayedAt : 0
+        lastPlayedAt: lastPlayedAt > 0 ? lastPlayedAt : 0,
+        dayListenMsDelta
       }
     });
   }
@@ -640,7 +688,12 @@ function postListenStatsUpdates() {
   try {
     for (const item of payloads) {
       window.chrome?.webview?.postMessage(item.message);
-      markListenOccurrenceSent(item.occ, item.listenMsDelta, item.playCountDelta, item.lastPlayedAt);
+      markListenOccurrenceSent(
+        item.occ,
+        item.listenMsDelta,
+        item.playCountDelta,
+        item.lastPlayedAt,
+        item.dayListenMsDelta);
     }
   } catch {
     // Host bridge unavailable; keep unsent for a later flush.
@@ -652,7 +705,12 @@ function postListenStatsUpdates() {
 function takeListenStatsUpdatesForClose() {
   const payloads = buildListenStatsPayloads();
   for (const item of payloads) {
-    markListenOccurrenceSent(item.occ, item.listenMsDelta, item.playCountDelta, item.lastPlayedAt);
+    markListenOccurrenceSent(
+      item.occ,
+      item.listenMsDelta,
+      item.playCountDelta,
+      item.lastPlayedAt,
+      item.dayListenMsDelta);
   }
   pruneSentFinalizedListen();
   return payloads.map((item) => item.message);
