@@ -14,6 +14,9 @@ namespace EMP.Hosting
         public bool AutomaticUpdateChecks { get; set; } = true;
 
         public DateTimeOffset? LastUpdateCheckUtc { get; set; }
+
+        /// <summary>Version string the user dismissed from the update toast; does not disable checks.</summary>
+        public string? DismissedUpdateVersion { get; set; }
     }
 
     internal static class AppSettingsStore
@@ -73,8 +76,35 @@ namespace EMP.Hosting
                 CloseMinimizes = Current.CloseMinimizes,
                 MusicFolders = folders.ToList(),
                 AutomaticUpdateChecks = Current.AutomaticUpdateChecks,
-                LastUpdateCheckUtc = Current.LastUpdateCheckUtc
+                LastUpdateCheckUtc = Current.LastUpdateCheckUtc,
+                DismissedUpdateVersion = Current.DismissedUpdateVersion
             });
+        }
+
+        public static AppSettings CopyCurrent(
+            string? startupOnLogin = null,
+            bool? closeMinimizes = null,
+            List<string>? musicFolders = null,
+            bool? automaticUpdateChecks = null,
+            DateTimeOffset? lastUpdateCheckUtc = null,
+            bool clearLastUpdateCheckUtc = false,
+            string? dismissedUpdateVersion = null,
+            bool clearDismissedUpdateVersion = false)
+        {
+            return new AppSettings
+            {
+                StartupOnLogin = startupOnLogin ?? Current.StartupOnLogin,
+                CloseMinimizes = closeMinimizes ?? Current.CloseMinimizes,
+                MusicFolders = musicFolders
+                    ?? (Current.MusicFolders is null ? null : [.. Current.MusicFolders]),
+                AutomaticUpdateChecks = automaticUpdateChecks ?? Current.AutomaticUpdateChecks,
+                LastUpdateCheckUtc = clearLastUpdateCheckUtc
+                    ? null
+                    : (lastUpdateCheckUtc ?? Current.LastUpdateCheckUtc),
+                DismissedUpdateVersion = clearDismissedUpdateVersion
+                    ? null
+                    : (dismissedUpdateVersion ?? Current.DismissedUpdateVersion)
+            };
         }
 
         private static AppSettings Normalize(AppSettings settings)

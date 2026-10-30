@@ -6,10 +6,19 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=74">
+  <link rel="stylesheet" href="css/player.css?v=76">
   <link rel="stylesheet" href="css/metadata-editor.css?v=2">
 </head>
 <body>
+  <div id="updateToast" class="update-toast" hidden role="status" aria-live="polite">
+    <div class="update-toast-body">
+      <p class="update-toast-message" data-update-toast-message>A new version of EMP is available.</p>
+      <div class="update-toast-actions">
+        <button class="update-toast-btn update-toast-primary" type="button" data-update-toast-action="download">Update now</button>
+        <button class="update-toast-btn" type="button" data-update-toast-action="dismiss">Dismiss</button>
+      </div>
+    </div>
+  </div>
   <div class="app-shell">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
@@ -235,8 +244,8 @@
   <script src="js/peak-protect.js?v=1"></script>
   <script src="js/audio-graph-recovery.js?v=1"></script>
   <script src="js/smart-playlists.js?v=1"></script>
-  <script src="js/smart-playlist-editor.js?v=3"></script>
+  <script src="js/smart-playlist-editor.js?v=4"></script>
   <script src="js/metadata-editor.js?v=2"></script>
-  <script src="js/player.js?v=64"></script>
+  <script src="js/player.js?v=66"></script>
 </body>
 </html>

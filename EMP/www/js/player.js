@@ -124,7 +124,8 @@ const state = {
     state: "idle",
     availableVersion: null,
     progress: null,
-    error: null
+    error: null,
+    dismissedUpdateVersion: null
   },
   playbackTarget: "local",
   connectingDeviceId: null,
@@ -217,6 +218,16 @@ const SONGS_SORT_OPTIONS = [
   { id: "recentlyPlayed", label: "Recently Played" }
 ];
 const SONGS_FILTER_DEBOUNCE_MS = 120;
+const SEARCH_DEBOUNCE_MS = 150;
+/** Set `window.__EMP_SEARCH_PERF__ = true` before load to log match vs render timings. */
+const SEARCH_PERF_ENABLED = Boolean(globalThis.__EMP_SEARCH_PERF__);
+/** Set `window.__EMP_LIBRARY_PERF__ = true` before load to log browse/virtualizer timings. */
+const LIBRARY_PERF_ENABLED = Boolean(globalThis.__EMP_LIBRARY_PERF__);
+const COLLECTION_VIRTUAL_THRESHOLD = 96;
+const COLLECTION_GRID_MIN = 160;
+const COLLECTION_GRID_GAP = 18;
+const COLLECTION_LIST_ROW_HEIGHT = 64;
+const COLLECTION_OVERSCAN_ROWS = 4;
 const LYRICS_FALLBACK_COLOR = "#535353";
 // Keeps white lyrics text at roughly 4.5:1 contrast or better.
 const LYRICS_MAX_LUMINANCE = 0.18;
@@ -237,8 +248,17 @@ let libraryContentFingerprint = "";
 let pendingRescanId = "";
 let rescanTimer = 0;
 let storageUsage = null;
+let updateUiShellReady = false;
+let updateToastSessionDismissedVersion = null;
+let searchIndex = null;
+let searchDebounceTimer = 0;
+let searchRequestId = 0;
 let lastSessionWrite = 0;
 let trackVirtual = null;
+let collectionVirtual = null;
+let collectionResizeRaf = 0;
+/** @type {Map<number, { filter: string, layout: string, sort: string, anchorIndex: number, anchorOffset: number }>} */
+const browseScrollByHistoryIndex = new Map();
 let lastAudioTime = 0;
 let listenStatsLoaded = false;
 let listenStatsRequestPending = false;
@@ -476,24 +496,12 @@ function setPersonalizedMixes(enabled) {
 }
 
 function mixCoverMarkup(mix, className) {
-  const tracks = mixTracks(mix);
-  const urls = [];
-  for (const track of tracks) {
-    if (track.coverUrl && !urls.includes(track.coverUrl)) {
-      urls.push(track.coverUrl);
-    }
-    if (urls.length >= 4) {
-      break;
-    }
-  }
+  const urls = selectDistinctCoverUrls(mixTracks(mix), 4);
   if (mix?.type === "artist" && urls[0]) {
     return coverMarkup({ coverUrl: urls[0], title: mix.title, color: "#282828" }, className);
   }
-  if (urls.length >= 4) {
-    const tiles = urls.slice(0, 4).map((url) => (
-      `<img src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">`
-    )).join("");
-    return `<div class="${className} cover-mosaic">${tiles}</div>`;
+  if (urls.length >= 2) {
+    return coverMosaicMarkup(urls, className);
   }
   if (urls[0]) {
     return coverMarkup({ coverUrl: urls[0], title: mix.title, color: "#282828" }, className);
@@ -1400,6 +1408,7 @@ function restoreEqualizerState(session) {
   state.sidebarWidth = normalizeSidebarWidth(session.sidebarWidth);
   state.sidebarCollapsed = Boolean(session.sidebarCollapsed);
   state.playlists = normalizePlaylists(session.playlists);
+  invalidateSearchIndex();
   if (Array.isArray(session.recentAlbumIds)) {
     state.recentAlbumIds = session.recentAlbumIds.filter((id) => typeof id === "string");
   }
@@ -2562,6 +2571,7 @@ function createPlaylist(name, trackId) {
     createdAt: Date.now()
   };
   state.playlists = [...state.playlists, playlist];
+  invalidateSearchIndex();
   recordRecentPlaylist(playlist.id);
   writeSession();
   if (state.view === "playlists" || state.view === "search") {
@@ -2604,6 +2614,7 @@ function createSmartPlaylist({ name, description, smart }) {
   };
   state.playlists = [...state.playlists, playlist];
   smartMatchCache.delete(playlist.id);
+  invalidateSearchIndex();
   recordRecentPlaylist(playlist.id);
   writeSession();
   return playlist;
@@ -2619,6 +2630,7 @@ function updateSmartPlaylist(playlistId, { name, description, smart }) {
   playlist.smart = window.EmpSmartPlaylists.normalizeSmartDefinition(smart);
   playlist.updatedAt = Date.now();
   smartMatchCache.delete(playlist.id);
+  invalidateSearchIndex();
   writeSession();
   refreshAfterPlaylistChange(playlist.id);
   return playlist;
@@ -2666,6 +2678,7 @@ function convertSmartPlaylistToRegular(playlistId) {
     createdAt: Date.now()
   };
   state.playlists = [...state.playlists, playlist];
+  invalidateSearchIndex();
   recordRecentPlaylist(playlist.id);
   writeSession();
   return playlist;
@@ -2786,6 +2799,7 @@ function isLibraryView(view = state.view) {
 }
 
 function refreshAfterPlaylistChange(playlistId) {
+  invalidateSearchIndex();
   renderLibraryList();
   if (
     state.view === "playlists"
@@ -2955,6 +2969,7 @@ function applySidebarLayout(options = {}) {
     void document.documentElement.offsetWidth;
     document.documentElement.classList.remove("is-sidebar-resizing");
   }
+  scheduleCollectionViewportSync();
 }
 
 function updateLibraryChipsScroll() {
@@ -3155,6 +3170,278 @@ function teardownTrackVirtual() {
   trackVirtual = null;
 }
 
+function libraryPerfLog(label, startedAt, extra = "") {
+  if (!LIBRARY_PERF_ENABLED) {
+    return;
+  }
+  const ms = Math.round(performance.now() - startedAt);
+  const cards = viewArea?.querySelectorAll(".media-card, .playlist-row.library-row, .virtual-collection-row .playlist-row")?.length ?? 0;
+  const nodes = viewArea?.querySelectorAll("*")?.length ?? 0;
+  console.info(`[EMP library] ${label} ${ms}ms${extra ? ` ${extra}` : ""} (cards/rows≈${cards}, nodes=${nodes})`);
+}
+
+function teardownCollectionVirtual() {
+  if (!collectionVirtual) {
+    return;
+  }
+  if (document.activeElement && collectionVirtual.container?.contains(document.activeElement)) {
+    document.activeElement.blur();
+  }
+  closeContextMenu();
+  closeOverflowMenu();
+  viewArea.removeEventListener("scroll", collectionVirtual.onScroll);
+  collectionVirtual = null;
+}
+
+function computeCollectionColumns(width) {
+  const w = Math.max(0, Number(width) || 0);
+  return Math.max(1, Math.floor((w + COLLECTION_GRID_GAP) / (COLLECTION_GRID_MIN + COLLECTION_GRID_GAP)));
+}
+
+function measureCollectionGridCardHeight(container, columns) {
+  const width = Math.max(1, container.clientWidth || 1);
+  const colWidth = Math.max(
+    COLLECTION_GRID_MIN,
+    (width - COLLECTION_GRID_GAP * Math.max(0, columns - 1)) / columns
+  );
+  const host = document.createElement("div");
+  host.className = "virtual-collection-measure";
+  host.style.width = `${colWidth}px`;
+  host.innerHTML = albumCard({
+    id: "__measure__",
+    title: "Measurement Title",
+    artist: "Measurement Artist",
+    color: "#282828",
+    isSingle: false
+  });
+  container.appendChild(host);
+  const card = host.firstElementChild;
+  const height = Math.max(1, Math.ceil(card?.getBoundingClientRect().height || (colWidth + 72)));
+  host.remove();
+  return height;
+}
+
+function captureCollectionScrollAnchor() {
+  if (!collectionVirtual?.items?.length) {
+    return { anchorIndex: 0, anchorOffset: 0 };
+  }
+  const { container, metrics, items } = collectionVirtual;
+  const columns = Math.max(1, metrics.columns);
+  const rowHeight = Math.max(1, metrics.rowHeight);
+  const containerTop = container.offsetTop;
+  const relative = Math.max(0, viewArea.scrollTop - containerTop);
+  const rowCount = Math.max(1, Math.ceil(items.length / columns));
+  const safeRow = Math.max(0, Math.min(rowCount - 1, Math.floor(relative / rowHeight)));
+  const anchorIndex = Math.min(items.length - 1, safeRow * columns);
+  const itemTop = containerTop + Math.floor(anchorIndex / columns) * rowHeight;
+  return {
+    anchorIndex,
+    anchorOffset: itemTop - viewArea.scrollTop
+  };
+}
+
+function applyCollectionScrollAnchor(anchor) {
+  if (!collectionVirtual || !anchor || !collectionVirtual.items.length) {
+    return;
+  }
+  const { container, metrics, items } = collectionVirtual;
+  const columns = Math.max(1, metrics.columns);
+  const rowHeight = Math.max(1, metrics.rowHeight);
+  const anchorIndex = Math.max(0, Math.min(items.length - 1, Number(anchor.anchorIndex) || 0));
+  const itemTop = container.offsetTop + Math.floor(anchorIndex / columns) * rowHeight;
+  const nextTop = itemTop - (Number(anchor.anchorOffset) || 0);
+  const maxScroll = Math.max(0, viewArea.scrollHeight - viewArea.clientHeight);
+  viewArea.scrollTop = Math.max(0, Math.min(maxScroll, nextTop));
+}
+
+function saveBrowseScrollForHistory() {
+  if (state.view !== "albums") {
+    return;
+  }
+  const anchor = collectionVirtual
+    ? captureCollectionScrollAnchor()
+    : {
+      anchorIndex: 0,
+      anchorOffset: -Math.max(0, viewArea.scrollTop)
+    };
+  // For non-virtual (small) libraries, store raw scroll via negative offset sentinel on index 0.
+  if (!collectionVirtual) {
+    browseScrollByHistoryIndex.set(historyIndex, {
+      filter: state.albumFilter,
+      layout: state.libraryLayout,
+      sort: state.librarySort,
+      anchorIndex: 0,
+      anchorOffset: -viewArea.scrollTop,
+      rawScrollTop: viewArea.scrollTop
+    });
+    return;
+  }
+  browseScrollByHistoryIndex.set(historyIndex, {
+    filter: state.albumFilter,
+    layout: state.libraryLayout,
+    sort: state.librarySort,
+    anchorIndex: anchor.anchorIndex,
+    anchorOffset: anchor.anchorOffset
+  });
+}
+
+function clearBrowseScrollForHistory(index = historyIndex) {
+  browseScrollByHistoryIndex.delete(index);
+}
+
+function restoreBrowseScrollForHistory() {
+  if (state.view !== "albums") {
+    return;
+  }
+  const stash = browseScrollByHistoryIndex.get(historyIndex);
+  if (!stash) {
+    return;
+  }
+  if (
+    stash.filter !== state.albumFilter
+    || stash.layout !== state.libraryLayout
+    || stash.sort !== state.librarySort
+  ) {
+    return;
+  }
+
+  const apply = () => {
+    if (typeof stash.rawScrollTop === "number") {
+      viewArea.scrollTop = stash.rawScrollTop;
+      return;
+    }
+    if (collectionVirtual) {
+      applyCollectionScrollAnchor(stash);
+      collectionVirtual.paint();
+    }
+  };
+
+  // Wait until spacer height is in the layout before restoring.
+  requestAnimationFrame(() => {
+    requestAnimationFrame(apply);
+  });
+}
+
+function scheduleCollectionViewportSync() {
+  if (collectionResizeRaf) {
+    return;
+  }
+  collectionResizeRaf = requestAnimationFrame(() => {
+    collectionResizeRaf = 0;
+    trackVirtual?.paint();
+    if (!collectionVirtual) {
+      return;
+    }
+    const anchor = captureCollectionScrollAnchor();
+    collectionVirtual.remeasure();
+    applyCollectionScrollAnchor(anchor);
+    collectionVirtual.paint();
+  });
+}
+
+function mountCollectionVirtual({ items, mode, showingArtists, renderItem }) {
+  const container = document.getElementById("virtualCollection");
+  const spacer = document.getElementById("virtualCollectionSpacer");
+  if (!container || !spacer || !items.length) {
+    return;
+  }
+
+  const metrics = {
+    columns: 1,
+    rowHeight: COLLECTION_LIST_ROW_HEIGHT,
+    cardHeight: COLLECTION_LIST_ROW_HEIGHT
+  };
+
+  const remeasure = () => {
+    if (mode === "list") {
+      metrics.columns = 1;
+      metrics.cardHeight = COLLECTION_LIST_ROW_HEIGHT;
+      metrics.rowHeight = COLLECTION_LIST_ROW_HEIGHT;
+    } else {
+      metrics.columns = computeCollectionColumns(container.clientWidth);
+      metrics.cardHeight = measureCollectionGridCardHeight(container, metrics.columns);
+      metrics.rowHeight = metrics.cardHeight + COLLECTION_GRID_GAP;
+    }
+    const rowCount = Math.ceil(items.length / metrics.columns);
+    const total = Math.max(0, rowCount * metrics.rowHeight - (mode === "grid" && rowCount > 0 ? COLLECTION_GRID_GAP : 0));
+    spacer.style.height = `${total}px`;
+  };
+
+  const paint = () => {
+    const paintStarted = LIBRARY_PERF_ENABLED ? performance.now() : 0;
+    if (document.activeElement && container.contains(document.activeElement)) {
+      document.activeElement.blur();
+    }
+    closeContextMenu();
+    closeOverflowMenu();
+
+    const columns = Math.max(1, metrics.columns);
+    const rowHeight = Math.max(1, metrics.rowHeight);
+    const rowCount = Math.ceil(items.length / columns);
+    const containerTop = container.offsetTop;
+    const relative = Math.max(0, viewArea.scrollTop - containerTop);
+    const firstRow = Math.max(0, Math.floor(relative / rowHeight) - COLLECTION_OVERSCAN_ROWS);
+    const visibleRows = Math.ceil(viewArea.clientHeight / rowHeight) + COLLECTION_OVERSCAN_ROWS * 2;
+    const lastRow = Math.min(rowCount, firstRow + visibleRows);
+
+    container.querySelectorAll(".virtual-collection-row").forEach((row) => row.remove());
+
+    const chunks = [];
+    for (let row = firstRow; row < lastRow; row += 1) {
+      const start = row * columns;
+      const slice = items.slice(start, start + columns);
+      if (!slice.length) {
+        continue;
+      }
+      const cells = slice.map((item, offset) => renderItem(item, start + offset)).join("");
+      if (mode === "list") {
+        chunks.push(`
+          <div class="virtual-collection-row is-list" style="top:${row * rowHeight}px;height:${metrics.cardHeight}px">
+            ${cells}
+          </div>
+        `);
+      } else {
+        chunks.push(`
+          <div class="virtual-collection-row is-grid" style="top:${row * rowHeight}px;height:${metrics.cardHeight}px;grid-template-columns:repeat(${columns}, minmax(0, 1fr));gap:${COLLECTION_GRID_GAP}px">
+            ${cells}
+          </div>
+        `);
+      }
+    }
+    spacer.insertAdjacentHTML("afterend", chunks.join(""));
+    libraryPerfLog("collection paint", paintStarted, `rows ${firstRow}-${lastRow} / ${rowCount}`);
+  };
+
+  remeasure();
+  const onScroll = () => paint();
+  viewArea.addEventListener("scroll", onScroll, { passive: true });
+  collectionVirtual = {
+    items,
+    mode,
+    showingArtists,
+    container,
+    spacer,
+    metrics,
+    renderItem,
+    remeasure,
+    paint,
+    onScroll
+  };
+  paint();
+
+  if (document.fonts?.ready) {
+    document.fonts.ready.then(() => {
+      if (collectionVirtual?.container !== container) {
+        return;
+      }
+      const anchor = captureCollectionScrollAnchor();
+      remeasure();
+      applyCollectionScrollAnchor(anchor);
+      paint();
+    }).catch(() => {});
+  }
+}
+
 function coverBackground(item) {
   if (item?.coverUrl) {
     return `background-image: url("${item.coverUrl}");`;
@@ -3163,14 +3450,55 @@ function coverBackground(item) {
   return `background: linear-gradient(135deg, ${color}, #121212);`;
 }
 
-function playlistArtworkUrls(playlist) {
+/**
+ * First distinct album artworks in track order.
+ * Dedupes by albumId AND coverUrl so same-album tracks and shared artwork
+ * files cannot fill multiple collage tiles.
+ */
+function selectDistinctCoverUrls(tracks, max = 4) {
   const urls = [];
-  for (const track of playlistTracks(playlist)) {
-    if (track.coverUrl) {
-      urls.push(track.coverUrl);
+  const seenAlbums = new Set();
+  const seenCovers = new Set();
+  const list = Array.isArray(tracks) ? tracks : [];
+  for (const track of list) {
+    const coverUrl = typeof track?.coverUrl === "string" ? track.coverUrl.trim() : "";
+    if (!coverUrl) {
+      continue;
+    }
+    const albumId = typeof track?.albumId === "string" ? track.albumId.trim() : "";
+    if (albumId && seenAlbums.has(albumId)) {
+      continue;
+    }
+    if (seenCovers.has(coverUrl)) {
+      continue;
+    }
+    if (albumId) {
+      seenAlbums.add(albumId);
+    }
+    seenCovers.add(coverUrl);
+    urls.push(coverUrl);
+    if (urls.length >= max) {
+      break;
     }
   }
   return urls;
+}
+
+function playlistArtworkUrls(playlist) {
+  return selectDistinctCoverUrls(playlistTracks(playlist), 4);
+}
+
+function coverMosaicMarkup(urls, className) {
+  const tiles = [];
+  for (let i = 0; i < 4; i += 1) {
+    const url = urls[i];
+    if (url) {
+      tiles.push(`<img src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">`);
+    } else {
+      tiles.push(`<div class="cover-mosaic-fallback" aria-hidden="true"></div>`);
+    }
+  }
+  return `<div class="${className} cover-mosaic">${tiles.join("")}</div>`;
 }
 
 function playlistCoverMarkup(playlist, className) {
@@ -3179,11 +3507,11 @@ function playlistCoverMarkup(playlist, className) {
   }
 
   const urls = playlistArtworkUrls(playlist);
-  if (urls.length >= 4) {
-    const tiles = urls.slice(0, 4).map((url) => (
-      `<img src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">`
-    )).join("");
-    return `<div class="${className} cover-mosaic">${tiles}</div>`;
+  if (urls.length >= 2) {
+    return coverMosaicMarkup(urls, className);
+  }
+  if (urls.length === 1) {
+    return coverMarkup({ coverUrl: urls[0], title: playlist?.name, color: playlist?.color }, className);
   }
 
   return coverMarkup(playlistCoverItem(playlist), className);
@@ -3505,12 +3833,8 @@ function normalizeSearchQuery(raw) {
   return normalizeSearchText(raw);
 }
 
-function scoreField(text, query) {
-  if (!query) {
-    return 0;
-  }
-  const normalized = normalizeSearchText(text);
-  if (!normalized) {
+function scoreNormalizedField(normalized, query) {
+  if (!query || !normalized) {
     return 0;
   }
   if (normalized === query) {
@@ -3523,6 +3847,10 @@ function scoreField(text, query) {
     return normalized.includes(` ${query}`) ? 60 : 50;
   }
   return 0;
+}
+
+function scoreField(text, query) {
+  return scoreNormalizedField(normalizeSearchText(text), query);
 }
 
 function scoreEntity(primary, secondaries, query) {
@@ -3538,6 +3866,93 @@ function scoreEntity(primary, secondaries, query) {
     return primaryScore;
   }
   return Math.max(0, secondaryScore - 25);
+}
+
+function scoreIndexedEntity(primaryNorm, secondaryNorms, query) {
+  const primaryScore = scoreNormalizedField(primaryNorm, query);
+  let secondaryScore = 0;
+  for (const field of secondaryNorms || []) {
+    secondaryScore = Math.max(secondaryScore, scoreNormalizedField(field, query));
+  }
+  if (!primaryScore && !secondaryScore) {
+    return 0;
+  }
+  if (primaryScore) {
+    return primaryScore;
+  }
+  return Math.max(0, secondaryScore - 25);
+}
+
+function invalidateSearchIndex() {
+  searchIndex = null;
+}
+
+function ensureSearchIndex() {
+  if (searchIndex) {
+    return searchIndex;
+  }
+
+  const trackCountByArtist = new Map();
+  for (const track of state.library.tracks) {
+    const key = String(track.artist ?? "").toLowerCase();
+    if (!key) {
+      continue;
+    }
+    trackCountByArtist.set(key, (trackCountByArtist.get(key) || 0) + 1);
+  }
+
+  const artistsByName = new Map();
+  for (const artist of catalogArtists()) {
+    const key = String(artist.name ?? "").toLowerCase();
+    artistsByName.set(key, {
+      artist: {
+        ...artist,
+        trackCount: trackCountByArtist.get(key) || 0
+      },
+      nameNorm: normalizeSearchText(artist.name)
+    });
+  }
+  for (const track of state.library.tracks) {
+    const key = String(track.artist ?? "").toLowerCase();
+    if (!key || artistsByName.has(key)) {
+      continue;
+    }
+    artistsByName.set(key, {
+      artist: {
+        name: track.artist,
+        albums: [],
+        coverUrl: track.coverUrl,
+        color: track.color,
+        trackCount: trackCountByArtist.get(key) || 0
+      },
+      nameNorm: normalizeSearchText(track.artist)
+    });
+  }
+
+  searchIndex = {
+    artists: [...artistsByName.values()],
+    playlists: state.playlists.map((playlist) => ({
+      playlist,
+      nameNorm: normalizeSearchText(playlist.name)
+    })),
+    albums: allAlbums().map((album) => ({
+      album,
+      titleNorm: normalizeSearchText(album.title),
+      artistNorm: normalizeSearchText(album.artist)
+    })),
+    songs: state.library.tracks.map((track) => ({
+      track,
+      titleNorm: normalizeSearchText(track.title),
+      artistNorm: normalizeSearchText(track.artist),
+      albumNorm: normalizeSearchText(track.album),
+      // Simple lowercasing for All Songs filter — same semantics as toLowerCase().includes.
+      // Do not use *Norm fields there (punctuation folding would change matches).
+      titleLower: String(track.title || "").toLowerCase(),
+      artistLower: String(track.artist || "").toLowerCase(),
+      albumLower: String(track.album || "").toLowerCase()
+    }))
+  };
+  return searchIndex;
 }
 
 const SEARCH_TYPE_TIEBREAK = {
@@ -3562,101 +3977,79 @@ function compareScored(left, right) {
   return left.index - right.index;
 }
 
-function searchArtists(query) {
-  const byName = new Map();
-  for (const artist of catalogArtists()) {
-    const key = String(artist.name ?? "").toLowerCase();
-    byName.set(key, {
-      ...artist,
-      trackCount: tracksByArtist(artist.name).length
-    });
-  }
-  for (const track of state.library.tracks) {
-    const key = String(track.artist ?? "").toLowerCase();
-    if (!key || byName.has(key)) {
-      continue;
-    }
-    byName.set(key, {
-      name: track.artist,
-      albums: [],
-      coverUrl: track.coverUrl,
-      color: track.color,
-      trackCount: tracksByArtist(track.artist).length
-    });
-  }
-
-  return [...byName.values()]
-    .map((artist, index) => {
-      const score = scoreEntity(artist.name, [], query);
+function searchArtists(query, index = ensureSearchIndex()) {
+  return index.artists
+    .map((entry, indexPos) => {
+      const score = scoreIndexedEntity(entry.nameNorm, [], query);
       if (!score) {
         return null;
       }
       return {
         type: "artist",
         score,
-        sortName: artist.name,
-        index,
-        artist
+        sortName: entry.artist.name,
+        index: indexPos,
+        artist: entry.artist
       };
     })
     .filter(Boolean)
     .sort(compareScored);
 }
 
-function searchPlaylists(query) {
-  return state.playlists
-    .map((playlist, index) => {
-      if (isLikedPlaylist(playlist) && !likedPlaylistWithSongs()) {
+function searchPlaylists(query, index = ensureSearchIndex()) {
+  return index.playlists
+    .map((entry, indexPos) => {
+      if (isLikedPlaylist(entry.playlist) && !likedPlaylistWithSongs()) {
         return null;
       }
-      const score = scoreEntity(playlist.name, [], query);
+      const score = scoreIndexedEntity(entry.nameNorm, [], query);
       if (!score) {
         return null;
       }
       return {
         type: "playlist",
         score,
-        sortName: playlist.name,
-        index,
-        playlist
+        sortName: entry.playlist.name,
+        index: indexPos,
+        playlist: entry.playlist
       };
     })
     .filter(Boolean)
     .sort(compareScored);
 }
 
-function searchAlbums(query) {
-  return allAlbums()
-    .map((album, index) => {
-      const score = scoreEntity(album.title, [album.artist], query);
+function searchAlbums(query, index = ensureSearchIndex()) {
+  return index.albums
+    .map((entry, indexPos) => {
+      const score = scoreIndexedEntity(entry.titleNorm, [entry.artistNorm], query);
       if (!score) {
         return null;
       }
       return {
         type: "album",
         score,
-        sortName: album.title,
-        index,
-        album
+        sortName: entry.album.title,
+        index: indexPos,
+        album: entry.album
       };
     })
     .filter(Boolean)
     .sort(compareScored);
 }
 
-function searchSongs(query) {
-  return state.library.tracks
-    .map((track, index) => {
-      const score = scoreEntity(track.title, [track.artist, track.album], query);
+function searchSongs(query, index = ensureSearchIndex()) {
+  return index.songs
+    .map((entry, indexPos) => {
+      const score = scoreIndexedEntity(entry.titleNorm, [entry.artistNorm, entry.albumNorm], query);
       if (!score) {
         return null;
       }
       return {
         type: "song",
         score,
-        sortName: track.title,
-        index,
-        track
+        sortName: entry.track.title,
+        index: indexPos,
+        track: entry.track
       };
     })
     .filter(Boolean)
@@ -3677,11 +4070,19 @@ function buildSearchResults(rawQuery) {
     };
   }
 
-  const artists = searchArtists(query);
-  const playlists = searchPlaylists(query);
-  const albums = searchAlbums(query);
-  const songs = searchSongs(query);
+  const matchStarted = SEARCH_PERF_ENABLED ? performance.now() : 0;
+  const index = ensureSearchIndex();
+  const artists = searchArtists(query, index);
+  const playlists = searchPlaylists(query, index);
+  const albums = searchAlbums(query, index);
+  const songs = searchSongs(query, index);
   const top = [...artists, ...playlists, ...albums, ...songs].sort(compareScored)[0] ?? null;
+  if (SEARCH_PERF_ENABLED) {
+    console.info(
+      `[EMP search] match/rank ${Math.round(performance.now() - matchStarted)}ms`,
+      `(artists ${artists.length}, playlists ${playlists.length}, albums ${albums.length}, songs ${songs.length})`
+    );
+  }
 
   return {
     query,
@@ -3794,8 +4195,11 @@ function updateSearchQuery(query, { focus = false, commit = false } = {}) {
     commitSearchHistory(state.query);
     clearSearchHistoryIdleCommit();
   }
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = 0;
+  const requestId = ++searchRequestId;
   if (state.view === "search") {
-    renderSearch({ preserveFocus: false });
+    renderSearch({ preserveFocus: false, requestId });
     searchInput.value = state.query;
     if (focus) {
       searchInput.focus();
@@ -3834,7 +4238,22 @@ function navigate(entry, { push = true } = {}) {
 
 function render(entry) {
   renderSeq += 1;
+  const nextFilter = entry.view === "albums" ? (entry.filter ?? "all") : null;
+  if (state.view === "albums" && entry.view !== "albums") {
+    saveBrowseScrollForHistory();
+  }
+  let resetBrowseScroll = false;
+  if (
+    state.view === "albums"
+    && entry.view === "albums"
+    && nextFilter !== null
+    && nextFilter !== state.albumFilter
+  ) {
+    clearBrowseScrollForHistory();
+    resetBrowseScroll = true;
+  }
   teardownTrackVirtual();
+  teardownCollectionVirtual();
   closeContextMenu();
   closeOverflowMenu();
   closeDetailsModal();
@@ -3877,10 +4296,15 @@ function render(entry) {
     renderSongs();
   } else if (entry.view === "search") {
     setStageAccent("#1f1f1f");
-    renderSearch();
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = 0;
+    renderSearch({ requestId: ++searchRequestId });
   } else if (entry.view === "albums") {
     setStageAccent("#3a1f12");
     renderAlbumGrid();
+    if (resetBrowseScroll) {
+      viewArea.scrollTop = 0;
+    }
   } else if (entry.view === "tracks") {
     setStageAccent("#121826");
     renderAllTracks();
@@ -4397,6 +4821,7 @@ function catalogAlbums() {
 }
 
 function renderAlbumGrid() {
+  const started = LIBRARY_PERF_ENABLED ? performance.now() : 0;
   const showingArtists = state.albumFilter === "artists";
   const albums = showingArtists ? [] : sortAlbums(catalogAlbums());
   const artists = showingArtists ? sortArtists(catalogArtists()) : [];
@@ -4421,13 +4846,23 @@ function renderAlbumGrid() {
         ? "albums"
         : "albums & singles";
   const list = state.libraryLayout === "list";
-  const body = showingArtists
-    ? (list
+  const useVirtual = items.length > COLLECTION_VIRTUAL_THRESHOLD;
+  let body;
+  if (useVirtual) {
+    body = `
+      <div class="virtual-collection${list ? " is-list" : " is-grid"}" id="virtualCollection">
+        <div class="virtual-collection-spacer" id="virtualCollectionSpacer"></div>
+      </div>
+    `;
+  } else if (showingArtists) {
+    body = list
       ? `<div class="library-list">${artists.map(libraryArtistRow).join("")}</div>`
-      : `<div class="card-grid">${artists.map(artistCard).join("")}</div>`)
-    : (list
+      : `<div class="card-grid">${artists.map(artistCard).join("")}</div>`;
+  } else {
+    body = list
       ? `<div class="library-list">${albums.map(libraryAlbumRow).join("")}</div>`
-      : `<div class="card-grid">${albums.map(albumCard).join("")}</div>`);
+      : `<div class="card-grid">${albums.map(albumCard).join("")}</div>`;
+  }
 
   viewArea.innerHTML = `
     <h1 class="greeting">${heading}</h1>
@@ -4438,6 +4873,25 @@ function renderAlbumGrid() {
     <p class="collection-stat">${items.length} ${label}</p>
     ${body}
   `;
+
+  if (useVirtual) {
+    const renderItem = showingArtists
+      ? (item) => (list ? libraryArtistRow(item) : artistCard(item))
+      : (item) => (list ? libraryAlbumRow(item) : albumCard(item));
+    mountCollectionVirtual({
+      items,
+      mode: list ? "list" : "grid",
+      showingArtists,
+      renderItem
+    });
+  }
+
+  restoreBrowseScrollForHistory();
+  libraryPerfLog(
+    "renderAlbumGrid",
+    started,
+    `${items.length} items ${list ? "list" : "grid"}${useVirtual ? " virtual" : " full"}`
+  );
 }
 
 function renderAllTracks() {
@@ -4465,9 +4919,14 @@ function songsQueryNeedle() {
   return String(state.songsQuery || "").trim().toLowerCase();
 }
 
-function trackMatchesSongsQuery(track, needle = songsQueryNeedle()) {
+function trackMatchesSongsQuery(track, needle = songsQueryNeedle(), lowerFields = null) {
   if (!needle) {
     return true;
+  }
+  if (lowerFields) {
+    return lowerFields.titleLower.includes(needle)
+      || lowerFields.artistLower.includes(needle)
+      || lowerFields.albumLower.includes(needle);
   }
   return [track.title, track.artist, track.album]
     .some((part) => String(part || "").toLowerCase().includes(needle));
@@ -4553,9 +5012,14 @@ function songsLibraryTracks() {
 
 function getSongsTracks() {
   const needle = songsQueryNeedle();
-  let tracks = songsLibraryTracks();
+  let tracks;
   if (needle) {
-    tracks = tracks.filter((track) => trackMatchesSongsQuery(track, needle));
+    const index = ensureSearchIndex();
+    tracks = index.songs
+      .filter((entry) => trackMatchesSongsQuery(entry.track, needle, entry))
+      .map((entry) => entry.track);
+  } else {
+    tracks = songsLibraryTracks();
   }
   if (state.songsNeverPlayed) {
     tracks = tracks.filter((track) => trackPlayCount(track.id) <= 0);
@@ -5171,18 +5635,28 @@ function renderSearchResultsBody(results) {
   `;
 }
 
-function renderSearch({ preserveFocus = false } = {}) {
+function renderSearch({ preserveFocus = false, requestId = null } = {}) {
+  if (requestId != null && requestId !== searchRequestId) {
+    return;
+  }
+
   const queryKey = normalizeSearchQuery(state.query);
   const scrollTop = preserveFocus ? viewArea.scrollTop : 0;
   const activeMore = preserveFocus
     ? document.activeElement?.getAttribute?.("data-search-more") || null
     : null;
 
+  const renderStarted = SEARCH_PERF_ENABLED ? performance.now() : 0;
   let body;
   if (!queryKey) {
     body = renderSearchLanding();
   } else {
-    body = renderSearchResultsBody(buildSearchResults(state.query));
+    const results = buildSearchResults(state.query);
+    const domStarted = SEARCH_PERF_ENABLED ? performance.now() : 0;
+    body = renderSearchResultsBody(results);
+    if (SEARCH_PERF_ENABLED) {
+      console.info(`[EMP search] results markup ${Math.round(performance.now() - domStarted)}ms`);
+    }
   }
 
   viewArea.innerHTML = `
@@ -5191,6 +5665,9 @@ function renderSearch({ preserveFocus = false } = {}) {
       ${body}
     </div>
   `;
+  if (SEARCH_PERF_ENABLED) {
+    console.info(`[EMP search] DOM commit ${Math.round(performance.now() - renderStarted)}ms`);
+  }
 
   if (preserveFocus) {
     viewArea.scrollTop = scrollTop;
@@ -5704,16 +6181,34 @@ function renderSettings() {
   window.chrome?.webview?.postMessage({ type: "updates", action: "status" });
 }
 
-function formatMegabytes(bytes) {
-  const megabytes = Math.max(0, Number(bytes) || 0) / (1024 * 1024);
-  if (megabytes > 0 && megabytes < 10) {
-    return `${megabytes.toFixed(1)} MB`;
+/** Format a byte count with SI (1000) units: B, KB, MB, GB, TB, PB. */
+function formatByteSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) {
+    return "0 B";
   }
-  return `${Math.round(megabytes).toLocaleString()} MB`;
+  if (value === 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  const base = 1000;
+  let unitIndex = 0;
+  let scaled = value;
+  while (scaled >= base && unitIndex < units.length - 1) {
+    scaled /= base;
+    unitIndex += 1;
+  }
+  if (unitIndex === 0) {
+    return `${Math.round(scaled).toLocaleString()} ${units[unitIndex]}`;
+  }
+  if (scaled < 10) {
+    return `${scaled.toFixed(1)} ${units[unitIndex]}`;
+  }
+  return `${Math.round(scaled).toLocaleString()} ${units[unitIndex]}`;
 }
 
 function storageValueText(key) {
-  return storageUsage ? formatMegabytes(storageUsage[key]) : "Calculating…";
+  return storageUsage ? formatByteSize(storageUsage[key]) : "Calculating…";
 }
 
 function renderStorageSettingsGroup() {
@@ -5824,9 +6319,11 @@ function applyUpdateStatus(detail) {
     state: detail.state || "idle",
     availableVersion: detail.availableVersion || null,
     progress: detail.progress == null ? null : Number(detail.progress),
-    error: detail.error || null
+    error: detail.error || null,
+    dismissedUpdateVersion: detail.dismissedUpdateVersion || null
   };
   syncUpdatesSettingsUi();
+  syncUpdateToast();
 }
 
 function updateSettingsNavBadge() {
@@ -5836,6 +6333,57 @@ function updateSettingsNavBadge() {
   }
   const hasUpdate = state.updateStatus?.state === "updateAvailable" || state.updateStatus?.state === "ready";
   nav.classList.toggle("has-update", Boolean(hasUpdate));
+}
+
+function shouldShowUpdateToast() {
+  if (!updateUiShellReady) {
+    return false;
+  }
+  const status = state.updateStatus || {};
+  if (status.state !== "updateAvailable") {
+    return false;
+  }
+  const version = status.availableVersion;
+  if (!version) {
+    return false;
+  }
+  if (updateToastSessionDismissedVersion && updateToastSessionDismissedVersion === version) {
+    return false;
+  }
+  if (status.dismissedUpdateVersion && status.dismissedUpdateVersion === version) {
+    return false;
+  }
+  return true;
+}
+
+function syncUpdateToast() {
+  const toast = document.getElementById("updateToast");
+  if (!toast) {
+    return;
+  }
+  const show = shouldShowUpdateToast();
+  toast.hidden = !show;
+  if (!show) {
+    return;
+  }
+  const message = toast.querySelector("[data-update-toast-message]");
+  const version = state.updateStatus?.availableVersion;
+  if (message && version) {
+    message.textContent = `EMP v${version} is available`;
+  }
+}
+
+function dismissUpdateToast() {
+  const version = state.updateStatus?.availableVersion;
+  if (version) {
+    updateToastSessionDismissedVersion = version;
+  }
+  const toast = document.getElementById("updateToast");
+  if (toast) {
+    toast.hidden = true;
+  }
+  // Persist dismissal without clearing updateAvailable / Settings badge.
+  postUpdateAction("dismissNotification");
 }
 
 function applyStorageUsage(detail) {
@@ -8022,6 +8570,7 @@ function updateNowPlaying() {
   highlightPlaying();
   updateCollectionControls();
   trackVirtual?.paint();
+  collectionVirtual?.paint();
   updateSlider(seekBar);
   updateSlider(volumeBar);
   applyVolumeControls();
@@ -8629,6 +9178,7 @@ function bindLibrary(library) {
       tracks: library.tracks ?? []
     };
     retainActiveTracks(previousTracks);
+    invalidateSearchIndex();
     if (fingerprint) {
       libraryContentFingerprint = fingerprint;
     }
@@ -8677,12 +9227,22 @@ function bindLibrary(library) {
   if (!sessionRestored) {
     sessionRestored = true;
     restoreSession();
+    markUpdateUiShellReady();
     return;
   }
 
   if (!unchanged) {
     updateNowPlaying();
   }
+  markUpdateUiShellReady();
+}
+
+function markUpdateUiShellReady() {
+  if (updateUiShellReady) {
+    return;
+  }
+  updateUiShellReady = true;
+  syncUpdateToast();
 }
 
 function isTypingTarget(target) {
@@ -9064,6 +9624,7 @@ function closeDeleteModal() {
 function deletePlaylist(playlistId) {
   smartMatchCache.delete(playlistId);
   state.playlists = state.playlists.filter((p) => p.id !== playlistId);
+  invalidateSearchIndex();
   writeSession();
   renderLibraryList();
   if (state.view === "playlists" || state.view === "playlist") {
@@ -9645,6 +10206,22 @@ document.body.addEventListener("click", (event) => {
     return;
   }
 
+  const updateToastAction = event.target.closest("[data-update-toast-action]");
+  if (updateToastAction) {
+    event.preventDefault();
+    const action = updateToastAction.dataset.updateToastAction;
+    if (action === "dismiss") {
+      dismissUpdateToast();
+    } else if (action === "download") {
+      const toast = document.getElementById("updateToast");
+      if (toast) {
+        toast.hidden = true;
+      }
+      postUpdateAction("download");
+    }
+    return;
+  }
+
   const updateActionButton = event.target.closest("[data-update-action]");
   if (updateActionButton) {
     event.preventDefault();
@@ -9910,16 +10487,20 @@ document.body.addEventListener("click", (event) => {
   }
 
   if (sortButton) {
+    clearBrowseScrollForHistory();
     state.librarySort = normalizeSort(sortButton.dataset.sort);
     writeSession();
     render(historyStack[historyIndex]);
+    viewArea.scrollTop = 0;
     return;
   }
 
   if (layoutButton) {
+    clearBrowseScrollForHistory();
     state.libraryLayout = normalizeLayout(layoutButton.dataset.layout);
     writeSession();
     render(historyStack[historyIndex]);
+    viewArea.scrollTop = 0;
     return;
   }
 
@@ -10001,6 +10582,7 @@ window.addEventListener("resize", () => {
   updateLibraryChipsScroll();
   syncTopBarScroll();
   syncHomeLayout();
+  scheduleCollectionViewportSync();
 });
 
 window.addEventListener("focus", () => {
@@ -10092,6 +10674,7 @@ document.addEventListener("visibilitychange", () => {
 
 new ResizeObserver(() => {
   syncHomeLayout();
+  scheduleCollectionViewportSync();
 }).observe(viewArea);
 
 function syncTopBarScroll() {
@@ -10302,6 +10885,7 @@ document.querySelector("[data-chips-scroll] .library-chips")?.addEventListener("
     const delta = event.clientX - startX;
     state.sidebarWidth = normalizeSidebarWidth(startWidth + delta);
     document.documentElement.style.setProperty("--sidebar-width", `${state.sidebarWidth}px`);
+    scheduleCollectionViewportSync();
   };
 
   const onUp = () => {
@@ -10313,6 +10897,7 @@ document.querySelector("[data-chips-scroll] .library-chips")?.addEventListener("
     document.body.style.cursor = "";
     writeSession();
     updateLibraryChipsScroll();
+    scheduleCollectionViewportSync();
   };
 
   sidebarResize.addEventListener("pointerdown", (event) => {
@@ -10350,11 +10935,25 @@ document.querySelector("[data-chips-scroll] .library-chips")?.addEventListener("
   });
 })();
 
+function scheduleSearchRender({ immediate = false } = {}) {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = 0;
+  const requestId = ++searchRequestId;
+  if (immediate) {
+    renderSearch({ preserveFocus: false, requestId });
+    return;
+  }
+  searchDebounceTimer = window.setTimeout(() => {
+    searchDebounceTimer = 0;
+    renderSearch({ preserveFocus: false, requestId });
+  }, SEARCH_DEBOUNCE_MS);
+}
+
 searchInput.addEventListener("input", () => {
   state.query = searchInput.value;
   const entry = { view: "search", query: state.query };
   historyStack[historyIndex] = entry;
-  renderSearch({ preserveFocus: false });
+  scheduleSearchRender();
   scheduleSearchHistoryIdleCommit();
 });
 
@@ -10365,7 +10964,7 @@ searchInput.addEventListener("keydown", (event) => {
     if (isMeaningfulSearchQuery(state.query)) {
       commitSearchHistory(state.query);
     }
-    renderSearch({ preserveFocus: false });
+    scheduleSearchRender({ immediate: true });
     return;
   }
   if (event.key === "Escape") {
@@ -10375,7 +10974,7 @@ searchInput.addEventListener("keydown", (event) => {
       state.query = "";
       historyStack[historyIndex] = { view: "search", query: "" };
       searchInput.value = "";
-      renderSearch();
+      scheduleSearchRender({ immediate: true });
       searchInput.focus();
     } else {
       searchInput.blur();
@@ -10908,6 +11507,80 @@ if (window.__emp?.library) {
   bindLibrary(window.__emp.library);
 }
 
+/**
+ * Dev helper: seed synthetic albums/artists approximating trackCount tracks.
+ * Usage: `__EMP_seedBrowseFixture(10000)` then open Browse Library.
+ * Does not write to disk; next real library bind replaces it.
+ */
+globalThis.__EMP_seedBrowseFixture = function seedBrowseFixture(trackCount = 10000) {
+  const total = Math.max(1, Math.floor(Number(trackCount) || 0));
+  const albums = [];
+  const singles = [];
+  const tracks = [];
+  let remaining = total;
+  let albumIndex = 0;
+  while (remaining > 0) {
+    albumIndex += 1;
+    const isSingle = albumIndex % 7 === 0;
+    const size = Math.min(remaining, isSingle ? 1 : 10);
+    const id = `fixture-album-${albumIndex}`;
+    const artist = `Fixture Artist ${((albumIndex - 1) % 500) + 1}`;
+    const title = `${isSingle ? "Single" : "Album"} ${albumIndex}`;
+    const album = {
+      id,
+      title,
+      artist,
+      coverUrl: null,
+      color: "#282828",
+      trackCount: size,
+      year: 2000 + (albumIndex % 25),
+      isSingle,
+      trackIds: []
+    };
+    for (let n = 1; n <= size; n += 1) {
+      const trackId = `fixture-track-${albumIndex}-${n}`;
+      album.trackIds.push(trackId);
+      tracks.push({
+        id: trackId,
+        title: `Track ${n}`,
+        artist,
+        album: title,
+        albumId: id,
+        trackNumber: n,
+        duration: 180,
+        url: "",
+        coverUrl: null,
+        isSingle,
+        color: "#282828"
+      });
+    }
+    if (isSingle) {
+      singles.push(album);
+    } else {
+      albums.push(album);
+    }
+    remaining -= size;
+  }
+  invalidateSearchIndex();
+  state.library = {
+    rootPath: state.library.rootPath || "",
+    folders: state.library.folders || [],
+    albums,
+    singles,
+    tracks
+  };
+  if (state.view === "albums") {
+    renderAlbumGrid();
+  }
+  console.info(
+    "[EMP library] seeded fixture: "
+      + tracks.length + " tracks, "
+      + albums.length + " albums, "
+      + singles.length + " singles"
+  );
+  return { tracks: tracks.length, albums: albums.length, singles: singles.length };
+};
+
 updateRepeatButton();
 updateSlider(volumeBar);
 updateSlider(seekBar);
@@ -10918,3 +11591,4 @@ if (navigator.mediaDevices?.addEventListener) {
     refreshAudioOutputDevices();
   });
 }
+

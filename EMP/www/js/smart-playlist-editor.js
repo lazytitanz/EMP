@@ -19,6 +19,9 @@
   let touchedPaths = new Set();
   let activeTemplateId = null;
   let previewUpdating = false;
+  /** @type {"auto"|"user"} Whether the name is still auto-generated from templates/defaults. */
+  let nameOwnership = "auto";
+  let lastAutoName = "";
 
   let hooks = {
     getContext: () => ({ tracks: [], albumsById: {}, listenStats: {}, likedIds: new Set(), now: Date.now() }),
@@ -573,6 +576,11 @@
   }
 
   function onRootInput(event) {
+    if (event.target.matches?.("[data-smart-name]")) {
+      // Any manual edit (including clearing) takes ownership of the name.
+      nameOwnership = "user";
+      draft.name = event.target.value;
+    }
     const row = event.target.closest("[data-rule-path]");
     if (row) {
       markRuleTouched(row.dataset.rulePath);
@@ -1006,12 +1014,14 @@
     draft.smart = sp().normalizeSmartDefinition(entry.def);
     activeTemplateId = id;
     draft.smart.templatesHint = id;
-    // Prefer template label when the current name is still a default placeholder.
-    const nameInput = root.querySelector("[data-smart-name]");
-    const currentName = String(nameInput.value || "").trim();
-    if (!currentName || /^Smart Playlist #\d+$/i.test(currentName)) {
+    // Only replace the name while it is still auto-owned (create flow / unedited).
+    if (nameOwnership === "auto") {
+      const nameInput = root.querySelector("[data-smart-name]");
       draft.name = entry.label;
-      nameInput.value = entry.label;
+      lastAutoName = entry.label;
+      if (nameInput) {
+        nameInput.value = entry.label;
+      }
     }
     showValidation = false;
     touchedPaths = new Set();
@@ -1039,11 +1049,14 @@
     mode = "create";
     editingId = null;
     const api = sp();
+    const name = defaults.name || "";
     draft = {
-      name: defaults.name || "",
+      name,
       description: defaults.description || "",
       smart: api.normalizeSmartDefinition(defaults.smart || api.createDefaultDefinition())
     };
+    nameOwnership = "auto";
+    lastAutoName = name;
     openModal("Create smart playlist", "Create playlist");
   }
 
@@ -1055,6 +1068,9 @@
       description: playlist.description || "",
       smart: sp().normalizeSmartDefinition(playlist.smart || sp().createDefaultDefinition())
     };
+    // Existing playlists always keep their name; template/rule edits never auto-rename.
+    nameOwnership = "user";
+    lastAutoName = "";
     activeTemplateId = draft.smart.templatesHint || null;
     openModal("Edit smart playlist", "Save changes");
   }

@@ -77,7 +77,8 @@ namespace EMP.Hosting
                     AvailableVersion = available?.AvailableVersion,
                     Progress = progress,
                     Error = error,
-                    AutomaticUpdateChecks = AppSettingsStore.Current.AutomaticUpdateChecks
+                    AutomaticUpdateChecks = AppSettingsStore.Current.AutomaticUpdateChecks,
+                    DismissedUpdateVersion = AppSettingsStore.Current.DismissedUpdateVersion
                 };
             }
 
@@ -105,6 +106,7 @@ namespace EMP.Hosting
                     RestartAndUpdate();
                     break;
                 case "dismiss":
+                    PersistDismissedAvailableVersion();
                     lock (Gate)
                     {
                         if (state is "updateAvailable" or "ready" or "failed")
@@ -116,18 +118,15 @@ namespace EMP.Hosting
 
                     PostStatus();
                     break;
+                case "dismissNotification":
+                    // Hide the toast only; keep updateAvailable/ready state and Settings badge.
+                    PersistDismissedAvailableVersion();
+                    PostStatus();
+                    break;
                 case "setAutomatic":
                     bool enabled = message.TryGetProperty("enabled", out JsonElement enabledElement)
                         && enabledElement.ValueKind == JsonValueKind.True;
-                    AppSettings settings = AppSettingsStore.Current;
-                    AppSettingsStore.Save(new AppSettings
-                    {
-                        StartupOnLogin = settings.StartupOnLogin,
-                        CloseMinimizes = settings.CloseMinimizes,
-                        MusicFolders = settings.MusicFolders is null ? null : [.. settings.MusicFolders],
-                        AutomaticUpdateChecks = enabled,
-                        LastUpdateCheckUtc = settings.LastUpdateCheckUtc
-                    });
+                    AppSettingsStore.Save(AppSettingsStore.CopyCurrent(automaticUpdateChecks: enabled));
                     PostStatus();
                     break;
             }
@@ -178,15 +177,7 @@ namespace EMP.Hosting
                 AvailableUpdate? update = await downloader.CheckForUpdateAsync(AppVersion.Current, cts.Token)
                     .ConfigureAwait(false);
 
-                AppSettings settings = AppSettingsStore.Current;
-                AppSettingsStore.Save(new AppSettings
-                {
-                    StartupOnLogin = settings.StartupOnLogin,
-                    CloseMinimizes = settings.CloseMinimizes,
-                    MusicFolders = settings.MusicFolders is null ? null : [.. settings.MusicFolders],
-                    AutomaticUpdateChecks = settings.AutomaticUpdateChecks,
-                    LastUpdateCheckUtc = DateTimeOffset.UtcNow
-                });
+                AppSettingsStore.Save(AppSettingsStore.CopyCurrent(lastUpdateCheckUtc: DateTimeOffset.UtcNow));
 
                 lock (Gate)
                 {
@@ -374,6 +365,22 @@ namespace EMP.Hosting
             }
         }
 
+        private static void PersistDismissedAvailableVersion()
+        {
+            string? version;
+            lock (Gate)
+            {
+                version = available?.AvailableVersion;
+            }
+
+            if (string.IsNullOrWhiteSpace(version))
+            {
+                return;
+            }
+
+            AppSettingsStore.Save(AppSettingsStore.CopyCurrent(dismissedUpdateVersion: version));
+        }
+
         private static IReleaseProvider CreateProvider()
         {
             if (providerOverride is not null)
@@ -411,6 +418,8 @@ namespace EMP.Hosting
             public string? Error { get; init; }
 
             public bool AutomaticUpdateChecks { get; init; }
+
+            public string? DismissedUpdateVersion { get; init; }
         }
     }
 }

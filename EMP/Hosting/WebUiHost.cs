@@ -1067,16 +1067,10 @@ namespace EMP.Hosting
                 automaticUpdateChecks = autoElement.ValueKind == JsonValueKind.True;
             }
 
-            AppSettingsStore.Save(new AppSettings
-            {
-                StartupOnLogin = startupOnLogin,
-                CloseMinimizes = closeMinimizes,
-                MusicFolders = AppSettingsStore.Current.MusicFolders is null
-                    ? null
-                    : [.. AppSettingsStore.Current.MusicFolders],
-                AutomaticUpdateChecks = automaticUpdateChecks,
-                LastUpdateCheckUtc = AppSettingsStore.Current.LastUpdateCheckUtc
-            });
+            AppSettingsStore.Save(AppSettingsStore.CopyCurrent(
+                startupOnLogin: startupOnLogin,
+                closeMinimizes: closeMinimizes,
+                automaticUpdateChecks: automaticUpdateChecks));
         }
 
         private static void HandleNowPlaying(JsonElement message)

@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#download">Download</a> ·
   <a href="#features">Features</a> ·
+  <a href="#screenshots">Screenshots</a> ·
   <a href="#why-emp">Why EMP?</a> ·
   <a href="#build-from-source">Build</a>
 </p>
@@ -98,6 +99,33 @@ Open **Connect to a device** from the player bar. When casting, EMP serves the o
 
 Audio processing (equalizer, ReplayGain, prevent clipping, crossfade, gapless) applies on this computer and is not applied when sending the original file to another device.
 </details>
+
+## Screenshots
+
+<p align="center">
+  <img src="EMP/www/img/image2.png" alt="All Songs page">
+</p>
+<p align="center"><em>All Songs — jump right in to listening to every song in your library.</em></p>
+
+<p align="center">
+  <img src="EMP/www/img/image3.png" alt="Search page">
+</p>
+<p align="center"><em>Search page.</em></p>
+
+<p align="center">
+  <img src="EMP/www/img/image4.png" alt="Settings page">
+</p>
+<p align="center"><em>Settings page.</em></p>
+
+<p align="center">
+  <img src="EMP/www/img/image5.png" alt="Artists page and discography">
+</p>
+<p align="center"><em>Artists page and discography sections.</em></p>
+
+<p align="center">
+  <img src="EMP/www/img/image6.png" alt="Lyrics panel">
+</p>
+<p align="center"><em>Lyrics panel.</em></p>
 
 ## Why EMP?
 
