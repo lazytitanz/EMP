@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="EMP/EMP.csproj" />
+  <Project Path="EMP.Tests/EMP.Tests.csproj" />
+</Solution>

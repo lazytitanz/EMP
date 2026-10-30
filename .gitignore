@@ -64,6 +64,7 @@ project.fragment.lock.json
 *.nuget.targets
 
 # Test and coverage
+EMP.Tests/
 [Tt]est[Rr]esult*/
 *.trx
 *.coverage
