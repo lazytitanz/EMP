@@ -10,6 +10,10 @@ namespace EMP.Hosting
         public bool CloseMinimizes { get; set; }
 
         public List<string>? MusicFolders { get; set; }
+
+        public bool AutomaticUpdateChecks { get; set; } = true;
+
+        public DateTimeOffset? LastUpdateCheckUtc { get; set; }
     }
 
     internal static class AppSettingsStore
@@ -67,7 +71,9 @@ namespace EMP.Hosting
             {
                 StartupOnLogin = Current.StartupOnLogin,
                 CloseMinimizes = Current.CloseMinimizes,
-                MusicFolders = folders.ToList()
+                MusicFolders = folders.ToList(),
+                AutomaticUpdateChecks = Current.AutomaticUpdateChecks,
+                LastUpdateCheckUtc = Current.LastUpdateCheckUtc
             });
         }
 

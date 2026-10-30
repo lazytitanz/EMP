@@ -1,4 +1,7 @@
 <Solution>
   <Project Path="EMP/EMP.csproj" />
+  <Project Path="EMP.UpdateCore/EMP.UpdateCore.csproj" />
+  <Project Path="EMP.Updater/EMP.Updater.csproj" />
+  <Project Path="EMP.Updater.Tests/EMP.Updater.Tests.csproj" />
   <Project Path="EMP.Tests/EMP.Tests.csproj" />
 </Solution>

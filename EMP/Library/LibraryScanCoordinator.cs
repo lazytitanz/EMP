@@ -4,6 +4,7 @@ namespace EMP.Library
     /// Ensures only one full library scan runs at a time. Overlapping watcher/folder
     /// requests coalesce into a follow-up scan. Manual refresh request ids attach to
     /// the in-flight scan so every refresh receives a completion without an extra pass.
+    /// Metadata edit sessions defer watcher-driven scans until targeted patching finishes.
     /// </summary>
     internal sealed class LibraryScanCoordinator
     {
@@ -13,6 +14,86 @@ namespace EMP.Library
         private bool coalesce;
         private int generation;
         private bool disposed;
+        private int metadataEditSessions;
+        private bool deferredWatcherRefresh;
+        private bool deferredNeedsFullScan;
+
+        public bool IsMetadataEditActive
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return metadataEditSessions > 0;
+                }
+            }
+        }
+
+        public void BeginMetadataEditSession()
+        {
+            lock (gate)
+            {
+                if (disposed)
+                {
+                    return;
+                }
+
+                metadataEditSessions++;
+            }
+        }
+
+        /// <summary>
+        /// Ends an edit session. Returns whether a full rescan should run because watchers
+        /// observed unrelated library changes (creates/deletes/renames) during the session.
+        /// </summary>
+        public bool EndMetadataEditSession(bool editedPathsFullyPatched)
+        {
+            lock (gate)
+            {
+                if (disposed)
+                {
+                    return false;
+                }
+
+                if (metadataEditSessions > 0)
+                {
+                    metadataEditSessions--;
+                }
+
+                if (metadataEditSessions > 0)
+                {
+                    return false;
+                }
+
+                bool needsFullScan = deferredNeedsFullScan || (deferredWatcherRefresh && !editedPathsFullyPatched);
+                deferredWatcherRefresh = false;
+                deferredNeedsFullScan = false;
+                return needsFullScan;
+            }
+        }
+
+        /// <summary>
+        /// Called when a watcher or folder-config change wants a refresh. During a metadata
+        /// edit session the request is deferred instead of starting a scan.
+        /// </summary>
+        public bool TryDeferWatcherRefresh(bool requiresFullScan = false)
+        {
+            lock (gate)
+            {
+                if (disposed || metadataEditSessions <= 0)
+                {
+                    return false;
+                }
+
+                deferredWatcherRefresh = true;
+                if (requiresFullScan)
+                {
+                    deferredNeedsFullScan = true;
+                }
+
+                return true;
+            }
+        }
 
         public void Request(string? requestId, Action<int> startScan)
         {
@@ -29,6 +110,17 @@ namespace EMP.Library
                 if (!string.IsNullOrWhiteSpace(requestId))
                 {
                     pendingRequestIds.Add(requestId);
+                }
+
+                if (metadataEditSessions > 0)
+                {
+                    // Manual refresh ids wait; watcher-style requests (no id) are deferred.
+                    if (string.IsNullOrWhiteSpace(requestId))
+                    {
+                        deferredWatcherRefresh = true;
+                    }
+
+                    return;
                 }
 
                 if (running)
@@ -80,6 +172,18 @@ namespace EMP.Library
                     return false;
                 }
 
+                if (metadataEditSessions > 0)
+                {
+                    running = false;
+                    if (coalesce)
+                    {
+                        deferredWatcherRefresh = true;
+                        coalesce = false;
+                    }
+
+                    return false;
+                }
+
                 if (!coalesce && pendingRequestIds.Count == 0)
                 {
                     running = false;
@@ -102,6 +206,9 @@ namespace EMP.Library
                 running = false;
                 coalesce = false;
                 generation++;
+                metadataEditSessions = 0;
+                deferredWatcherRefresh = false;
+                deferredNeedsFullScan = false;
                 pendingRequestIds.Clear();
             }
         }

@@ -2,7 +2,9 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using EMP.Cast;
 using EMP.Library;
+using EMP.Library.Metadata;
 using EMP.Lyrics;
+using EMP.UpdateCore;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -40,8 +42,12 @@ namespace EMP.Hosting
         private static int storageRequested;
         private static int storageMeasuring;
         private static readonly LibraryScanCoordinator ScanCoordinator = new();
+        private static readonly MetadataEditorService MetadataEditor = new();
         private static CachedMusicLibrary? lastCompleteCache;
+        private static MusicLibrary? currentLibrary;
         private static string? lastDeliveredFingerprint;
+        private static string? nowPlayingTrackId;
+        private static string? nowPlayingNextTrackId;
 
         public static event Action<bool>? PlayingChanged;
 
@@ -90,6 +96,16 @@ namespace EMP.Hosting
             settings.IsWebMessageEnabled = true;
             settings.IsNonClientRegionSupportEnabled = true;
 
+            // Unlock media device labels for Audio Output selection (enumerateDevices).
+            webView.CoreWebView2.PermissionRequested += (_, args) =>
+            {
+                if (args.PermissionKind == CoreWebView2PermissionKind.Microphone)
+                {
+                    args.State = CoreWebView2PermissionState.Allow;
+                    args.Handled = true;
+                }
+            };
+
             try
             {
                 await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
@@ -117,9 +133,17 @@ namespace EMP.Hosting
             await listenStatsLoadTask.ConfigureAwait(true);
             if (startupCache is not null)
             {
+                MusicLibrary hydrated = TrackDateStore.ApplyAndPersist(startupCache.Library);
+                startupCache = new CachedMusicLibrary
+                {
+                    ContentFingerprint = startupCache.ContentFingerprint,
+                    FolderPaths = startupCache.FolderPaths,
+                    Library = hydrated
+                };
                 lastCompleteCache = startupCache;
+                currentLibrary = hydrated;
                 lastDeliveredFingerprint = startupCache.ContentFingerprint;
-                LibraryMediaIndex.Replace(startupCache.Library.Locations);
+                LibraryMediaIndex.Replace(hydrated.Locations);
             }
 
             // Single document-created registration: message bridge + optional cached library.
@@ -134,6 +158,7 @@ namespace EMP.Hosting
                     pageLoaded = true;
                     RefreshLibrary();
                     PostAppSettings();
+                    UpdateCoordinator.PostStatus();
                     PostWindowState(IsWindowMaximized?.Invoke() ?? false);
                 }
             };
@@ -215,6 +240,22 @@ namespace EMP.Hosting
                     {
                         PostListenStatsSnapshot();
                     }
+                    else if (kind == "updates")
+                    {
+                        UpdateCoordinator.HandleMessage(document.RootElement);
+                    }
+                    else if (kind == "metadataGet")
+                    {
+                        HandleMetadataGet(document.RootElement);
+                    }
+                    else if (kind == "metadataApply")
+                    {
+                        HandleMetadataApply(document.RootElement);
+                    }
+                    else if (kind == "metadataCancel")
+                    {
+                        MetadataEditor.CancelApply();
+                    }
                 }
                 catch (JsonException)
                 {
@@ -241,7 +282,10 @@ namespace EMP.Hosting
             hostView = null;
             pageLoaded = false;
             lastCompleteCache = null;
+            currentLibrary = null;
             lastDeliveredFingerprint = null;
+            nowPlayingTrackId = null;
+            nowPlayingNextTrackId = null;
             IsWindowMaximized = null;
             MappedHosts.Clear();
             RetainedHosts.Clear();
@@ -403,6 +447,12 @@ namespace EMP.Hosting
                 return;
             }
 
+            if (string.IsNullOrWhiteSpace(requestId)
+                && ScanCoordinator.TryDeferWatcherRefresh(requiresFullScan: false))
+            {
+                return;
+            }
+
             RequestLibraryScan(requestId);
         }
 
@@ -431,6 +481,8 @@ namespace EMP.Hosting
                     scanned,
                     folders,
                     lastCompleteCache);
+                // Durable first-seen timestamps — independent of disposable library-cache.json.
+                merged = TrackDateStore.ApplyAndPersist(merged);
                 string fingerprint = LibraryCacheStore.ComputeFingerprint(merged);
                 result = new LibraryScanResult
                 {
@@ -496,6 +548,7 @@ namespace EMP.Hosting
             }
 
             LibraryMediaIndex.Replace(result.Library.Locations);
+            currentLibrary = result.Library;
 
             bool unchanged = string.Equals(
                 result.Fingerprint,
@@ -607,6 +660,14 @@ namespace EMP.Hosting
                     }
                     if (message.type === 'listenStats') {
                       window.dispatchEvent(new CustomEvent('emp-listen-stats', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'updateStatus') {
+                      window.dispatchEvent(new CustomEvent('emp-update-status', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'metadataResult' || message.type === 'metadataProgress' || message.type === 'metadataApplied') {
+                      window.dispatchEvent(new CustomEvent('emp-metadata', { detail: message }));
                     }
                   });
                 }
@@ -650,7 +711,9 @@ namespace EMP.Hosting
             {
                 Type = "appSettings",
                 StartupOnLogin = settings.StartupOnLogin,
-                CloseMinimizes = settings.CloseMinimizes
+                CloseMinimizes = settings.CloseMinimizes,
+                AutomaticUpdateChecks = settings.AutomaticUpdateChecks,
+                CurrentVersion = AppVersion.Current
             };
 
             hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
@@ -998,13 +1061,21 @@ namespace EMP.Hosting
                 closeMinimizes = closeElement.ValueKind == JsonValueKind.True;
             }
 
+            bool automaticUpdateChecks = AppSettingsStore.Current.AutomaticUpdateChecks;
+            if (message.TryGetProperty("automaticUpdateChecks", out JsonElement autoElement))
+            {
+                automaticUpdateChecks = autoElement.ValueKind == JsonValueKind.True;
+            }
+
             AppSettingsStore.Save(new AppSettings
             {
                 StartupOnLogin = startupOnLogin,
                 CloseMinimizes = closeMinimizes,
                 MusicFolders = AppSettingsStore.Current.MusicFolders is null
                     ? null
-                    : [.. AppSettingsStore.Current.MusicFolders]
+                    : [.. AppSettingsStore.Current.MusicFolders],
+                AutomaticUpdateChecks = automaticUpdateChecks,
+                LastUpdateCheckUtc = AppSettingsStore.Current.LastUpdateCheckUtc
             });
         }
 
@@ -1014,6 +1085,8 @@ namespace EMP.Hosting
             string? artist = ReadString(message, "artist");
             string? album = ReadString(message, "album");
             string? coverUrl = ReadString(message, "coverUrl");
+            nowPlayingTrackId = ReadString(message, "trackId");
+            nowPlayingNextTrackId = ReadString(message, "nextTrackId");
             bool playing = message.TryGetProperty("playing", out JsonElement playingElement)
                 && playingElement.ValueKind == JsonValueKind.True;
 
@@ -1076,6 +1149,448 @@ namespace EMP.Hosting
             }
 
             string json = JsonSerializer.Serialize(payload, JsonOptions);
+            PostToUi(() =>
+            {
+                try
+                {
+                    hostView?.CoreWebView2?.PostWebMessageAsJson(json);
+                }
+                catch (Exception)
+                {
+                    // The WebView may already be tearing down.
+                }
+            });
+        }
+
+        private static void HandleMetadataGet(JsonElement message)
+        {
+            string requestId = ReadString(message, "requestId") ?? Guid.NewGuid().ToString("N");
+            List<string> trackIds = ReadStringArray(message, "trackIds");
+            IReadOnlyList<string> roots = AppSettingsStore.ResolvedMusicFolders();
+            IReadOnlyList<EditableTrackMetadata> tracks = MetadataEditor.Get(
+                trackIds,
+                roots,
+                LookupBusy,
+                LookupDisplay);
+
+            PostMetadataMessage(new
+            {
+                type = "metadataResult",
+                requestId,
+                action = "get",
+                tracks
+            });
+        }
+
+        private static void HandleMetadataApply(JsonElement message)
+        {
+            string requestId = ReadString(message, "requestId") ?? Guid.NewGuid().ToString("N");
+            if (!MetadataEditor.TryBeginApply(out string? beginError))
+            {
+                PostMetadataMessage(new
+                {
+                    type = "metadataApplied",
+                    requestId,
+                    failed = true,
+                    errorCode = nameof(MetadataErrorCode.EditInProgress),
+                    errorMessage = beginError,
+                    total = 0,
+                    succeeded = 0,
+                    files = Array.Empty<object>()
+                });
+                return;
+            }
+
+            List<MetadataTrackEdit> edits = ParseTrackEdits(message);
+            if (edits.Count == 0)
+            {
+                MetadataEditor.EndApply();
+                PostMetadataMessage(new
+                {
+                    type = "metadataApplied",
+                    requestId,
+                    failed = true,
+                    errorCode = nameof(MetadataErrorCode.NoChanges),
+                    errorMessage = MetadataErrorMessages.For(MetadataErrorCode.NoChanges),
+                    total = 0,
+                    succeeded = 0,
+                    files = Array.Empty<object>()
+                });
+                return;
+            }
+
+            IReadOnlyList<string> roots = AppSettingsStore.ResolvedMusicFolders();
+            string root = artworkRoot;
+            CancellationToken token = MetadataEditor.ApplyToken;
+            _ = Task.Run(() =>
+            {
+                ScanCoordinator.BeginMetadataEditSession();
+                bool editedPathsFullyPatched = false;
+                try
+                {
+                    MetadataApplySummary summary = MetadataEditor.ApplySequential(
+                        requestId,
+                        edits,
+                        roots,
+                        trackId =>
+                        {
+                            (bool busy, _, MetadataErrorCode code) = LookupBusy(trackId);
+                            return (busy, code);
+                        },
+                        (completed, total, currentTitle, succeeded, failed) =>
+                        {
+                            PostMetadataMessage(new
+                            {
+                                type = "metadataProgress",
+                                requestId,
+                                completed,
+                                total,
+                                currentTitle,
+                                succeeded,
+                                failed
+                            });
+                        },
+                        token);
+
+                    List<string> successfulIds = summary.Files
+                        .Where(file => file.Succeeded && file.ErrorCode != MetadataErrorCode.NoChanges)
+                        .Select(file => file.TrackId)
+                        .ToList();
+
+                    HashSet<string> artworkSuccess = new(
+                        summary.Files
+                            .Where(file => file.Succeeded && file.ArtworkChanged)
+                            .Select(file => file.TrackId),
+                        StringComparer.OrdinalIgnoreCase);
+
+                    bool regenerateAlbumCover = false;
+                    string? albumIdForCover = null;
+                    MetadataArtworkOp albumCoverOp = MetadataArtworkOp.Keep;
+                    byte[]? albumCoverBytes = null;
+                    string? albumCoverMime = null;
+
+                    if (successfulIds.Count > 0 && currentLibrary is not null)
+                    {
+                        Dictionary<string, string> trackAlbum = currentLibrary.Tracks
+                            .ToDictionary(track => track.Id, track => track.AlbumId, StringComparer.OrdinalIgnoreCase);
+
+                        HashSet<string> affectedAlbums = new(StringComparer.OrdinalIgnoreCase);
+                        foreach (string id in artworkSuccess)
+                        {
+                            if (trackAlbum.TryGetValue(id, out string? albumId) && !string.IsNullOrWhiteSpace(albumId))
+                            {
+                                affectedAlbums.Add(albumId);
+                            }
+                        }
+
+                        foreach (string albumId in affectedAlbums)
+                        {
+                            AlbumInfo? album = currentLibrary.Albums.FirstOrDefault(item =>
+                                    string.Equals(item.Id, albumId, StringComparison.OrdinalIgnoreCase))
+                                ?? currentLibrary.Singles.FirstOrDefault(item =>
+                                    string.Equals(item.Id, albumId, StringComparison.OrdinalIgnoreCase));
+                            if (album is null)
+                            {
+                                continue;
+                            }
+
+                            if (!AlbumArtworkCache.ShouldRegenerateAlbumCover(album.TrackIds, artworkSuccess))
+                            {
+                                continue;
+                            }
+
+                            MetadataTrackEdit? artEdit = edits.FirstOrDefault(edit =>
+                                artworkSuccess.Contains(edit.TrackId) && edit.Artwork is not null);
+                            if (artEdit?.Artwork is null)
+                            {
+                                continue;
+                            }
+
+                            regenerateAlbumCover = true;
+                            albumIdForCover = albumId;
+                            albumCoverOp = artEdit.Artwork.Op;
+                            if (albumCoverOp == MetadataArtworkOp.Set
+                                && !string.IsNullOrWhiteSpace(artEdit.Artwork.DataBase64))
+                            {
+                                try
+                                {
+                                    albumCoverBytes = Convert.FromBase64String(artEdit.Artwork.DataBase64);
+                                    if (ArtworkImageValidator.TryValidate(
+                                            albumCoverBytes,
+                                            artEdit.Artwork.Mime,
+                                            out albumCoverMime,
+                                            out _))
+                                    {
+                                        break;
+                                    }
+
+                                    regenerateAlbumCover = false;
+                                    albumCoverBytes = null;
+                                }
+                                catch (FormatException)
+                                {
+                                    regenerateAlbumCover = false;
+                                }
+                            }
+
+                            break;
+                        }
+
+                        MusicLibrary patched = LibraryMetadataPatcher.PatchTracks(
+                            currentLibrary,
+                            successfulIds,
+                            root,
+                            regenerateAlbumCover,
+                            albumIdForCover,
+                            albumCoverOp,
+                            albumCoverBytes,
+                            albumCoverMime);
+
+                        string fingerprint = LibraryCacheStore.ComputeFingerprint(patched);
+                        PostToUi(() =>
+                        {
+                            currentLibrary = patched;
+                            LibraryMediaIndex.Replace(patched.Locations);
+                            lastDeliveredFingerprint = fingerprint;
+                            lastCompleteCache = new CachedMusicLibrary
+                            {
+                                ContentFingerprint = fingerprint,
+                                FolderPaths = roots,
+                                Library = patched
+                            };
+                            if (LibraryCacheStore.IsCompleteScan(patched))
+                            {
+                                LibraryCacheStore.Save(roots, patched, fingerprint);
+                            }
+
+                            PostLibraryMessage(ToLibraryMessage(patched, fingerprint, requestId: null));
+                        });
+
+                        editedPathsFullyPatched = true;
+                        summary = new MetadataApplySummary
+                        {
+                            RequestId = summary.RequestId,
+                            Total = summary.Total,
+                            Succeeded = summary.Succeeded,
+                            Failed = summary.Failed,
+                            Cancelled = summary.Cancelled,
+                            AlbumCoverRegenerated = regenerateAlbumCover,
+                            Files = summary.Files
+                        };
+                    }
+
+                    PostMetadataMessage(new
+                    {
+                        type = "metadataApplied",
+                        requestId = summary.RequestId,
+                        total = summary.Total,
+                        succeeded = summary.Succeeded,
+                        failed = summary.Failed,
+                        cancelled = summary.Cancelled,
+                        albumCoverRegenerated = summary.AlbumCoverRegenerated,
+                        files = summary.Files.Select(file => new
+                        {
+                            trackId = file.TrackId,
+                            succeeded = file.Succeeded,
+                            errorCode = file.ErrorCode == MetadataErrorCode.None
+                                ? null
+                                : file.ErrorCode.ToString(),
+                            errorMessage = file.ErrorMessage,
+                            artworkChanged = file.ArtworkChanged
+                        })
+                    });
+                }
+                finally
+                {
+                    bool needsFullScan = ScanCoordinator.EndMetadataEditSession(editedPathsFullyPatched);
+                    MetadataEditor.EndApply();
+                    if (needsFullScan)
+                    {
+                        PostToUi(() => RefreshLibrary());
+                    }
+                }
+            });
+        }
+
+        private static (bool Busy, string? Reason, MetadataErrorCode Code) LookupBusy(string trackId)
+        {
+            if (!string.IsNullOrWhiteSpace(nowPlayingTrackId)
+                && string.Equals(nowPlayingTrackId, trackId, StringComparison.OrdinalIgnoreCase))
+            {
+                return (true, "playing", MetadataErrorCode.BusyPlaying);
+            }
+
+            if (!string.IsNullOrWhiteSpace(nowPlayingNextTrackId)
+                && string.Equals(nowPlayingNextTrackId, trackId, StringComparison.OrdinalIgnoreCase))
+            {
+                return (true, "playing", MetadataErrorCode.BusyPlaying);
+            }
+
+            IReadOnlyList<string>? castBusy = cast?.GetBusyTrackIds();
+            if (castBusy is not null
+                && castBusy.Any(id => string.Equals(id, trackId, StringComparison.OrdinalIgnoreCase)))
+            {
+                return (true, "casting", MetadataErrorCode.BusyCasting);
+            }
+
+            return (false, null, MetadataErrorCode.None);
+        }
+
+        private static TrackDisplayContext? LookupDisplay(string trackId)
+        {
+            MusicLibrary? library = currentLibrary ?? lastCompleteCache?.Library;
+            TrackInfo? track = library?.Tracks.FirstOrDefault(item =>
+                string.Equals(item.Id, trackId, StringComparison.OrdinalIgnoreCase));
+            if (track is null)
+            {
+                return null;
+            }
+
+            AlbumInfo? album = library?.Albums.FirstOrDefault(item =>
+                    string.Equals(item.Id, track.AlbumId, StringComparison.OrdinalIgnoreCase))
+                ?? library?.Singles.FirstOrDefault(item =>
+                    string.Equals(item.Id, track.AlbumId, StringComparison.OrdinalIgnoreCase));
+
+            return new TrackDisplayContext
+            {
+                AlbumId = track.AlbumId,
+                Title = track.Title,
+                Artist = track.Artist,
+                Album = track.Album,
+                CoverUrl = track.CoverUrl,
+                AlbumTrackIds = album?.TrackIds ?? []
+            };
+        }
+
+        private static List<MetadataTrackEdit> ParseTrackEdits(JsonElement message)
+        {
+            List<MetadataTrackEdit> edits = [];
+            if (!message.TryGetProperty("edits", out JsonElement editsElement)
+                || editsElement.ValueKind != JsonValueKind.Array)
+            {
+                return edits;
+            }
+
+            foreach (JsonElement item in editsElement.EnumerateArray())
+            {
+                string? trackId = ReadString(item, "trackId");
+                if (string.IsNullOrWhiteSpace(trackId))
+                {
+                    continue;
+                }
+
+                edits.Add(new MetadataTrackEdit
+                {
+                    TrackId = trackId,
+                    ExpectedLastWriteUtcTicks = ReadOptionalInt64(item, "expectedLastWriteUtcTicks"),
+                    ExpectedLength = ReadOptionalInt64(item, "expectedLength"),
+                    Title = ReadFieldEdit(item, "title"),
+                    Artist = ReadFieldEdit(item, "artist"),
+                    AlbumArtist = ReadFieldEdit(item, "albumArtist"),
+                    Album = ReadFieldEdit(item, "album"),
+                    TrackNumber = ReadFieldEdit(item, "trackNumber"),
+                    DiscNumber = ReadFieldEdit(item, "discNumber"),
+                    Genre = ReadFieldEdit(item, "genre"),
+                    Year = ReadFieldEdit(item, "year"),
+                    Comment = ReadFieldEdit(item, "comment"),
+                    Artwork = ReadArtworkEdit(item)
+                });
+            }
+
+            return edits;
+        }
+
+        private static MetadataFieldEdit? ReadFieldEdit(JsonElement parent, string name)
+        {
+            if (!parent.TryGetProperty(name, out JsonElement field) || field.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            string? opText = ReadString(field, "op")?.ToLowerInvariant();
+            MetadataFieldOp op = opText switch
+            {
+                "set" => MetadataFieldOp.Set,
+                "clear" => MetadataFieldOp.Clear,
+                _ => MetadataFieldOp.Keep
+            };
+
+            return new MetadataFieldEdit
+            {
+                Op = op,
+                Value = ReadString(field, "value")
+            };
+        }
+
+        private static MetadataArtworkEdit? ReadArtworkEdit(JsonElement parent)
+        {
+            if (!parent.TryGetProperty("artwork", out JsonElement field) || field.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            string? opText = ReadString(field, "op")?.ToLowerInvariant();
+            MetadataArtworkOp op = opText switch
+            {
+                "set" => MetadataArtworkOp.Set,
+                "clear" => MetadataArtworkOp.Clear,
+                _ => MetadataArtworkOp.Keep
+            };
+
+            return new MetadataArtworkEdit
+            {
+                Op = op,
+                Mime = ReadString(field, "mime"),
+                DataBase64 = ReadString(field, "dataBase64")
+            };
+        }
+
+        private static List<string> ReadStringArray(JsonElement message, string name)
+        {
+            List<string> values = [];
+            if (!message.TryGetProperty(name, out JsonElement element) || element.ValueKind != JsonValueKind.Array)
+            {
+                return values;
+            }
+
+            foreach (JsonElement item in element.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                {
+                    string? value = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        values.Add(value);
+                    }
+                }
+            }
+
+            return values;
+        }
+
+        private static long? ReadOptionalInt64(JsonElement message, string name)
+        {
+            if (!message.TryGetProperty(name, out JsonElement value) || value.ValueKind != JsonValueKind.Number)
+            {
+                return null;
+            }
+
+            if (value.TryGetInt64(out long number))
+            {
+                return number;
+            }
+
+            return null;
+        }
+
+        private static void PostMetadataMessage(object message)
+        {
+            if (hostView?.CoreWebView2 is null)
+            {
+                return;
+            }
+
+            string json = JsonSerializer.Serialize(message, JsonOptions);
             PostToUi(() =>
             {
                 try
@@ -1177,6 +1692,10 @@ namespace EMP.Hosting
             public required string StartupOnLogin { get; init; }
 
             public required bool CloseMinimizes { get; init; }
+
+            public required bool AutomaticUpdateChecks { get; init; }
+
+            public required string CurrentVersion { get; init; }
         }
 
         private sealed class WindowStateMessage

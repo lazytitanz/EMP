@@ -38,7 +38,15 @@ namespace EMP.Library
 
         public static bool IsSupportedAudioPath(string? path)
         {
-            return !string.IsNullOrWhiteSpace(path) && AudioExtensions.Contains(Path.GetExtension(path));
+            if (string.IsNullOrWhiteSpace(path) || !AudioExtensions.Contains(Path.GetExtension(path)))
+            {
+                return false;
+            }
+
+            string name = Path.GetFileName(path);
+            // Staging files used by the metadata editor must never enter the library.
+            return name.Contains(".emp-meta-", StringComparison.OrdinalIgnoreCase) == false
+                && name.Contains(".emp-bak-", StringComparison.OrdinalIgnoreCase) == false;
         }
 
         public static bool IsIgnoredWatchPath(string? path)
@@ -56,7 +64,9 @@ namespace EMP.Library
 
             if (IgnoredWatchNames.Contains(name)
                 || name.StartsWith("~$", StringComparison.Ordinal)
-                || name.EndsWith('~'))
+                || name.EndsWith('~')
+                || name.Contains(".emp-meta-", StringComparison.OrdinalIgnoreCase)
+                || name.Contains(".emp-bak-", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -185,7 +195,16 @@ namespace EMP.Library
                         Duration = file.DurationSeconds,
                         Url = ToVirtualUrl(HostNameForRoot(file.RootPath), file.RelativePath),
                         CoverUrl = coverUrl,
-                        IsSingle = isSingle
+                        IsSingle = isSingle,
+                        Genre = file.Genre,
+                        AlbumArtist = file.AlbumArtist,
+                        Format = file.Format,
+                        Year = file.Year > 0 ? file.Year : null,
+                        DateAdded = 0,
+                        ReplayGainTrackGain = file.ReplayGainTrackGain,
+                        ReplayGainTrackPeak = file.ReplayGainTrackPeak,
+                        ReplayGainAlbumGain = file.ReplayGainAlbumGain,
+                        ReplayGainAlbumPeak = file.ReplayGainAlbumPeak
                     });
 
                     locations[trackId] = new LibraryMediaLocation
@@ -265,11 +284,15 @@ namespace EMP.Library
             string title = parsedTitle;
             string artist = artistHint;
             string album = albumHint;
+            string? albumArtist = null;
+            string? genre = null;
             int trackNumber = parsedNumber;
             double duration = 0;
             int year = 0;
             byte[]? pictureData = null;
             string? pictureMime = null;
+            ReplayGainInfo replayGain = default;
+            string format = NormalizeFormat(Path.GetExtension(path));
 
             try
             {
@@ -277,6 +300,11 @@ namespace EMP.Library
                 if (!string.IsNullOrWhiteSpace(file.Tag.Title))
                 {
                     title = file.Tag.Title.Trim();
+                }
+
+                if (!string.IsNullOrWhiteSpace(file.Tag.FirstAlbumArtist))
+                {
+                    albumArtist = file.Tag.FirstAlbumArtist.Trim();
                 }
 
                 string? taggedArtist = FirstNonEmpty(file.Tag.FirstPerformer, file.Tag.FirstAlbumArtist);
@@ -288,6 +316,11 @@ namespace EMP.Library
                 if (!string.IsNullOrWhiteSpace(file.Tag.Album))
                 {
                     album = file.Tag.Album.Trim();
+                }
+
+                if (!string.IsNullOrWhiteSpace(file.Tag.FirstGenre))
+                {
+                    genre = file.Tag.FirstGenre.Trim();
                 }
 
                 if (file.Tag.Track > 0)
@@ -307,6 +340,12 @@ namespace EMP.Library
                     pictureData = picture.Data.Data;
                     pictureMime = picture.MimeType;
                 }
+
+                replayGain = ReplayGainParser.FromTagLib(
+                    file.Tag.ReplayGainTrackGain,
+                    file.Tag.ReplayGainTrackPeak,
+                    file.Tag.ReplayGainAlbumGain,
+                    file.Tag.ReplayGainAlbumPeak);
             }
             catch (Exception)
             {
@@ -323,12 +362,29 @@ namespace EMP.Library
                 Artist = artist,
                 Album = album,
                 AlbumHint = albumHint,
+                AlbumArtist = albumArtist,
+                Genre = genre,
+                Format = format,
                 TrackNumber = trackNumber,
                 DurationSeconds = duration,
                 Year = year,
                 PictureData = pictureData,
-                PictureMime = pictureMime
+                PictureMime = pictureMime,
+                ReplayGainTrackGain = replayGain.TrackGainDb,
+                ReplayGainTrackPeak = replayGain.TrackPeak,
+                ReplayGainAlbumGain = replayGain.AlbumGainDb,
+                ReplayGainAlbumPeak = replayGain.AlbumPeak
             };
+        }
+
+        private static string NormalizeFormat(string? extension)
+        {
+            if (string.IsNullOrWhiteSpace(extension))
+            {
+                return string.Empty;
+            }
+
+            return extension.Trim().TrimStart('.').ToLowerInvariant();
         }
 
         private static string GetArtistHint(string musicRoot, string albumDirectory)
@@ -417,10 +473,20 @@ namespace EMP.Library
             return (0, stem);
         }
 
-        private static string CreateId(string value)
+        public static string CreateId(string value)
         {
             byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));
             return Convert.ToHexString(hash)[..12].ToLowerInvariant();
+        }
+
+        public static string TrackIdForPath(string fullPath)
+        {
+            return CreateId(fullPath);
+        }
+
+        public static string AlbumIdForDirectory(string directoryPath)
+        {
+            return CreateId(directoryPath);
         }
 
         private static string AccentFor(string key)
@@ -460,6 +526,12 @@ namespace EMP.Library
 
             public required string AlbumHint { get; init; }
 
+            public string? AlbumArtist { get; init; }
+
+            public string? Genre { get; init; }
+
+            public string? Format { get; init; }
+
             public required int TrackNumber { get; init; }
 
             public required double DurationSeconds { get; init; }
@@ -469,6 +541,14 @@ namespace EMP.Library
             public byte[]? PictureData { get; init; }
 
             public string? PictureMime { get; init; }
+
+            public double? ReplayGainTrackGain { get; init; }
+
+            public double? ReplayGainTrackPeak { get; init; }
+
+            public double? ReplayGainAlbumGain { get; init; }
+
+            public double? ReplayGainAlbumPeak { get; init; }
         }
     }
 }

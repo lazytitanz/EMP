@@ -84,5 +84,28 @@ namespace EMP.Library
         public string? CoverUrl { get; init; }
 
         public bool IsSingle { get; init; }
+
+        public string? Genre { get; init; }
+
+        public string? AlbumArtist { get; init; }
+
+        /// <summary>Lowercase extension without dot (mp3, flac, …).</summary>
+        public string? Format { get; init; }
+
+        public int? Year { get; init; }
+
+        /// <summary>
+        /// Unix ms when EMP first observed this track id. Hydrated from durable
+        /// track-dates store — not owned by the disposable library cache.
+        /// </summary>
+        public long DateAdded { get; init; }
+
+        public double? ReplayGainTrackGain { get; init; }
+
+        public double? ReplayGainTrackPeak { get; init; }
+
+        public double? ReplayGainAlbumGain { get; init; }
+
+        public double? ReplayGainAlbumPeak { get; init; }
     }
 }

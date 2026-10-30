@@ -63,8 +63,13 @@ project.fragment.lock.json
 *.nuget.props
 *.nuget.targets
 
+# Local docs (not published with the repo)
+docs/
+
+# Local helper scripts (not published with the repo)
+scripts/
+
 # Test and coverage
-EMP.Tests/
 [Tt]est[Rr]esult*/
 *.trx
 *.coverage
@@ -76,6 +81,7 @@ BenchmarkDotNet.Artifacts/
 
 # Publish and installers
 publish/
+artifacts/
 *.pubxml
 *.publishproj
 *.[Pp]ublish.xml

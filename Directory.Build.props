@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <Version>0.2.1</Version>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <Company>EMP</Company>
+    <Product>EMP</Product>
+  </PropertyGroup>
+</Project>

@@ -85,7 +85,9 @@ namespace EMP.Forms
             try
             {
                 await WebUiHost.InitializeAsync(webView);
+                UpdateCoordinator.Initialize(webView, RequestRestartForUpdate);
                 PostWindowState();
+                _ = ScheduleBackgroundUpdateCheckAsync();
             }
             catch (Exception ex)
             {
@@ -98,6 +100,31 @@ namespace EMP.Forms
 
                 allowClose = true;
                 Close();
+            }
+        }
+
+        private void RequestRestartForUpdate()
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(RequestRestartForUpdate);
+                return;
+            }
+
+            allowClose = true;
+            Close();
+        }
+
+        private static async Task ScheduleBackgroundUpdateCheckAsync()
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                await UpdateCoordinator.MaybeBackgroundCheckAsync().ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Background update checks must never affect playback startup.
             }
         }
 

@@ -17,6 +17,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\EMP.UpdateCore\EMP.UpdateCore.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Content Include="www\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>

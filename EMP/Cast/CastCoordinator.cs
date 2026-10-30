@@ -81,6 +81,27 @@ namespace EMP.Cast
             _ = CommandAsync(action, trackId, position, playing, volume, muted);
         }
 
+        public IReadOnlyList<string> GetBusyTrackIds()
+        {
+            lock (gate)
+            {
+                List<string> ids = [];
+                if (!string.IsNullOrWhiteSpace(currentTrackId) && session is not null)
+                {
+                    ids.Add(currentTrackId);
+                }
+
+                if (!string.IsNullOrWhiteSpace(nextTrackId)
+                    && session is not null
+                    && !ids.Contains(nextTrackId, StringComparer.OrdinalIgnoreCase))
+                {
+                    ids.Add(nextTrackId);
+                }
+
+                return ids;
+            }
+        }
+
         public void Dispose()
         {
             if (disposed)

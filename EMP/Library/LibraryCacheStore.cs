@@ -37,7 +37,9 @@ namespace EMP.Library
 
     internal static class LibraryCacheStore
     {
-        public const int SchemaVersion = 1;
+        public const int SchemaVersion = 3;
+
+        private static string? filePathOverride;
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
@@ -46,10 +48,15 @@ namespace EMP.Library
             WriteIndented = false
         };
 
-        public static string FilePath => Path.Combine(
+        public static string FilePath => filePathOverride ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "EMP",
             "library-cache.json");
+
+        internal static void SetFilePathForTests(string? path)
+        {
+            filePathOverride = path;
+        }
 
         public static CachedMusicLibrary? TryLoad(IReadOnlyList<string> configuredFolders)
         {
@@ -191,6 +198,15 @@ namespace EMP.Library
                 Append(hash, track.Url);
                 Append(hash, track.CoverUrl ?? "");
                 Append(hash, track.IsSingle ? "1" : "0");
+                Append(hash, track.Genre ?? "");
+                Append(hash, track.AlbumArtist ?? "");
+                Append(hash, track.Format ?? "");
+                Append(hash, track.Year?.ToString() ?? "");
+                // DateAdded lives in TrackDateStore and is excluded to avoid cache thrash.
+                Append(hash, track.ReplayGainTrackGain?.ToString("G17") ?? "");
+                Append(hash, track.ReplayGainTrackPeak?.ToString("G17") ?? "");
+                Append(hash, track.ReplayGainAlbumGain?.ToString("G17") ?? "");
+                Append(hash, track.ReplayGainAlbumPeak?.ToString("G17") ?? "");
             }
 
             foreach (LibraryMediaLocation location in library.Locations.Values

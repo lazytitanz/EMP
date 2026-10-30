@@ -125,5 +125,17 @@ Clone the repository, then run:
 
 ```bash
 dotnet restore
-dotnet run
+dotnet run --project EMP
 ```
+
+### Packaging a release
+
+From the repository root:
+
+```powershell
+.\scripts\release.ps1 -Version 0.2.1
+```
+
+This publishes self-contained Windows x64 builds of EMP and EMP.Updater, assembles a flat ZIP, and writes a SHA-256 checksum file. Use `scripts/test-update.ps1` for an isolated update dry-run.
+
+EMP can check GitHub Releases from **Settings → Updates**. Updates never install without your consent.

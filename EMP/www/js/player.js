@@ -1,9 +1,14 @@
 const CROSSFADE_SECONDS = 8;
 const GAPLESS_LEAD_SECONDS = 0.12;
 const PRELOAD_SECONDS = 20;
-const NORMALIZE_TARGET_RMS = 0.1;
-const NORMALIZE_MIN_GAIN = 0.35;
-const NORMALIZE_MAX_GAIN = 2.8;
+const ReplayGain = globalThis.EmpReplayGain;
+const Transitions = globalThis.EmpPlaybackTransitions;
+const PeakProtect = globalThis.EmpPeakProtect;
+const GraphRecovery = globalThis.EmpAudioGraphRecovery;
+
+function clampCrossfadeSeconds(value) {
+  return Transitions?.clampCrossfadeSeconds?.(value) ?? CROSSFADE_SECONDS;
+}
 
 function createAudioPlayer() {
   const el = new Audio();
@@ -32,11 +37,19 @@ let eqFilters = [];
 let eqReady = false;
 let cachedEqHeadroomDb = 0;
 let audioGraphReady = false;
+let peakCompressor = null;
+let peakDryGain = null;
+let peakWetGain = null;
+let audioOutputDevices = [];
+let audioOutputSupported = false;
+let audioContextResumePromise = null;
+let playbackElementBindGeneration = 0;
+let transitionGeneration = 0;
+let preloadGeneration = 0;
 let fadeRaf = 0;
 let playbackTransitioning = false;
 let fadeStartedAt = 0;
 let fadeDurationMs = CROSSFADE_SECONDS * 1000;
-const normalizeCache = new Map();
 
 function currentPlayer() {
   return players[currentPlayerIndex];
@@ -94,12 +107,25 @@ const state = {
   holdEnded: false,
   crossfade: false,
   gapless: false,
+  crossfadeSeconds: CROSSFADE_SECONDS,
   normalizeVolume: false,
+  normalizeMode: "track",
+  preventClipping: true,
+  audioOutputId: "",
+  audioOutputLabel: "",
   equalizerEnabled: false,
   equalizerPreset: "flat",
   equalizerGains: cloneEqGains(EQ_FLAT_GAINS),
   startupOnLogin: "no",
   closeMinimizes: false,
+  automaticUpdateChecks: true,
+  appVersion: "",
+  updateStatus: {
+    state: "idle",
+    availableVersion: null,
+    progress: null,
+    error: null
+  },
   playbackTarget: "local",
   connectingDeviceId: null,
   castDevices: [],
@@ -179,7 +205,7 @@ const ARTIST_INFO_TIMEOUT_MS = 15000;
 const DEVICE_SCAN_MS = 6000;
 const DEVICE_DRAWER_EXIT_MS = 280;
 const QUEUE_DRAWER_LIMIT = 100;
-const QUEUE_SOURCE_KINDS = ["album", "playlist", "artist", "recents", "library", "songs", "mix"];
+const QUEUE_SOURCE_KINDS = ["album", "playlist", "smart", "artist", "recents", "library", "songs", "mix"];
 const SONGS_SORT_OPTIONS = [
   { id: "title", label: "Title" },
   { id: "artist", label: "Artist" },
@@ -290,6 +316,7 @@ function bumpListenStatsLocal(trackId, lastPlayedAt) {
   if (state.view === "songs") {
     refreshSongsResults({ preserveScroll: true });
   }
+  scheduleSmartReevaluation({ stats: true, dateRelative: true });
 }
 
 function ensureListenStatsForSongs() {
@@ -345,6 +372,7 @@ function applyListenStats(detail) {
     refreshSongsResults({ preserveScroll: true });
   }
   maybeRefreshMixesAfterStats();
+  scheduleSmartReevaluation({ stats: true, dateRelative: true });
 }
 
 function trackListenMs(trackId) {
@@ -1060,20 +1088,166 @@ function normalizePlaylists(value) {
     return [];
   }
 
+  const smartApi = window.EmpSmartPlaylists;
   return value
     .filter((item) => item && typeof item.id === "string" && typeof item.name === "string")
-    .map((item) => ({
-      id: item.id === LIKED_PLAYLIST_ID || item.kind === "liked" ? LIKED_PLAYLIST_ID : item.id,
-      name: item.id === LIKED_PLAYLIST_ID || item.kind === "liked" ? LIKED_PLAYLIST_NAME : item.name,
-      kind: item.id === LIKED_PLAYLIST_ID || item.kind === "liked" ? "liked" : undefined,
-      trackIds: Array.isArray(item.trackIds) ? item.trackIds.filter((id) => typeof id === "string") : [],
-      description: typeof item.description === "string" ? item.description : "",
-      createdAt: Number(item.createdAt) || 0
-    }));
+    .map((item) => {
+      if (item.id === LIKED_PLAYLIST_ID || item.kind === "liked") {
+        return {
+          id: LIKED_PLAYLIST_ID,
+          name: LIKED_PLAYLIST_NAME,
+          kind: "liked",
+          trackIds: Array.isArray(item.trackIds) ? item.trackIds.filter((id) => typeof id === "string") : [],
+          description: typeof item.description === "string" ? item.description : "",
+          createdAt: Number(item.createdAt) || 0
+        };
+      }
+
+      if (item.kind === "smart") {
+        const smart = smartApi
+          ? smartApi.normalizeSmartDefinition(item.smart || {})
+          : (item.smart && typeof item.smart === "object" ? item.smart : null);
+        return {
+          id: item.id,
+          name: item.name,
+          kind: "smart",
+          trackIds: [],
+          description: typeof item.description === "string" ? item.description : "",
+          createdAt: Number(item.createdAt) || 0,
+          updatedAt: Number(item.updatedAt) || Number(item.createdAt) || 0,
+          schemaVersion: Number(item.schemaVersion) || 1,
+          smart
+        };
+      }
+
+      return {
+        id: item.id,
+        name: item.name,
+        kind: undefined,
+        trackIds: Array.isArray(item.trackIds) ? item.trackIds.filter((id) => typeof id === "string") : [],
+        description: typeof item.description === "string" ? item.description : "",
+        createdAt: Number(item.createdAt) || 0
+      };
+    });
 }
 
 function isLikedPlaylist(playlist) {
   return playlist?.kind === "liked" || playlist?.id === LIKED_PLAYLIST_ID;
+}
+
+function isSmartPlaylist(playlist) {
+  return playlist?.kind === "smart";
+}
+
+/** Ephemeral match cache — never persisted to emp.playback. */
+const smartMatchCache = new Map();
+let smartReevalTimer = null;
+let smartEvalDayKey = "";
+
+function albumsByIdMap() {
+  const map = {};
+  for (const album of [...(state.library.albums || []), ...(state.library.singles || [])]) {
+    map[album.id] = album;
+  }
+  return map;
+}
+
+function smartEvalContext() {
+  return {
+    tracks: state.library.tracks || [],
+    albumsById: albumsByIdMap(),
+    listenStats: state.listenStats || {},
+    likedIds: state.liked instanceof Set ? state.liked : new Set(),
+    now: Date.now()
+  };
+}
+
+function smartContextFingerprint(deps) {
+  const parts = [];
+  if (!deps || deps.metadata) {
+    parts.push(state.library?.contentFingerprint || state.library?.tracks?.length || 0);
+  }
+  if (!deps || deps.stats) {
+    parts.push(`stats:${Object.keys(state.listenStats || {}).length}`);
+  }
+  if (!deps || deps.liked) {
+    parts.push(`liked:${state.liked?.size || 0}`);
+  }
+  if (!deps || deps.dateRelative) {
+    const d = new Date();
+    parts.push(`${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`);
+  }
+  return parts.join("|");
+}
+
+function evaluateSmartPlaylistTracks(playlist, { bypassCache = false } = {}) {
+  if (!isSmartPlaylist(playlist) || !playlist.smart || !window.EmpSmartPlaylists) {
+    return [];
+  }
+  if (playlist.smart.loadError) {
+    return [];
+  }
+  const deps = window.EmpSmartPlaylists.definitionDependencies(playlist.smart);
+  const fingerprint = `${playlist.id}|${playlist.updatedAt || 0}|${smartContextFingerprint(deps)}|${JSON.stringify(playlist.smart.sort)}|${playlist.smart.limit}|${playlist.smart.randomSeed}`;
+  if (!bypassCache) {
+    const cached = smartMatchCache.get(playlist.id);
+    if (cached && cached.fingerprint === fingerprint) {
+      return cached.trackIds.map(trackById).filter(Boolean);
+    }
+  }
+  const result = window.EmpSmartPlaylists.evaluateSmartPlaylist(playlist.smart, smartEvalContext());
+  smartMatchCache.set(playlist.id, { fingerprint, trackIds: result.trackIds });
+  return result.trackIds.map(trackById).filter(Boolean);
+}
+
+function invalidateSmartMatches(filterDeps) {
+  if (!filterDeps) {
+    smartMatchCache.clear();
+    return;
+  }
+  for (const playlist of state.playlists) {
+    if (!isSmartPlaylist(playlist) || !playlist.smart || !window.EmpSmartPlaylists) {
+      continue;
+    }
+    const deps = window.EmpSmartPlaylists.definitionDependencies(playlist.smart);
+    if ((filterDeps.metadata && deps.metadata)
+      || (filterDeps.stats && deps.stats)
+      || (filterDeps.liked && deps.liked)
+      || (filterDeps.dateRelative && deps.dateRelative)) {
+      smartMatchCache.delete(playlist.id);
+    }
+  }
+}
+
+function scheduleSmartReevaluation(filterDeps) {
+  invalidateSmartMatches(filterDeps);
+  clearTimeout(smartReevalTimer);
+  smartReevalTimer = setTimeout(() => {
+    // Reevaluation must not write emp.playback — membership is derived.
+    if (state.view === "playlist" && isSmartPlaylist(playlistById(state.playlistId))) {
+      renderPlaylist(state.playlistId);
+    }
+    if (state.recentsFilter === "playlists" || state.view === "playlists" || state.view === "search") {
+      renderLibraryList();
+      if (state.view === "playlists" || state.view === "search") {
+        render(historyStack[historyIndex]);
+      }
+    }
+  }, 300);
+}
+
+function localDayKey(now = Date.now()) {
+  const d = new Date(now);
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+function ensureSmartDateRelativeFreshness() {
+  const key = localDayKey();
+  if (key === smartEvalDayKey) {
+    return;
+  }
+  smartEvalDayKey = key;
+  scheduleSmartReevaluation({ dateRelative: true, metadata: true, stats: true, liked: true });
 }
 
 function likedPlaylist() {
@@ -1142,12 +1316,18 @@ function buildSessionPayload({ compactQueue = false } = {}) {
     personalizedMixes: state.personalizedMixes !== false,
     crossfade: state.crossfade,
     gapless: state.gapless,
+    crossfadeSeconds: state.crossfadeSeconds,
     normalizeVolume: state.normalizeVolume,
+    normalizeMode: state.normalizeMode,
+    preventClipping: state.preventClipping !== false,
+    audioOutputId: typeof state.audioOutputId === "string" ? state.audioOutputId : "",
+    audioOutputLabel: typeof state.audioOutputLabel === "string" ? state.audioOutputLabel : "",
     equalizerEnabled: state.equalizerEnabled,
     equalizerPreset: state.equalizerPreset,
     equalizerGains: cloneEqGains(state.equalizerGains),
     startupOnLogin: state.startupOnLogin,
-    closeMinimizes: state.closeMinimizes
+    closeMinimizes: state.closeMinimizes,
+    automaticUpdateChecks: state.automaticUpdateChecks !== false
   };
 }
 
@@ -1235,9 +1415,20 @@ function restoreEqualizerState(session) {
   state.personalizedMixes = session.personalizedMixes !== false;
   state.crossfade = Boolean(session.crossfade);
   state.gapless = Boolean(session.gapless);
+  if (state.crossfade && state.gapless) {
+    state.gapless = false;
+  }
+  state.crossfadeSeconds = clampCrossfadeSeconds(session.crossfadeSeconds);
   state.normalizeVolume = Boolean(session.normalizeVolume);
+  state.normalizeMode = ReplayGain?.normalizeMode?.(session.normalizeMode) || "track";
+  state.preventClipping = session.preventClipping !== false;
+  state.audioOutputId = typeof session.audioOutputId === "string" ? session.audioOutputId : "";
+  state.audioOutputLabel = typeof session.audioOutputLabel === "string" ? session.audioOutputLabel : "";
   state.startupOnLogin = normalizeStartupOnLogin(session.startupOnLogin);
   state.closeMinimizes = Boolean(session.closeMinimizes);
+  if (typeof session.automaticUpdateChecks === "boolean") {
+    state.automaticUpdateChecks = session.automaticUpdateChecks;
+  }
   try {
     restoreEqualizerState(session);
   } catch {
@@ -1355,6 +1546,9 @@ function playlistById(id) {
 }
 
 function playlistTracks(playlist) {
+  if (isSmartPlaylist(playlist)) {
+    return evaluateSmartPlaylistTracks(playlist);
+  }
   return (playlist?.trackIds ?? []).map(trackById).filter(Boolean);
 }
 
@@ -1791,6 +1985,7 @@ function queueSourceLabel(source) {
     case "album":
       return albumById(source.id)?.title ?? "";
     case "playlist":
+    case "smart":
       return playlistById(source.id)?.name ?? "";
     case "artist":
       return source.id ?? "";
@@ -2176,6 +2371,7 @@ function setShuffle(enabled) {
     state.shuffleBag = [];
     state.index = currentId ? Math.max(0, state.queue.indexOf(currentId)) : state.index;
   }
+  invalidateIncomingPreload();
   updateNowPlaying();
   writeSession();
 }
@@ -2227,6 +2423,7 @@ function playlistsForMenu(query) {
   const rank = new Map(state.recentPlaylistIds.map((id, index) => [id, index]));
   return state.playlists
     .filter((playlist) => playlist.id !== contextMenuState.playlistId)
+    .filter((playlist) => !isSmartPlaylist(playlist))
     .filter((playlist) => !needle || playlist.name.toLowerCase().includes(needle))
     .sort((left, right) => {
       const leftRank = rank.get(left.id) ?? Number.MAX_SAFE_INTEGER;
@@ -2377,9 +2574,106 @@ function createPlaylist(name, trackId) {
   return playlist;
 }
 
+function defaultSmartPlaylistName() {
+  const used = new Set();
+  for (const playlist of state.playlists) {
+    const match = /^Smart Playlist #(\d+)$/i.exec(playlist.name);
+    if (match) {
+      used.add(Number(match[1]));
+    }
+  }
+  let number = 1;
+  while (used.has(number)) {
+    number += 1;
+  }
+  return `Smart Playlist #${number}`;
+}
+
+function createSmartPlaylist({ name, description, smart }) {
+  const now = Date.now();
+  const playlist = {
+    id: newPlaylistId(),
+    name: String(name ?? "").trim() || defaultSmartPlaylistName(),
+    kind: "smart",
+    description: String(description ?? "").trim(),
+    trackIds: [],
+    createdAt: now,
+    updatedAt: now,
+    schemaVersion: 1,
+    smart: window.EmpSmartPlaylists.normalizeSmartDefinition(smart)
+  };
+  state.playlists = [...state.playlists, playlist];
+  smartMatchCache.delete(playlist.id);
+  recordRecentPlaylist(playlist.id);
+  writeSession();
+  return playlist;
+}
+
+function updateSmartPlaylist(playlistId, { name, description, smart }) {
+  const playlist = playlistById(playlistId);
+  if (!playlist || !isSmartPlaylist(playlist)) {
+    return null;
+  }
+  playlist.name = String(name ?? "").trim() || playlist.name;
+  playlist.description = String(description ?? "").trim();
+  playlist.smart = window.EmpSmartPlaylists.normalizeSmartDefinition(smart);
+  playlist.updatedAt = Date.now();
+  smartMatchCache.delete(playlist.id);
+  writeSession();
+  refreshAfterPlaylistChange(playlist.id);
+  return playlist;
+}
+
+function duplicateSmartPlaylist(playlistId) {
+  const source = playlistById(playlistId);
+  if (!source || !isSmartPlaylist(source)) {
+    return null;
+  }
+  const smart = window.EmpSmartPlaylists.cloneDefinition(source.smart);
+  if (smart.sort?.field === "random") {
+    smart.randomSeed = window.EmpSmartPlaylists.newRandomSeed(source.name);
+  }
+  return createSmartPlaylist({
+    name: `${source.name} Copy`,
+    description: source.description,
+    smart
+  });
+}
+
+function reshuffleSmartPlaylist(playlistId) {
+  const playlist = playlistById(playlistId);
+  if (!playlist || !isSmartPlaylist(playlist) || playlist.smart?.sort?.field !== "random") {
+    return;
+  }
+  playlist.smart.randomSeed = window.EmpSmartPlaylists.newRandomSeed(playlist.name);
+  playlist.updatedAt = Date.now();
+  smartMatchCache.delete(playlist.id);
+  writeSession();
+  refreshAfterPlaylistChange(playlist.id);
+}
+
+function convertSmartPlaylistToRegular(playlistId) {
+  const source = playlistById(playlistId);
+  if (!source || !isSmartPlaylist(source)) {
+    return null;
+  }
+  const trackIds = playlistTracks(source).map((track) => track.id);
+  const playlist = {
+    id: newPlaylistId(),
+    name: source.name,
+    description: source.description || "",
+    trackIds,
+    createdAt: Date.now()
+  };
+  state.playlists = [...state.playlists, playlist];
+  recordRecentPlaylist(playlist.id);
+  writeSession();
+  return playlist;
+}
+
 function addTrackToPlaylist(playlistId, trackId) {
   const playlist = playlistById(playlistId);
-  if (!playlist || !trackId) {
+  if (!playlist || !trackId || isSmartPlaylist(playlist)) {
     return false;
   }
 
@@ -2418,10 +2712,12 @@ function likeTrack(trackId) {
     recordRecentPlaylist(playlist.id);
     writeSession();
     refreshAfterPlaylistChange(playlist.id);
+    scheduleSmartReevaluation({ liked: true });
     return;
   }
 
   addTrackToPlaylist(playlist.id, trackId);
+  scheduleSmartReevaluation({ liked: true });
 }
 
 function unlikeTrack(trackId) {
@@ -2433,17 +2729,19 @@ function unlikeTrack(trackId) {
   const playlist = likedPlaylist();
   if (!playlist) {
     writeSession();
+    scheduleSmartReevaluation({ liked: true });
     return;
   }
 
   playlist.trackIds = playlist.trackIds.filter((id) => id !== trackId);
   writeSession();
   refreshAfterPlaylistChange(playlist.id);
+  scheduleSmartReevaluation({ liked: true });
 }
 
 function removeTrackFromPlaylist(playlistId, trackId) {
   const playlist = playlistById(playlistId);
-  if (!playlist || !trackId) {
+  if (!playlist || !trackId || isSmartPlaylist(playlist)) {
     return;
   }
 
@@ -2465,7 +2763,8 @@ function playPlaylist(playlistId, startId) {
   }
 
   recordRecentPlaylist(playlistId);
-  playTrack(queueStartId(ids, startId), ids, { source: { kind: "playlist", id: playlistId } });
+  const sourceKind = isSmartPlaylist(playlist) ? "smart" : "playlist";
+  playTrack(queueStartId(ids, startId), ids, { source: { kind: sourceKind, id: playlistId } });
 }
 
 function setRecentsFilter(filter) {
@@ -2694,6 +2993,117 @@ function createPlaylistFromSidebar() {
   syncRecentsChips();
   writeSession();
   navigate({ view: "playlist", playlistId: playlist.id });
+}
+
+let createMenuRoot = null;
+
+function ensureCreateMenu() {
+  if (createMenuRoot) {
+    return createMenuRoot;
+  }
+  createMenuRoot = document.createElement("div");
+  createMenuRoot.className = "create-menu-root";
+  createMenuRoot.hidden = true;
+  createMenuRoot.innerHTML = `
+    <div class="create-menu" role="menu">
+      <button class="create-menu-item" type="button" role="menuitem" data-create-regular>
+        <i class="bi bi-music-note-list"></i>
+        <span>
+          <span class="create-menu-item-title">Create playlist</span>
+          <span class="create-menu-item-desc">Add songs manually.</span>
+        </span>
+      </button>
+      <button class="create-menu-item" type="button" role="menuitem" data-create-smart>
+        <i class="bi bi-funnel"></i>
+        <span>
+          <span class="create-menu-item-title">Create smart playlist</span>
+          <span class="create-menu-item-desc">Automatically add matching songs.</span>
+        </span>
+      </button>
+    </div>
+  `;
+  document.body.appendChild(createMenuRoot);
+  createMenuRoot.addEventListener("click", (event) => {
+    if (event.target === createMenuRoot) {
+      closeCreateMenu();
+      return;
+    }
+    if (event.target.closest("[data-create-regular]")) {
+      closeCreateMenu();
+      createPlaylistFromSidebar();
+      return;
+    }
+    if (event.target.closest("[data-create-smart]")) {
+      closeCreateMenu();
+      openSmartPlaylistEditorCreate();
+    }
+  });
+  createMenuRoot.addEventListener("keydown", (event) => {
+    const items = [...createMenuRoot.querySelectorAll(".create-menu-item")];
+    const index = items.indexOf(document.activeElement);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!items.length) {
+        return;
+      }
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      const next = index < 0 ? 0 : (index + delta + items.length) % items.length;
+      items[next].focus();
+    }
+  });
+  return createMenuRoot;
+}
+
+function positionCreateMenu(anchor) {
+  const root = ensureCreateMenu();
+  const menu = root.querySelector(".create-menu");
+  const rect = anchor.getBoundingClientRect();
+  root.hidden = false;
+  // Measure after showing so size is accurate.
+  const box = menu.getBoundingClientRect();
+  const gap = 4;
+  const pad = 8;
+  let left = rect.left;
+  let top = rect.bottom + gap;
+
+  // Prefer staying near the + button / sidebar; flip if clipped.
+  if (left + box.width > window.innerWidth - pad) {
+    left = Math.max(pad, rect.right - box.width);
+  }
+  if (top + box.height > window.innerHeight - pad) {
+    top = Math.max(pad, rect.top - box.height - gap);
+  }
+  left = Math.min(Math.max(pad, left), window.innerWidth - box.width - pad);
+  top = Math.min(Math.max(pad, top), window.innerHeight - box.height - pad);
+
+  menu.style.left = `${Math.round(left)}px`;
+  menu.style.top = `${Math.round(top)}px`;
+}
+
+function openCreateMenu(anchor) {
+  closeContextMenu();
+  closeOverflowMenu();
+  ensureCreateMenu();
+  positionCreateMenu(anchor);
+  createMenuRoot.querySelector("[data-create-regular]")?.focus();
+}
+
+function closeCreateMenu() {
+  if (createMenuRoot) {
+    createMenuRoot.hidden = true;
+  }
+}
+
+function openSmartPlaylistEditorCreate() {
+  window.EmpSmartPlaylistEditor?.openCreate({ name: defaultSmartPlaylistName() });
+}
+
+function openSmartPlaylistEditorEdit(playlistId) {
+  const playlist = playlistById(playlistId || state.playlistId);
+  if (!playlist || !isSmartPlaylist(playlist)) {
+    return;
+  }
+  window.EmpSmartPlaylistEditor?.openEdit(playlist);
 }
 
 function sidebarPlaylists() {
@@ -3428,6 +3838,7 @@ function render(entry) {
   closeContextMenu();
   closeOverflowMenu();
   closeDetailsModal();
+  clearTrackSelection();
   state.view = entry.view;
   state.albumId = entry.albumId ?? null;
   state.playlistId = entry.playlistId ?? null;
@@ -3489,6 +3900,11 @@ function render(entry) {
   } else if (entry.view === "settings") {
     setStageAccent("#1f1f1f");
     renderSettings();
+    refreshAudioOutputDevices();
+    const durationSlider = viewArea.querySelector("[data-crossfade-seconds]");
+    if (durationSlider) {
+      updateSlider(durationSlider);
+    }
   } else if (entry.view === "lyrics") {
     renderLyrics();
   }
@@ -3549,6 +3965,10 @@ function renderLibraryList() {
       const tracks = playlistTracks(playlist);
       const playing = isSidebarPlaylistPlaying(playlist.id);
       const pinned = isLikedPlaylist(playlist);
+      const smart = isSmartPlaylist(playlist);
+      const kindLabel = smart
+        ? `<span class="playlist-sub-smart"><i class="bi bi-funnel playlist-smart-icon" aria-hidden="true"></i>Smart Playlist</span>`
+        : "Playlist";
       return `
         <li>
           <div class="playlist-row${playing ? " is-playing" : ""}${pinned ? " is-pinned" : ""}">
@@ -3558,7 +3978,7 @@ function renderLibraryList() {
               </span>
               <span class="playlist-meta">
                 <span class="playlist-title">${escapeHtml(playlist.name)}</span>
-                <span class="playlist-sub">Playlist • ${songLabel(tracks.length)}</span>
+                <span class="playlist-sub">${kindLabel} • ${songLabel(tracks.length)}</span>
               </span>
             </button>
             ${sidebarPlayOverlay(`data-play-playlist="${playlist.id}"`, playlist.name, playing)}
@@ -3620,6 +4040,10 @@ function albumCard(album, options) {
   `;
 }
 
+function playlistKindLabel(playlist) {
+  return isSmartPlaylist(playlist) ? "Smart Playlist" : "Playlist";
+}
+
 function playlistCard(playlist) {
   const playing = isSidebarPlaylistPlaying(playlist.id);
   const count = playlistTracks(playlist).length;
@@ -3632,7 +4056,7 @@ function playlistCard(playlist) {
         </button>
       </div>
       <div class="media-title">${escapeHtml(playlist.name)}</div>
-      <div class="media-sub">Playlist • ${songLabel(count)}</div>
+      <div class="media-sub">${playlistKindLabel(playlist)} • ${songLabel(count)}</div>
     </article>
   `;
 }
@@ -3702,7 +4126,7 @@ function libraryPlaylistRow(playlist) {
         </span>
         <span class="playlist-meta">
           <span class="playlist-title">${escapeHtml(playlist.name)}</span>
-          <span class="playlist-sub">Playlist • ${songLabel(count)}</span>
+          <span class="playlist-sub">${playlistKindLabel(playlist)} • ${songLabel(count)}</span>
         </span>
       </button>
       <button class="playlist-play${playing ? " is-playing" : ""}" type="button" tabindex="-1" data-play-playlist="${playlist.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(playlist.name)}">
@@ -4605,7 +5029,7 @@ function searchTopResultMarkup(top) {
             ${playlistCoverMarkup(playlist, "search-top-cover")}
             <span class="search-top-copy">
               <span class="search-top-title">${escapeHtml(playlist.name)}</span>
-              <span class="search-top-meta">Playlist • ${songLabel(count)}</span>
+              <span class="search-top-meta">${playlistKindLabel(playlist)} • ${songLabel(count)}</span>
             </span>
           </button>
           <button class="play-fab search-top-play" type="button" data-play-playlist="${playlist.id}" title="Play" aria-label="Play ${escapeHtml(playlist.name)}">
@@ -4867,6 +5291,209 @@ function settingSwitch(key, checked, label) {
   `;
 }
 
+function audioOutputMenuOptions() {
+  const options = [{ id: "", label: "System Default" }];
+  const seen = new Set([""]);
+  for (const device of audioOutputDevices) {
+    const id = typeof device.deviceId === "string" ? device.deviceId : "";
+    const label = typeof device.label === "string" ? device.label.trim() : "";
+    if (!id || seen.has(id) || !label) {
+      continue;
+    }
+    seen.add(id);
+    options.push({ id, label });
+  }
+  if (state.audioOutputId && !seen.has(state.audioOutputId)) {
+    const savedLabel = typeof state.audioOutputLabel === "string" ? state.audioOutputLabel.trim() : "";
+    if (savedLabel) {
+      options.push({ id: state.audioOutputId, label: savedLabel });
+    }
+  }
+  return options;
+}
+
+function audioOutputLabelForId(deviceId) {
+  const id = typeof deviceId === "string" ? deviceId : "";
+  if (!id) {
+    return "System Default";
+  }
+  const match = audioOutputMenuOptions().find((item) => item.id === id);
+  if (match) {
+    return match.label;
+  }
+  const saved = typeof state.audioOutputLabel === "string" ? state.audioOutputLabel.trim() : "";
+  return saved || "System Default";
+}
+
+function renderAudioOutputSettingRow() {
+  if (!audioOutputSupported && !(window.AudioContext && "setSinkId" in window.AudioContext.prototype)) {
+    return `
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Audio Output</span>
+          <span class="settings-desc">Output device selection is not available in this WebView2 runtime.</span>
+        </div>
+      </div>`;
+  }
+  audioOutputSupported = true;
+  const options = audioOutputMenuOptions();
+  const currentId = options.some((item) => item.id === state.audioOutputId) ? state.audioOutputId : "";
+  const currentLabel = audioOutputLabelForId(currentId);
+  const canPick = typeof navigator.mediaDevices?.selectAudioOutput === "function";
+  const items = options.map((item) => {
+    const active = item.id === currentId;
+    return `
+      <button class="songs-sort-item${active ? " active" : ""}" type="button" role="menuitemradio" aria-checked="${active ? "true" : "false"}" data-audio-output="${escapeHtml(item.id)}">
+        <span>${escapeHtml(item.label)}</span>
+        ${active ? '<i class="bi bi-check2" aria-hidden="true"></i>' : ""}
+      </button>`;
+  }).join("");
+  const pickItem = canPick
+    ? `
+      <button class="songs-sort-item" type="button" role="menuitem" data-audio-output-pick>
+        <span>Choose device…</span>
+      </button>`
+    : "";
+
+  return `
+    <div class="settings-row">
+      <div class="settings-copy">
+        <span class="settings-label">Audio Output</span>
+        <span class="settings-desc">Choose a local playback device when supported.</span>
+      </div>
+      <div class="songs-sort-wrap settings-audio-output-wrap">
+        <button class="songs-sort-button" type="button" data-audio-output-toggle aria-haspopup="menu" aria-expanded="false" aria-label="Audio Output">
+          <span data-audio-output-label>${escapeHtml(currentLabel)}</span>
+          <i class="bi bi-chevron-down" aria-hidden="true"></i>
+        </button>
+        <div class="songs-sort-menu settings-audio-output-menu" role="menu" aria-label="Audio Output" hidden>
+          ${items}
+          ${pickItem}
+        </div>
+      </div>
+    </div>`;
+}
+
+let audioOutputLabelProbe = null;
+
+async function enumerateAudioOutputDevices() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices.filter((device) => device.kind === "audiooutput");
+}
+
+function audioOutputHasLabels(devices) {
+  return devices.some((device) => device.deviceId && String(device.label || "").trim());
+}
+
+/**
+ * Chromium withholds device labels until a media permission is granted.
+ * Probe once with a short-lived audio capture stream (host auto-allows mic).
+ */
+async function ensureAudioOutputLabels(devices) {
+  if (audioOutputHasLabels(devices)) {
+    return devices;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return devices;
+  }
+  if (!audioOutputLabelProbe) {
+    audioOutputLabelProbe = (async () => {
+      let stream = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: false
+        });
+      } catch {
+        return false;
+      } finally {
+        stream?.getTracks?.().forEach((track) => {
+          try {
+            track.stop();
+          } catch {
+            // Ignore stop failures after probing.
+          }
+        });
+      }
+      return true;
+    })().finally(() => {
+      // Allow a later retry if the first probe failed before permission was ready.
+      window.setTimeout(() => {
+        audioOutputLabelProbe = null;
+      }, 1500);
+    });
+  }
+  await audioOutputLabelProbe;
+  return enumerateAudioOutputDevices();
+}
+
+async function refreshAudioOutputDevices() {
+  audioOutputSupported = Boolean(window.AudioContext && "setSinkId" in window.AudioContext.prototype);
+  if (!audioOutputSupported || !navigator.mediaDevices?.enumerateDevices) {
+    audioOutputDevices = [];
+    return;
+  }
+  try {
+    let devices = await enumerateAudioOutputDevices();
+    devices = await ensureAudioOutputLabels(devices);
+    audioOutputDevices = devices;
+    const labeledIds = new Set(
+      audioOutputDevices
+        .filter((device) => device.deviceId && String(device.label || "").trim())
+        .map((device) => device.deviceId)
+    );
+    if (state.audioOutputId
+      && state.audioOutputId !== ""
+      && !labeledIds.has(state.audioOutputId)
+      && !(typeof state.audioOutputLabel === "string" && state.audioOutputLabel.trim())) {
+      state.audioOutputId = "";
+      state.audioOutputLabel = "";
+      writeSession();
+      applyAudioOutputDevice();
+    } else if (state.audioOutputId) {
+      const match = audioOutputDevices.find((device) => device.deviceId === state.audioOutputId);
+      const label = match && String(match.label || "").trim();
+      if (label) {
+        state.audioOutputLabel = label;
+      }
+    }
+  } catch {
+    audioOutputDevices = [];
+  }
+  if (state.view === "settings") {
+    renderSettings();
+  }
+}
+
+async function pickAudioOutputDevice() {
+  if (typeof navigator.mediaDevices?.selectAudioOutput !== "function") {
+    return;
+  }
+  try {
+    const device = await navigator.mediaDevices.selectAudioOutput();
+    if (!device || typeof device.deviceId !== "string") {
+      return;
+    }
+    state.audioOutputLabel = typeof device.label === "string" ? device.label.trim() : "";
+    setPlaybackSetting("audioOutputId", device.deviceId);
+    await refreshAudioOutputDevices();
+  } catch {
+    // User cancelled the system picker or the runtime denied it.
+  }
+}
+
+function closeAudioOutputMenu() {
+  viewArea.querySelectorAll(".settings-audio-output-wrap").forEach((wrap) => {
+    const menu = wrap.querySelector(".songs-sort-menu");
+    const button = wrap.querySelector("[data-audio-output-toggle]");
+    if (menu) {
+      menu.hidden = true;
+    }
+    button?.setAttribute("aria-expanded", "false");
+    wrap.classList.remove("is-open");
+  });
+}
+
 function settingSelect(name, value, options) {
   const items = options.map(([id, label]) => {
     const selected = value === id;
@@ -4987,34 +5614,85 @@ function renderSettings() {
       </section>
       <section class="settings-group">
         <h2>Playback</h2>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <span class="settings-label">Crossfade Songs</span>
+        <div class="settings-block">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <span class="settings-label">Crossfade Songs</span>
+            </div>
+            ${settingSwitch("crossfade", state.crossfade, "Crossfade Songs")}
           </div>
-          ${settingSwitch("crossfade", state.crossfade, "Crossfade Songs")}
+          ${state.crossfade ? `
+          <div class="settings-nested" role="group" aria-label="Crossfade options">
+            <div class="settings-nested-row">
+              <span class="settings-nested-label">Duration</span>
+              <div class="settings-duration-control">
+                <input class="slider settings-duration-slider" type="range" min="1" max="12" step="1" value="${clampCrossfadeSeconds(state.crossfadeSeconds)}" aria-label="Crossfade duration" data-crossfade-seconds>
+                <span class="settings-duration-value" data-crossfade-seconds-label>${clampCrossfadeSeconds(state.crossfadeSeconds)} sec</span>
+              </div>
+            </div>
+          </div>` : ""}
         </div>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <span class="settings-label">Gapless</span>
+        <div class="settings-block">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <span class="settings-label">Gapless</span>
+              <span class="settings-desc">Start the next song with minimal silence. Cannot be used with Crossfade.</span>
+            </div>
+            ${settingSwitch("gapless", state.gapless, "Gapless")}
           </div>
-          ${settingSwitch("gapless", state.gapless, "Gapless")}
         </div>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <span class="settings-label">Normalize volume</span>
-            <span class="settings-desc">Set the same volume level for all songs</span>
+        <div class="settings-block">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <span class="settings-label">Normalize volume</span>
+              <span class="settings-desc">Applies ReplayGain tags when available. Songs without ReplayGain metadata play at their original level.</span>
+            </div>
+            ${settingSwitch("normalizeVolume", state.normalizeVolume, "Normalize volume")}
           </div>
-          ${settingSwitch("normalizeVolume", state.normalizeVolume, "Normalize volume")}
+          ${state.normalizeVolume ? `
+          <div class="settings-nested" role="group" aria-label="Normalization options">
+            <div class="settings-nested-row">
+              <span class="settings-nested-label">Mode</span>
+              <div class="settings-segmented" role="group" aria-label="Normalization mode">
+                <button type="button" class="settings-segment${state.normalizeMode === "track" ? " is-selected" : ""}" data-normalize-mode="track">Track</button>
+                <button type="button" class="settings-segment${state.normalizeMode === "album" ? " is-selected" : ""}" data-normalize-mode="album">Album</button>
+              </div>
+            </div>
+            <p class="settings-nested-desc">Album mode uses album tags when present; otherwise track tags.</p>
+          </div>` : ""}
         </div>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <span class="settings-label">Equalizer</span>
+        <div class="settings-block">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <span class="settings-label">Prevent Clipping</span>
+              <span class="settings-desc">Reduce distortion caused by volume normalization and audio enhancements.</span>
+            </div>
+            ${settingSwitch("preventClipping", state.preventClipping !== false, "Prevent Clipping")}
           </div>
-          ${settingSwitch("equalizerEnabled", state.equalizerEnabled, "Equalizer")}
         </div>
-        ${equalizerMarkup}
+        <div class="settings-block">
+          ${renderAudioOutputSettingRow()}
+        </div>
+        ${isRemotePlayback() || isConnectingPlayback() ? `
+        <div class="settings-block">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <span class="settings-desc">Equalizer, ReplayGain, Prevent Clipping, and audio output apply to local playback only while casting.</span>
+            </div>
+          </div>
+        </div>` : ""}
+        <div class="settings-block">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <span class="settings-label">Equalizer</span>
+            </div>
+            ${settingSwitch("equalizerEnabled", state.equalizerEnabled, "Equalizer")}
+          </div>
+          ${equalizerMarkup}
+        </div>
       </section>
       ${renderStorageSettingsGroup()}
+      ${renderUpdatesSettingsGroup()}
     </div>
   `;
   try {
@@ -5023,6 +5701,7 @@ function renderSettings() {
     // Settings still render if the graph overlay cannot be drawn.
   }
   window.chrome?.webview?.postMessage({ type: "storage" });
+  window.chrome?.webview?.postMessage({ type: "updates", action: "status" });
 }
 
 function formatMegabytes(bytes) {
@@ -5057,6 +5736,106 @@ function renderStorageSettingsGroup() {
       </div>
     </section>
   `;
+}
+
+function updateStatusCopy() {
+  const status = state.updateStatus || {};
+  const current = state.appVersion || "…";
+  switch (status.state) {
+    case "checking":
+      return "Checking for updates…";
+    case "upToDate":
+      return "You're up to date.";
+    case "updateAvailable":
+      return `Update available: v${status.availableVersion}`;
+    case "downloading": {
+      const pct = status.progress == null ? "" : ` ${Math.round(Number(status.progress) * 100)}%`;
+      return `Downloading update…${pct}`;
+    }
+    case "ready":
+      return `v${status.availableVersion} is ready to install. EMP will restart to finish updating.`;
+    case "installing":
+      return "Installing update…";
+    case "failed":
+      return status.error || "Couldn't check for updates. Try again later.";
+    default:
+      return "Check for updates anytime.";
+  }
+}
+
+function renderUpdatesSettingsGroup() {
+  const status = state.updateStatus || {};
+  const actions = [];
+  if (status.state === "updateAvailable") {
+    actions.push(`<button class="eq-reset" type="button" data-update-action="download">Download Update</button>`);
+    actions.push(`<button class="eq-reset" type="button" data-update-action="dismiss">Not Now</button>`);
+  } else if (status.state === "ready") {
+    actions.push(`<button class="eq-reset" type="button" data-update-action="restartAndUpdate">Restart and Update</button>`);
+    actions.push(`<button class="eq-reset" type="button" data-update-action="dismiss">Later</button>`);
+  } else if (status.state !== "checking" && status.state !== "downloading" && status.state !== "installing") {
+    actions.push(`<button class="eq-reset" type="button" data-update-action="check">Check for Updates</button>`);
+  }
+
+  return `
+    <section class="settings-group">
+      <h2>Updates</h2>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Current version</span>
+          <span class="settings-desc">The version of EMP installed on this computer.</span>
+        </div>
+        <span class="settings-value" data-update-version>${escapeHtml(state.appVersion || "…")}</span>
+      </div>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Automatically check for updates</span>
+          <span class="settings-desc">Looks for new versions about once a day. Updates never install without asking.</span>
+        </div>
+        ${settingSwitch("automaticUpdateChecks", state.automaticUpdateChecks !== false, "Automatically check for updates")}
+      </div>
+      <div class="settings-row settings-update-status-row">
+        <div class="settings-copy">
+          <span class="settings-label">Status</span>
+          <span class="settings-desc" data-update-status>${escapeHtml(updateStatusCopy())}</span>
+        </div>
+      </div>
+      <div class="settings-row settings-folder-actions" data-update-actions>
+        ${actions.join("\n        ")}
+      </div>
+    </section>
+  `;
+}
+
+function postUpdateAction(action, extra = {}) {
+  window.chrome?.webview?.postMessage({ type: "updates", action, ...extra });
+}
+
+function applyUpdateStatus(detail) {
+  if (!detail || typeof detail !== "object") {
+    return;
+  }
+  if (typeof detail.currentVersion === "string" && detail.currentVersion) {
+    state.appVersion = detail.currentVersion;
+  }
+  if (typeof detail.automaticUpdateChecks === "boolean") {
+    state.automaticUpdateChecks = detail.automaticUpdateChecks;
+  }
+  state.updateStatus = {
+    state: detail.state || "idle",
+    availableVersion: detail.availableVersion || null,
+    progress: detail.progress == null ? null : Number(detail.progress),
+    error: detail.error || null
+  };
+  syncUpdatesSettingsUi();
+}
+
+function updateSettingsNavBadge() {
+  const nav = document.querySelector('[data-nav="settings"]');
+  if (!nav) {
+    return;
+  }
+  const hasUpdate = state.updateStatus?.state === "updateAvailable" || state.updateStatus?.state === "ready";
+  nav.classList.toggle("has-update", Boolean(hasUpdate));
 }
 
 function applyStorageUsage(detail) {
@@ -5106,7 +5885,7 @@ function renderAlbum(albumId) {
             </div>
           </div>
         </div>
-        ${collectionActionsMarkup(album.title, `data-play-album="${album.id}"`)}
+        ${collectionActionsMarkup(album.title, `data-play-album="${album.id}"`, { albumMore: true })}
       </div>
       <div class="track-panel">
         ${trackTable(tracks, { showAlbum: false, showCover: false, showHeader: true })}
@@ -5122,7 +5901,10 @@ function renderPlaylist(playlistId) {
     return;
   }
 
-  const tracks = playlistTracks(playlist);
+  ensureSmartDateRelativeFreshness();
+  const smart = isSmartPlaylist(playlist);
+  const loadError = smart && playlist.smart?.loadError;
+  const tracks = loadError ? [] : playlistTracks(playlist);
   const cover = playlistCoverItem(playlist);
   const totalDuration = tracks.reduce((sum, track) => sum + (Number(track.duration) || 0), 0);
   const album = albumById(tracks[0]?.albumId);
@@ -5133,25 +5915,49 @@ function renderPlaylist(playlistId) {
     setStageAccentFromArt(artUrl, playlistFallback, 420);
   }
 
+  let emptyMarkup = "";
+  if (!tracks.length) {
+    if (loadError) {
+      emptyMarkup = `
+        <div class="smart-empty-state">
+          <h3>Couldn't load these rules</h3>
+          <p>This smart playlist definition couldn't be evaluated. Your playlist was kept — try editing the rules.</p>
+          <button class="smart-btn-primary" type="button" data-smart-edit-rules>Edit Rules</button>
+        </div>`;
+    } else if (smart) {
+      emptyMarkup = `
+        <div class="smart-empty-state">
+          <h3>No matching songs</h3>
+          <p>Try adjusting your rules to include more of your library.</p>
+          <button class="smart-btn-primary" type="button" data-smart-edit-rules>Edit Rules</button>
+        </div>`;
+    } else {
+      emptyMarkup = `<p class="text-secondary">This playlist is empty. Right-click a track on an album to add songs.</p>`;
+    }
+  }
+
+  const description = playlist.description
+    ? `<div class="album-meta" style="margin-top:6px;opacity:.85">${escapeHtml(playlist.description)}</div>`
+    : "";
+
   viewArea.innerHTML = `
     <div class="album-page">
       <div class="album-page-content">
         <div class="album-hero">
           ${playlistCoverMarkup(playlist, "album-hero-cover")}
           <div class="album-hero-text">
-            <div class="album-kicker">Playlist</div>
+            <div class="album-kicker">${smart ? "Smart Playlist" : "Playlist"}</div>
             <h1>${escapeHtml(playlist.name)}</h1>
             <div class="album-meta">
               <span>${songLabel(tracks.length)}</span>
               <span class="album-meta-dot">•</span>
               <span>${formatCollectionDuration(totalDuration)}</span>
             </div>
+            ${description}
           </div>
         </div>
         ${collectionActionsMarkup(playlist.name, `data-play-playlist="${playlist.id}"`, { more: true })}
-        ${tracks.length
-          ? ""
-          : `<p class="text-secondary">This playlist is empty. Right-click a track on an album to add songs.</p>`}
+        ${emptyMarkup}
       </div>
       ${tracks.length
         ? `<div class="track-panel">${trackTable(tracks, { showAlbum: true, showCover: true, showHeader: true })}</div>`
@@ -6013,16 +6819,40 @@ function syncHomePlaying() {
     }
   });
 
-  viewArea.querySelectorAll(".home-shelf .media-card[data-open-album]").forEach((card) => {
-    const playing = isSidebarAlbumPlaying(card.dataset.openAlbum);
+  viewArea.querySelectorAll(".home-shelf .media-card").forEach((card) => {
+    let playing = false;
+    let label = "";
+    if (card.dataset.openAlbum) {
+      playing = isSidebarAlbumPlaying(card.dataset.openAlbum);
+      label = card.querySelector(".media-title")?.textContent || "";
+    } else if (card.dataset.openPlaylist) {
+      playing = isSidebarPlaylistPlaying(card.dataset.openPlaylist);
+      label = card.querySelector(".media-title")?.textContent || "";
+    } else if (card.dataset.openMix) {
+      playing = isMixQueuePlaying(card.dataset.openMix);
+      label = card.querySelector(".media-title")?.textContent || "";
+    } else {
+      return;
+    }
+
     const fab = card.querySelector(".play-fab");
     card.classList.toggle("is-playing", playing);
     if (fab) {
       fab.classList.toggle("is-playing", playing);
       fab.innerHTML = playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
       fab.title = playing ? "Pause" : "Play";
+      if (label) {
+        fab.setAttribute("aria-label", `${playing ? "Pause" : "Play"} ${label}`);
+      }
     }
   });
+}
+
+function blurHomePlayControl(target) {
+  const control = target?.closest?.(".play-fab, .quick-play-fab, .playlist-play");
+  if (control && typeof control.blur === "function") {
+    control.blur();
+  }
 }
 
 function clamp(value, min, max) {
@@ -6037,9 +6867,22 @@ function userVolumeGain() {
   return Math.pow(normalized, 2);
 }
 
+function trackByPlayer(player) {
+  return player?.trackId ? trackById(player.trackId) : null;
+}
+
+function computePlayerNormalizeGain(player) {
+  if (!state.normalizeVolume || !ReplayGain) {
+    return 1;
+  }
+  return ReplayGain.computeReplayGainLinear(trackByPlayer(player), {
+    enabled: true,
+    mode: state.normalizeMode
+  });
+}
+
 function playerOutputGain(player) {
-  const normalize = state.normalizeVolume ? player.normalize : 1;
-  return player.fade * normalize;
+  return player.fade * (Number.isFinite(player.normalize) ? player.normalize : 1);
 }
 
 const EQ_RAMP_TIME = 0.018;
@@ -6127,6 +6970,32 @@ function setAudioParam(param, value, immediate) {
   param.setTargetAtTime(value, now, EQ_RAMP_TIME);
 }
 
+function createPeakProtectChain(eqOutput) {
+  peakCompressor = audioContext.createDynamicsCompressor();
+  PeakProtect?.applyCompressorParams?.(peakCompressor);
+  peakDryGain = audioContext.createGain();
+  peakWetGain = audioContext.createGain();
+  const mix = PeakProtect?.peakProtectMixGains?.(state.preventClipping !== false)
+    ?? { dry: 0, wet: 1 };
+  peakDryGain.gain.value = mix.dry;
+  peakWetGain.gain.value = mix.wet;
+  eqOutput.connect(peakDryGain);
+  eqOutput.connect(peakCompressor);
+  peakCompressor.connect(peakWetGain);
+  peakDryGain.connect(masterGain);
+  peakWetGain.connect(masterGain);
+}
+
+function applyPeakProtection({ immediate = false } = {}) {
+  if (!peakDryGain || !peakWetGain) {
+    return;
+  }
+  const mix = PeakProtect?.peakProtectMixGains?.(state.preventClipping !== false)
+    ?? { dry: state.preventClipping === false ? 1 : 0, wet: state.preventClipping === false ? 0 : 1 };
+  setAudioParam(peakDryGain.gain, mix.dry, immediate);
+  setAudioParam(peakWetGain.gain, mix.wet, immediate);
+}
+
 function createEqualizerChain() {
   eqPreamp = audioContext.createGain();
   eqPreamp.gain.value = 1;
@@ -6141,7 +7010,14 @@ function createEqualizerChain() {
     previous = filter;
     return filter;
   });
-  previous.connect(masterGain);
+  try {
+    createPeakProtectChain(previous);
+  } catch {
+    previous.connect(masterGain);
+    peakCompressor = null;
+    peakDryGain = null;
+    peakWetGain = null;
+  }
   eqReady = true;
   return eqPreamp;
 }
@@ -6299,9 +7175,64 @@ function eqClientYToGain(clientY, graph) {
   return Math.max(EQ_MIN_DB, Math.min(EQ_MAX_DB, EQ_MAX_DB - t * (EQ_MAX_DB - EQ_MIN_DB)));
 }
 
+function resumeAudioContext() {
+  if (!audioContext || audioContext.state === "closed") {
+    return Promise.resolve();
+  }
+  if (audioContext.state === "running") {
+    return Promise.resolve();
+  }
+  if (audioContextResumePromise) {
+    return audioContextResumePromise;
+  }
+  audioContextResumePromise = Promise.resolve(audioContext.resume?.())
+    .catch(() => {})
+    .finally(() => {
+      audioContextResumePromise = null;
+    });
+  return audioContextResumePromise;
+}
+
+function wirePlayerIntoGraph(player, mixTarget) {
+  if (player.source) {
+    return;
+  }
+  player.source = audioContext.createMediaElementSource(player.el);
+  player.gain = audioContext.createGain();
+  player.analyser = audioContext.createAnalyser();
+  player.analyser.fftSize = 2048;
+  player.source.connect(player.analyser);
+  player.source.connect(player.gain);
+  player.gain.connect(mixTarget);
+  player.el.volume = 1;
+}
+
+function applyAudioOutputDevice() {
+  if (!audioContext || typeof audioContext.setSinkId !== "function") {
+    return Promise.resolve();
+  }
+  if (isRemotePlayback() || isConnectingPlayback()) {
+    return Promise.resolve();
+  }
+  const sinkId = typeof state.audioOutputId === "string" ? state.audioOutputId : "";
+  return Promise.resolve(audioContext.setSinkId(sinkId)).catch(() => {
+    if (sinkId) {
+      state.audioOutputId = "";
+      writeSession();
+      return audioContext.setSinkId("");
+    }
+    return undefined;
+  });
+}
+
 function ensureAudioGraph() {
-  if (audioGraphReady) {
-    audioContext?.resume?.();
+  if (audioGraphReady && audioContext && audioContext.state !== "closed") {
+    resumeAudioContext();
+    return;
+  }
+
+  if (audioGraphReady && audioContext?.state === "closed") {
+    rebuildAudioGraphFromClosedContext();
     return;
   }
 
@@ -6311,7 +7242,13 @@ function ensureAudioGraph() {
   }
 
   try {
+    audioOutputSupported = "setSinkId" in Context.prototype;
     audioContext = new Context();
+    audioContext.addEventListener("statechange", () => {
+      if (audioContext?.state === "suspended" && state.playing && !isRemotePlayback()) {
+        resumeAudioContext();
+      }
+    });
     masterGain = audioContext.createGain();
     masterGain.connect(audioContext.destination);
 
@@ -6322,37 +7259,133 @@ function ensureAudioGraph() {
       eqReady = false;
       eqPreamp = null;
       eqFilters = [];
+      peakCompressor = null;
+      peakDryGain = null;
+      peakWetGain = null;
       mixTarget = masterGain;
     }
 
     players.forEach((player) => {
-      player.source = audioContext.createMediaElementSource(player.el);
-      player.gain = audioContext.createGain();
-      player.analyser = audioContext.createAnalyser();
-      player.analyser.fftSize = 2048;
-      player.source.connect(player.analyser);
-      player.source.connect(player.gain);
-      player.gain.connect(mixTarget);
-      player.el.volume = 1;
+      wirePlayerIntoGraph(player, mixTarget);
     });
     audioGraphReady = true;
     try {
       applyEqualizer({ immediate: true });
+      applyPeakProtection({ immediate: true });
     } catch {
-      // Playback continues without EQ if coefficient apply fails.
+      // Playback continues without EQ/peak protect if apply fails.
     }
-    audioContext.resume();
+    applyAudioOutputDevice();
+    resumeAudioContext();
   } catch {
     audioGraphReady = false;
   }
 }
 
+function rebuildAudioGraphFromClosedContext() {
+  const snapshot = GraphRecovery?.capturePlaybackSnapshot?.({
+    trackId: currentTrack()?.id ?? null,
+    position: playbackPosition(),
+    playing: state.playing,
+    queue: state.queue,
+    shuffleBag: state.shuffleBag,
+    index: state.index,
+    shuffle: state.shuffle,
+    repeat: state.repeat,
+    incomingTrackId: incomingPlayer().trackId,
+    nextId: peekNextId({ wrap: state.repeat === "all" }),
+    lyricsTrackId: currentTrack()?.id ?? null,
+    listenOccurrenceIds: players
+      .map((player) => player.listenOccurrence && !player.listenOccurrence.finalized
+        ? player.trackId
+        : null)
+      .filter(Boolean)
+  }) ?? null;
+
+  audioGraphReady = false;
+  audioContext = null;
+  masterGain = null;
+  eqPreamp = null;
+  eqFilters = [];
+  eqReady = false;
+  peakCompressor = null;
+  peakDryGain = null;
+  peakWetGain = null;
+
+  const saved = players.map((player) => ({
+    trackId: player.trackId,
+    fade: player.fade,
+    normalize: player.normalize,
+    listenOccurrence: player.listenOccurrence,
+    currentTime: player.el.currentTime,
+    src: player.el.getAttribute("src")
+  }));
+
+  // Replace elements so MediaElementSources can be created again; preserve listen occurrences.
+  players.forEach((_, index) => {
+    const replacement = createAudioPlayer();
+    replacement.fade = saved[index].fade;
+    replacement.normalize = saved[index].normalize;
+    replacement.trackId = saved[index].trackId;
+    replacement.listenOccurrence = saved[index].listenOccurrence;
+    players[index] = replacement;
+  });
+
+  playbackElementBindGeneration = GraphRecovery?.nextBindGeneration?.(playbackElementBindGeneration)
+    ?? (playbackElementBindGeneration + 1);
+  ensureAudioGraph();
+  players.forEach(bindPlaybackElement);
+
+  saved.forEach((entry, index) => {
+    const player = players[index];
+    if (!entry.src || !entry.trackId) {
+      return;
+    }
+    const track = trackById(entry.trackId);
+    if (!track) {
+      return;
+    }
+    player.el.src = track.url;
+    player.trackId = track.id;
+    player.fade = entry.fade;
+    applyReplayGain(player);
+    const seekTo = snapshot && index === currentPlayerIndex
+      ? snapshot.position
+      : entry.currentTime;
+    if (Number.isFinite(seekTo) && seekTo > 0) {
+      try {
+        player.el.currentTime = seekTo;
+      } catch {
+        // Ignore seek failures during recovery.
+      }
+    }
+    if (snapshot?.playing && index === currentPlayerIndex && !isRemotePlayback()) {
+      player.el.play().catch(() => {});
+    }
+  });
+
+  const incomingId = GraphRecovery?.resolveIncomingAfterRebuild?.(snapshot);
+  if (incomingId && incomingPlayer().trackId !== incomingId) {
+    const next = trackById(incomingId);
+    if (next && (state.crossfade || state.gapless)) {
+      ensureIncomingLoaded(next);
+    }
+  }
+
+  applyVolume();
+  updateNowPlaying();
+  syncLyricsRequests();
+}
+
 function applyVolume() {
   const master = userVolumeGain();
   if (audioGraphReady && masterGain) {
+    // Direct assignment keeps crossfade rAF fades responsive.
     masterGain.gain.value = master;
     players.forEach((player) => {
-      player.gain.gain.value = playerOutputGain(player);
+      if (player.gain) {
+        player.gain.gain.value = playerOutputGain(player);
+      }
       player.el.volume = 1;
     });
     return;
@@ -6363,50 +7396,19 @@ function applyVolume() {
   });
 }
 
-function sampleRms(player) {
-  if (!player.analyser) {
-    return 0;
+function applyReplayGain(player) {
+  if (!player) {
+    return;
   }
-  const buffer = new Float32Array(player.analyser.fftSize);
-  player.analyser.getFloatTimeDomainData(buffer);
-  let sum = 0;
-  for (let i = 0; i < buffer.length; i += 1) {
-    sum += buffer[i] * buffer[i];
+  if (!player.trackId || !state.normalizeVolume) {
+    player.normalize = 1;
+    return;
   }
-  return Math.sqrt(sum / buffer.length);
+  player.normalize = computePlayerNormalizeGain(player);
 }
 
 function applyCachedNormalize(player) {
-  if (!player.trackId) {
-    player.normalize = 1;
-    return;
-  }
-  if (!state.normalizeVolume) {
-    player.normalize = 1;
-    return;
-  }
-  if (normalizeCache.has(player.trackId)) {
-    player.normalize = normalizeCache.get(player.trackId);
-  }
-}
-
-function refreshNormalize(player) {
-  if (!state.normalizeVolume || !player.trackId || !audioGraphReady) {
-    return;
-  }
-  if (normalizeCache.has(player.trackId)) {
-    player.normalize = normalizeCache.get(player.trackId);
-    applyVolume();
-    return;
-  }
-  const rms = sampleRms(player);
-  if (rms < 0.008) {
-    return;
-  }
-  const gain = clamp(NORMALIZE_TARGET_RMS / rms, NORMALIZE_MIN_GAIN, NORMALIZE_MAX_GAIN);
-  normalizeCache.set(player.trackId, gain);
-  player.normalize = gain;
-  applyVolume();
+  applyReplayGain(player);
 }
 
 function stopPlayer(player) {
@@ -6432,6 +7434,7 @@ function finishIncoming() {
 }
 
 function cancelTransition() {
+  transitionGeneration += 1;
   if (fadeRaf) {
     cancelAnimationFrame(fadeRaf);
     fadeRaf = 0;
@@ -6474,29 +7477,55 @@ function advanceQueueTo(trackId) {
 function ensureIncomingLoaded(track) {
   const incoming = incomingPlayer();
   if (incoming.trackId === track.id && incoming.el.src) {
-    applyCachedNormalize(incoming);
+    applyReplayGain(incoming);
     return;
   }
   loadPlayer(incoming, track, { fade: 0 });
 }
 
+function invalidateIncomingPreload() {
+  preloadGeneration += 1;
+  if (playbackTransitioning) {
+    return;
+  }
+  const nextId = (state.crossfade || state.gapless) && state.repeat !== "one"
+    ? peekNextId({ wrap: state.repeat === "all" })
+    : null;
+  const incoming = incomingPlayer();
+  if (!Transitions?.isIncomingPreloadValid?.(incoming.trackId, nextId)) {
+    if (incoming.trackId) {
+      stopPlayer(incoming);
+    }
+  }
+  if (nextId && (state.crossfade || state.gapless)) {
+    maybePreloadNext();
+  }
+}
+
 function maybePreloadNext() {
-  if (isRemotePlayback() || isConnectingPlayback() || playbackTransitioning || state.repeat === "one") {
-    return;
-  }
-  if (!state.crossfade && !state.gapless) {
-    return;
-  }
   const el = currentAudio();
   const duration = el.duration || currentTrack()?.duration || 0;
-  if (!duration || duration - el.currentTime > PRELOAD_SECONDS) {
+  const remaining = duration ? duration - el.currentTime : Number.POSITIVE_INFINITY;
+  const allowed = Transitions?.shouldPreloadNext?.({
+    remote: isRemotePlayback(),
+    connecting: isConnectingPlayback(),
+    transitioning: playbackTransitioning,
+    repeatOne: state.repeat === "one",
+    crossfade: state.crossfade,
+    gapless: state.gapless,
+    remainingSeconds: remaining,
+    crossfadeSeconds: state.crossfadeSeconds
+  });
+  if (!allowed) {
     return;
   }
+  const generation = preloadGeneration;
   const nextId = peekNextId({ wrap: state.repeat === "all" });
   const next = trackById(nextId);
-  if (next) {
-    ensureIncomingLoaded(next);
+  if (!next || generation !== preloadGeneration) {
+    return;
   }
+  ensureIncomingLoaded(next);
 }
 
 function recordCurrentRecent() {
@@ -6508,6 +7537,11 @@ function recordCurrentRecent() {
   recordRecentTrack(track.id);
 }
 
+function incomingReadyForTransition(player) {
+  // HAVE_CURRENT_DATA === 2
+  return Boolean(player?.el?.src) && player.el.readyState >= 2;
+}
+
 async function startCrossfade(nextId) {
   if (playbackTransitioning) {
     return;
@@ -6517,6 +7551,7 @@ async function startCrossfade(nextId) {
     return;
   }
 
+  const generation = ++transitionGeneration;
   playbackTransitioning = true;
   ensureAudioGraph();
   const incoming = incomingPlayer();
@@ -6524,20 +7559,52 @@ async function startCrossfade(nextId) {
   incoming.fade = 0;
   applyVolume();
 
+  if (!incomingReadyForTransition(incoming)) {
+    try {
+      await new Promise((resolve, reject) => {
+        const onReady = () => {
+          cleanup();
+          resolve();
+        };
+        const onError = () => {
+          cleanup();
+          reject(new Error("incoming load failed"));
+        };
+        const cleanup = () => {
+          incoming.el.removeEventListener("canplay", onReady);
+          incoming.el.removeEventListener("error", onError);
+        };
+        incoming.el.addEventListener("canplay", onReady, { once: true });
+        incoming.el.addEventListener("error", onError, { once: true });
+      });
+    } catch {
+      if (generation !== transitionGeneration) {
+        return;
+      }
+      playbackTransitioning = false;
+      playTrack(nextId, null, { keepBag: true });
+      return;
+    }
+  }
+
   try {
     await incoming.el.play();
   } catch {
+    if (generation !== transitionGeneration) {
+      return;
+    }
     playbackTransitioning = false;
     playTrack(nextId, null, { keepBag: true });
     return;
   }
 
-  if (!playbackTransitioning) {
+  if (generation !== transitionGeneration || !playbackTransitioning) {
     return;
   }
 
-  const remaining = Math.max(0.5, (currentAudio().duration || CROSSFADE_SECONDS) - currentAudio().currentTime);
-  fadeDurationMs = Math.min(CROSSFADE_SECONDS, remaining) * 1000;
+  const remaining = (currentAudio().duration || state.crossfadeSeconds) - currentAudio().currentTime;
+  fadeDurationMs = Transitions?.crossfadeDurationMs?.(state.crossfadeSeconds, remaining)
+    ?? Math.min(state.crossfadeSeconds, Math.max(0.5, remaining)) * 1000;
   advanceQueueTo(nextId);
   swapPlayers();
   recordCurrentRecent();
@@ -6552,6 +7619,9 @@ async function startCrossfade(nextId) {
   applyVolume();
 
   const step = (now) => {
+    if (generation !== transitionGeneration) {
+      return;
+    }
     if (state.playing) {
       fadeElapsed += now - lastTick;
     }
@@ -6564,7 +7634,7 @@ async function startCrossfade(nextId) {
       fadeRaf = requestAnimationFrame(step);
       return;
     }
-    if (playbackTransitioning) {
+    if (playbackTransitioning && generation === transitionGeneration) {
       finishIncoming();
     }
   };
@@ -6580,6 +7650,7 @@ async function startGapless(nextId) {
     return;
   }
 
+  const generation = ++transitionGeneration;
   playbackTransitioning = true;
   ensureAudioGraph();
   const incoming = incomingPlayer();
@@ -6587,15 +7658,46 @@ async function startGapless(nextId) {
   incoming.fade = 1;
   applyVolume();
 
+  if (!incomingReadyForTransition(incoming)) {
+    try {
+      await new Promise((resolve, reject) => {
+        const onReady = () => {
+          cleanup();
+          resolve();
+        };
+        const onError = () => {
+          cleanup();
+          reject(new Error("incoming load failed"));
+        };
+        const cleanup = () => {
+          incoming.el.removeEventListener("canplay", onReady);
+          incoming.el.removeEventListener("error", onError);
+        };
+        incoming.el.addEventListener("canplay", onReady, { once: true });
+        incoming.el.addEventListener("error", onError, { once: true });
+      });
+    } catch {
+      if (generation !== transitionGeneration) {
+        return;
+      }
+      playbackTransitioning = false;
+      playTrack(nextId, null, { keepBag: true });
+      return;
+    }
+  }
+
   try {
     await incoming.el.play();
   } catch {
+    if (generation !== transitionGeneration) {
+      return;
+    }
     playbackTransitioning = false;
     playTrack(nextId, null, { keepBag: true });
     return;
   }
 
-  if (!playbackTransitioning) {
+  if (generation !== transitionGeneration || !playbackTransitioning) {
     return;
   }
 
@@ -6623,28 +7725,26 @@ function maybeStartAutoAdvance() {
   if (!nextId) {
     return;
   }
-  if (state.crossfade && remaining <= CROSSFADE_SECONDS && remaining > 0.05) {
+  if (state.crossfade && Transitions?.shouldStartCrossfade?.(remaining, state.crossfadeSeconds)) {
     startCrossfade(nextId);
     return;
   }
-  if (state.gapless && remaining <= GAPLESS_LEAD_SECONDS) {
+  if (state.gapless && Transitions?.shouldStartGapless?.(remaining, GAPLESS_LEAD_SECONDS)) {
     startGapless(nextId);
   }
 }
 
 function applyPlaybackSettings() {
-  applyCachedNormalize(currentPlayer());
-  applyCachedNormalize(incomingPlayer());
-  if (!state.normalizeVolume) {
-    currentPlayer().normalize = 1;
-    incomingPlayer().normalize = 1;
-  }
+  applyReplayGain(currentPlayer());
+  applyReplayGain(incomingPlayer());
+  applyPeakProtection();
   applyVolume();
 
   if (!state.crossfade && !state.gapless && !playbackTransitioning) {
     stopPlayer(incomingPlayer());
     return;
   }
+  invalidateIncomingPreload();
   maybePreloadNext();
 }
 
@@ -6652,7 +7752,8 @@ function postAppSettings() {
   window.chrome?.webview?.postMessage({
     type: "appSettings",
     startupOnLogin: state.startupOnLogin,
-    closeMinimizes: state.closeMinimizes
+    closeMinimizes: state.closeMinimizes,
+    automaticUpdateChecks: state.automaticUpdateChecks !== false
   });
 }
 
@@ -6687,8 +7788,58 @@ function applyHostAppSettings(detail) {
   if (typeof detail.closeMinimizes === "boolean") {
     state.closeMinimizes = detail.closeMinimizes;
   }
+  if (typeof detail.automaticUpdateChecks === "boolean") {
+    state.automaticUpdateChecks = detail.automaticUpdateChecks;
+  }
+  if (typeof detail.currentVersion === "string" && detail.currentVersion) {
+    state.appVersion = detail.currentVersion;
+  }
   writeSession();
   syncStartupSettingsUi();
+  syncUpdatesSettingsUi();
+}
+
+function setAutomaticUpdateChecks(value) {
+  state.automaticUpdateChecks = Boolean(value);
+  writeSession();
+  postAppSettings();
+  postUpdateAction("setAutomatic", { enabled: state.automaticUpdateChecks });
+  syncUpdatesSettingsUi();
+}
+
+function syncUpdatesSettingsUi() {
+  if (state.view !== "settings") {
+    updateSettingsNavBadge();
+    return;
+  }
+
+  const versionEl = viewArea.querySelector("[data-update-version]");
+  if (versionEl) {
+    versionEl.textContent = state.appVersion || "…";
+  }
+  const statusEl = viewArea.querySelector("[data-update-status]");
+  if (statusEl) {
+    statusEl.textContent = updateStatusCopy();
+  }
+  const autoToggle = viewArea.querySelector('[data-setting="automaticUpdateChecks"]');
+  autoToggle?.setAttribute("aria-checked", state.automaticUpdateChecks !== false ? "true" : "false");
+
+  const actionsRow = viewArea.querySelector("[data-update-actions]");
+  if (actionsRow) {
+    const status = state.updateStatus || {};
+    const actions = [];
+    if (status.state === "updateAvailable") {
+      actions.push(`<button class="eq-reset" type="button" data-update-action="download">Download Update</button>`);
+      actions.push(`<button class="eq-reset" type="button" data-update-action="dismiss">Not Now</button>`);
+    } else if (status.state === "ready") {
+      actions.push(`<button class="eq-reset" type="button" data-update-action="restartAndUpdate">Restart and Update</button>`);
+      actions.push(`<button class="eq-reset" type="button" data-update-action="dismiss">Later</button>`);
+    } else if (status.state !== "checking" && status.state !== "downloading" && status.state !== "installing") {
+      actions.push(`<button class="eq-reset" type="button" data-update-action="check">Check for Updates</button>`);
+    }
+    actionsRow.innerHTML = actions.join("\n        ");
+  }
+  updateSettingsNavBadge();
 }
 
 function setStartupOnLogin(value) {
@@ -6706,17 +7857,59 @@ function setCloseMinimizes(value) {
 }
 
 function setPlaybackSetting(key, value) {
-  state[key] = Boolean(value);
+  const needsSettingsRerender = key === "crossfade"
+    || key === "gapless"
+    || key === "normalizeVolume"
+    || key === "normalizeMode";
+
+  if (key === "crossfade" || key === "gapless") {
+    const next = Transitions?.applyTransitionExclusivity?.(key, value, state)
+      ?? { crossfade: key === "crossfade" ? Boolean(value) : state.crossfade, gapless: key === "gapless" ? Boolean(value) : state.gapless };
+    state.crossfade = next.crossfade;
+    state.gapless = next.gapless;
+  } else if (key === "normalizeMode") {
+    state.normalizeMode = ReplayGain?.normalizeMode?.(value) || "track";
+  } else if (key === "crossfadeSeconds") {
+    state.crossfadeSeconds = clampCrossfadeSeconds(value);
+  } else if (key === "audioOutputId") {
+    state.audioOutputId = typeof value === "string" ? value : "";
+    if (!state.audioOutputId) {
+      state.audioOutputLabel = "";
+    } else if (!state.audioOutputLabel) {
+      const match = audioOutputDevices.find((device) => device.deviceId === state.audioOutputId);
+      state.audioOutputLabel = match && String(match.label || "").trim() ? match.label.trim() : "";
+    }
+    applyAudioOutputDevice();
+  } else {
+    state[key] = Boolean(value);
+  }
+
   writeSession();
   if (key === "equalizerEnabled") {
     applyEqualizer();
-  } else {
+  } else if (key === "preventClipping") {
+    applyPeakProtection();
+  } else if (key !== "audioOutputId") {
     applyPlaybackSettings();
   }
+
   if (state.view === "settings") {
-    const toggle = viewArea.querySelector(`[data-setting="${key}"]`);
-    if (toggle) {
-      toggle.setAttribute("aria-checked", state[key] ? "true" : "false");
+    if (needsSettingsRerender) {
+      renderSettings();
+      const durationSlider = viewArea.querySelector("[data-crossfade-seconds]");
+      if (durationSlider) {
+        updateSlider(durationSlider);
+      }
+    } else if (key === "crossfadeSeconds") {
+      const label = viewArea.querySelector("[data-crossfade-seconds-label]");
+      if (label) {
+        label.textContent = `${state.crossfadeSeconds} sec`;
+      }
+    } else {
+      const toggle = viewArea.querySelector(`[data-setting="${key}"]`);
+      if (toggle) {
+        toggle.setAttribute("aria-checked", state[key] ? "true" : "false");
+      }
     }
   }
 }
@@ -6760,6 +7953,8 @@ function postNowPlaying() {
     title: track?.title ?? "",
     artist: track?.artist ?? "",
     album: track?.album ?? "",
+    trackId: track?.id ?? null,
+    nextTrackId: nextCastTrackId(),
     playing: Boolean(track && state.playing),
     coverUrl: track?.coverUrl ?? "",
     mediaHosts: activeMediaHosts()
@@ -6862,6 +8057,7 @@ async function playTrack(id, queueIds, options = {}) {
     const index = state.queue.indexOf(id);
     state.index = index >= 0 ? index : 0;
   }
+  invalidateIncomingPreload();
 
   const track = currentTrack();
   if (!track) {
@@ -7106,7 +8302,7 @@ function updatePlaylistDetails(playlistId, name, description) {
   refreshAfterPlaylistChange(playlist.id);
 }
 
-function collectionActionsMarkup(label, playAttrs, { more = false } = {}) {
+function collectionActionsMarkup(label, playAttrs, { more = false, albumMore = false } = {}) {
   return `
     <div class="album-actions">
       <button class="play-fab-lg" type="button" ${playAttrs} aria-label="Play ${escapeHtml(label)}">
@@ -7117,6 +8313,11 @@ function collectionActionsMarkup(label, playAttrs, { more = false } = {}) {
       </button>
       ${more ? `
         <button class="collection-more" type="button" data-playlist-more aria-label="More options" title="More">
+          <i class="bi bi-three-dots"></i>
+        </button>
+      ` : ""}
+      ${albumMore ? `
+        <button class="collection-more" type="button" data-album-more aria-label="More options" title="More">
           <i class="bi bi-three-dots"></i>
         </button>
       ` : ""}
@@ -7336,6 +8537,7 @@ function openNowPlayingArtist() {
 function cycleRepeat() {
   const index = REPEAT_MODES.indexOf(state.repeat);
   state.repeat = REPEAT_MODES[(index + 1) % REPEAT_MODES.length];
+  invalidateIncomingPreload();
   updateNowPlaying();
   writeSession();
 }
@@ -7451,6 +8653,10 @@ function bindLibrary(library) {
     }
   }
 
+  if (!failed && !unchanged) {
+    scheduleSmartReevaluation({ metadata: true, dateRelative: true });
+  }
+
   // While the button animates, only its own library message may re-render the view.
   if (matched && busy) {
     finishRescan(button, failed);
@@ -7486,14 +8692,58 @@ function isTypingTarget(target) {
 let contextRoot = null;
 const contextMenuState = {
   trackId: null,
+  trackIds: [],
   playlistId: null,
   naming: false,
   query: ""
 };
 
+const trackSelection = {
+  ids: new Set(),
+  anchorId: null
+};
+
+function clearTrackSelection() {
+  trackSelection.ids.clear();
+  trackSelection.anchorId = null;
+  document.querySelectorAll(".track-row.selected").forEach((row) => row.classList.remove("selected"));
+}
+
+function visibleTrackIdsInView() {
+  return [...document.querySelectorAll(".track-row[data-play-id]")]
+    .map((row) => row.dataset.playId)
+    .filter(Boolean);
+}
+
+function syncTrackSelectionClasses() {
+  document.querySelectorAll(".track-row[data-play-id]").forEach((row) => {
+    row.classList.toggle("selected", trackSelection.ids.has(row.dataset.playId));
+  });
+}
+
+function selectTrackRange(toId) {
+  const ids = visibleTrackIdsInView();
+  const anchor = trackSelection.anchorId && ids.includes(trackSelection.anchorId)
+    ? trackSelection.anchorId
+    : toId;
+  const from = ids.indexOf(anchor);
+  const to = ids.indexOf(toId);
+  if (from < 0 || to < 0) {
+    trackSelection.ids = new Set([toId]);
+    trackSelection.anchorId = toId;
+    syncTrackSelectionClasses();
+    return;
+  }
+  const start = Math.min(from, to);
+  const end = Math.max(from, to);
+  trackSelection.ids = new Set(ids.slice(start, end + 1));
+  syncTrackSelectionClasses();
+}
+
 function closeContextMenu() {
   if (!contextRoot || contextRoot.hidden) {
     contextMenuState.trackId = null;
+    contextMenuState.trackIds = [];
     contextMenuState.playlistId = null;
     contextMenuState.naming = false;
     contextMenuState.query = "";
@@ -7506,6 +8756,7 @@ function closeContextMenu() {
     submenu.hidden = true;
   }
   contextMenuState.trackId = null;
+  contextMenuState.trackIds = [];
   contextMenuState.playlistId = null;
   contextMenuState.naming = false;
   contextMenuState.query = "";
@@ -7559,9 +8810,33 @@ function ensureOverflowRoot() {
         <i class="bi bi-pencil"></i>
         <span>Name &amp; details</span>
       </button>
+      <button class="ctx-item" type="button" data-smart-edit-rules hidden>
+        <i class="bi bi-funnel"></i>
+        <span>Edit Rules</span>
+      </button>
+      <button class="ctx-item" type="button" data-smart-refresh hidden>
+        <i class="bi bi-arrow-clockwise"></i>
+        <span>Refresh Matches</span>
+      </button>
+      <button class="ctx-item" type="button" data-smart-reshuffle hidden>
+        <i class="bi bi-shuffle"></i>
+        <span>Reshuffle</span>
+      </button>
+      <button class="ctx-item" type="button" data-smart-duplicate hidden>
+        <i class="bi bi-copy"></i>
+        <span>Duplicate</span>
+      </button>
+      <button class="ctx-item" type="button" data-smart-convert hidden>
+        <i class="bi bi-music-note-list"></i>
+        <span>Convert to Regular Playlist</span>
+      </button>
       <button class="ctx-item ctx-item-danger" type="button" data-playlist-delete>
         <i class="bi bi-trash3"></i>
         <span>Delete Playlist</span>
+      </button>
+      <button class="ctx-item" type="button" data-album-edit-meta hidden>
+        <i class="bi bi-pencil-square"></i>
+        <span>Edit Album Metadata</span>
       </button>
     </div>
   `;
@@ -7576,9 +8851,47 @@ function ensureOverflowRoot() {
       closeOverflowMenu();
       openPlaylistDetailsModal();
     }
+    if (event.target.closest("[data-smart-edit-rules]")) {
+      closeOverflowMenu();
+      openSmartPlaylistEditorEdit(state.playlistId);
+    }
+    if (event.target.closest("[data-smart-refresh]")) {
+      closeOverflowMenu();
+      smartMatchCache.delete(state.playlistId);
+      refreshAfterPlaylistChange(state.playlistId);
+    }
+    if (event.target.closest("[data-smart-reshuffle]")) {
+      closeOverflowMenu();
+      reshuffleSmartPlaylist(state.playlistId);
+    }
+    if (event.target.closest("[data-smart-duplicate]")) {
+      closeOverflowMenu();
+      const copy = duplicateSmartPlaylist(state.playlistId);
+      if (copy) {
+        state.recentsFilter = "playlists";
+        syncRecentsChips();
+        navigate({ view: "playlist", playlistId: copy.id });
+      }
+    }
+    if (event.target.closest("[data-smart-convert]")) {
+      closeOverflowMenu();
+      const converted = convertSmartPlaylistToRegular(state.playlistId);
+      if (converted) {
+        state.recentsFilter = "playlists";
+        syncRecentsChips();
+        navigate({ view: "playlist", playlistId: converted.id });
+      }
+    }
     if (event.target.closest("[data-playlist-delete]")) {
       closeOverflowMenu();
       openDeletePlaylistModal();
+    }
+    if (event.target.closest("[data-album-edit-meta]")) {
+      closeOverflowMenu();
+      const album = albumById(state.albumId);
+      if (album?.trackIds?.length) {
+        window.EmpMetadataEditor?.open(album.trackIds);
+      }
     }
   });
   overflowRoot.addEventListener("contextmenu", (event) => {
@@ -7588,13 +8901,32 @@ function ensureOverflowRoot() {
   return overflowRoot;
 }
 
-function openOverflowMenu(anchor) {
+function openOverflowMenu(anchor, { album = false } = {}) {
   closeContextMenu();
   const root = ensureOverflowRoot();
   const deleteBtn = root.querySelector("[data-playlist-delete]");
+  const editBtn = root.querySelector("[data-playlist-edit]");
+  const albumEditBtn = root.querySelector("[data-album-edit-meta]");
   const playlist = playlistById(state.playlistId);
+  const smart = !album && isSmartPlaylist(playlist);
+  if (editBtn) {
+    editBtn.hidden = album;
+  }
   if (deleteBtn) {
-    deleteBtn.hidden = !!(playlist && isLikedPlaylist(playlist));
+    deleteBtn.hidden = album || !!(playlist && isLikedPlaylist(playlist));
+  }
+  if (albumEditBtn) {
+    albumEditBtn.hidden = !album;
+  }
+  root.querySelector("[data-smart-edit-rules]").hidden = !smart;
+  root.querySelector("[data-smart-refresh]").hidden = !smart;
+  root.querySelector("[data-smart-duplicate]").hidden = !smart;
+  root.querySelector("[data-smart-convert]").hidden = !smart;
+  root.querySelector("[data-smart-reshuffle]").hidden = !(smart && playlist?.smart?.sort?.field === "random");
+  if (deleteBtn && smart) {
+    deleteBtn.querySelector("span").textContent = "Delete Smart Playlist";
+  } else if (deleteBtn) {
+    deleteBtn.querySelector("span").textContent = "Delete Playlist";
   }
   root.hidden = false;
   positionOverflowMenu(anchor);
@@ -7730,6 +9062,7 @@ function closeDeleteModal() {
 }
 
 function deletePlaylist(playlistId) {
+  smartMatchCache.delete(playlistId);
   state.playlists = state.playlists.filter((p) => p.id !== playlistId);
   writeSession();
   renderLibraryList();
@@ -7875,6 +9208,19 @@ function bindContextRoot(root) {
       return;
     }
 
+    if (event.target.closest("[data-ctx-edit-meta]")) {
+      const ids = contextMenuState.trackIds?.length
+        ? contextMenuState.trackIds
+        : contextMenuState.trackId
+          ? [contextMenuState.trackId]
+          : [];
+      closeContextMenu();
+      if (ids.length) {
+        window.EmpMetadataEditor?.open(ids);
+      }
+      return;
+    }
+
     if (event.target.closest("[data-ctx-add]")) {
       openContextSubmenu();
       return;
@@ -7939,6 +9285,10 @@ function ensureContextRoot() {
   contextRoot.hidden = true;
   contextRoot.innerHTML = `
     <div class="ctx-menu" role="menu">
+      <button class="ctx-item" type="button" data-ctx-edit-meta>
+        <i class="bi bi-pencil-square"></i>
+        <span data-ctx-edit-meta-label>Edit Metadata</span>
+      </button>
       <button class="ctx-item has-sub" type="button" data-ctx-add>
         <i class="bi bi-plus-lg"></i>
         <span>Add to playlist</span>
@@ -7983,6 +9333,7 @@ function updateContextPlaylistActions() {
   const actions = contextRoot?.querySelector("[data-ctx-playlist-actions]");
   const likeBtn = contextRoot?.querySelector("[data-ctx-like]");
   const likeLabel = contextRoot?.querySelector("[data-ctx-like-label]");
+  const removeBtn = contextRoot?.querySelector("[data-ctx-remove]");
   const playlistMode = Boolean(contextMenuState.playlistId);
   if (actions) {
     actions.hidden = !playlistMode;
@@ -7991,7 +9342,17 @@ function updateContextPlaylistActions() {
     return;
   }
 
-  const onLikedPlaylist = isLikedPlaylist(playlistById(contextMenuState.playlistId));
+  const currentPlaylist = playlistById(contextMenuState.playlistId);
+  const onLikedPlaylist = isLikedPlaylist(currentPlaylist);
+  const onSmartPlaylist = isSmartPlaylist(currentPlaylist);
+  if (removeBtn) {
+    removeBtn.hidden = onSmartPlaylist;
+    if (onSmartPlaylist) {
+      removeBtn.title = "Smart Playlist membership is controlled by rules";
+    } else {
+      removeBtn.removeAttribute("title");
+    }
+  }
   likeBtn.hidden = onLikedPlaylist;
   const liked = state.liked.has(contextMenuState.trackId);
   likeLabel.textContent = liked ? "Remove from your Liked Songs" : "Save to your Liked Songs";
@@ -8000,9 +9361,19 @@ function updateContextPlaylistActions() {
 function openContextMenu(trackId, x, y) {
   closeOverflowMenu();
   const root = ensureContextRoot();
+  const selected = trackSelection.ids.has(trackId) && trackSelection.ids.size > 1
+    ? [...trackSelection.ids]
+    : [trackId];
   contextMenuState.trackId = trackId;
+  contextMenuState.trackIds = selected;
   contextMenuState.playlistId = state.view === "playlist" ? state.playlistId : null;
   updateContextPlaylistActions();
+  const editLabel = root.querySelector("[data-ctx-edit-meta-label]");
+  if (editLabel) {
+    editLabel.textContent = selected.length > 1
+      ? `Edit Metadata (${selected.length} songs)`
+      : "Edit Metadata";
+  }
   root.hidden = false;
   root.querySelector(".ctx-submenu").hidden = true;
   resetContextSubmenu();
@@ -8042,6 +9413,7 @@ document.body.addEventListener("click", (event) => {
   const recentsFilterButton = event.target.closest("[data-recents-filter]");
   const settingButton = event.target.closest("[data-setting]");
   const playlistMoreButton = event.target.closest("[data-playlist-more]");
+  const albumMoreButton = event.target.closest("[data-album-more]");
   const collectionShuffleButton = event.target.closest("[data-collection-shuffle]");
   const playPlaylistButton = event.target.closest("[data-play-playlist]");
   const playlistButton = event.target.closest("[data-open-playlist]");
@@ -8185,6 +9557,7 @@ document.body.addEventListener("click", (event) => {
     }
     const open = menu.hidden;
     closeSongsSortMenu();
+    closeAudioOutputMenu();
     if (open) {
       wrap.classList.add("is-open");
       menu.hidden = false;
@@ -8207,16 +9580,75 @@ document.body.addEventListener("click", (event) => {
     clearSearchHistoryIdleCommit();
   }
 
+  const normalizeModeButton = event.target.closest("[data-normalize-mode]");
+  if (normalizeModeButton) {
+    event.preventDefault();
+    setPlaybackSetting("normalizeMode", normalizeModeButton.dataset.normalizeMode);
+    return;
+  }
+
+  const audioOutputToggle = event.target.closest("[data-audio-output-toggle]");
+  if (audioOutputToggle) {
+    event.preventDefault();
+    const wrap = audioOutputToggle.closest(".settings-audio-output-wrap");
+    const menu = wrap?.querySelector(".songs-sort-menu");
+    const open = menu && menu.hidden;
+    closeAudioOutputMenu();
+    closeEqPresetMenu();
+    closeSongsSortMenu();
+    if (open && menu) {
+      menu.hidden = false;
+      audioOutputToggle.setAttribute("aria-expanded", "true");
+      wrap.classList.add("is-open");
+    }
+    return;
+  }
+
+  const audioOutputPick = event.target.closest("[data-audio-output-pick]");
+  if (audioOutputPick) {
+    event.preventDefault();
+    closeAudioOutputMenu();
+    pickAudioOutputDevice();
+    return;
+  }
+
+  const audioOutputItem = event.target.closest("[data-audio-output]");
+  if (audioOutputItem && audioOutputItem.closest(".settings-audio-output-wrap")) {
+    event.preventDefault();
+    const deviceId = audioOutputItem.dataset.audioOutput ?? "";
+    const label = audioOutputItem.querySelector("span")?.textContent?.trim() || "";
+    state.audioOutputLabel = deviceId ? label : "";
+    setPlaybackSetting("audioOutputId", deviceId);
+    closeAudioOutputMenu();
+    if (state.view === "settings") {
+      renderSettings();
+    }
+    return;
+  }
+
+  if (!event.target.closest(".settings-audio-output-wrap")) {
+    closeAudioOutputMenu();
+  }
+
   if (settingButton) {
     event.preventDefault();
     const key = settingButton.dataset.setting;
-    if (key === "crossfade" || key === "gapless" || key === "normalizeVolume" || key === "equalizerEnabled") {
+    if (key === "crossfade" || key === "gapless" || key === "normalizeVolume" || key === "equalizerEnabled" || key === "preventClipping") {
       setPlaybackSetting(key, !state[key]);
     } else if (key === "personalizedMixes") {
       setPersonalizedMixes(state.personalizedMixes === false);
     } else if (key === "closeMinimizes") {
       setCloseMinimizes(!state.closeMinimizes);
+    } else if (key === "automaticUpdateChecks") {
+      setAutomaticUpdateChecks(!(state.automaticUpdateChecks !== false));
     }
+    return;
+  }
+
+  const updateActionButton = event.target.closest("[data-update-action]");
+  if (updateActionButton) {
+    event.preventDefault();
+    postUpdateAction(updateActionButton.dataset.updateAction);
     return;
   }
 
@@ -8251,6 +9683,7 @@ document.body.addEventListener("click", (event) => {
     const menu = wrap?.querySelector(".eq-preset-menu");
     const open = menu && menu.hidden;
     closeEqPresetMenu();
+    closeAudioOutputMenu();
     if (open && menu) {
       menu.hidden = false;
       menuToggle.setAttribute("aria-expanded", "true");
@@ -8295,6 +9728,12 @@ document.body.addEventListener("click", (event) => {
     return;
   }
 
+  if (event.target.closest("[data-smart-edit-rules]")) {
+    event.preventDefault();
+    openSmartPlaylistEditorEdit(state.playlistId);
+    return;
+  }
+
   if (playlistMoreButton) {
     event.preventDefault();
     event.stopPropagation();
@@ -8302,6 +9741,17 @@ document.body.addEventListener("click", (event) => {
       closeOverflowMenu();
     } else {
       openOverflowMenu(playlistMoreButton);
+    }
+    return;
+  }
+
+  if (albumMoreButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (overflowRoot && !overflowRoot.hidden) {
+      closeOverflowMenu();
+    } else {
+      openOverflowMenu(albumMoreButton, { album: true });
     }
     return;
   }
@@ -8325,6 +9775,7 @@ document.body.addEventListener("click", (event) => {
     } else {
       playPlaylist(playlistId);
     }
+    blurHomePlayControl(playPlaylistButton);
     return;
   }
 
@@ -8349,6 +9800,7 @@ document.body.addEventListener("click", (event) => {
     } else {
       playMix(mixId);
     }
+    blurHomePlayControl(playMixButton);
     return;
   }
 
@@ -8371,6 +9823,7 @@ document.body.addEventListener("click", (event) => {
     } else {
       playAlbum(albumId);
     }
+    blurHomePlayControl(playAlbumButton);
     return;
   }
 
@@ -8385,6 +9838,7 @@ document.body.addEventListener("click", (event) => {
     } else {
       playArtist(artistName);
     }
+    blurHomePlayControl(playArtistButton);
     return;
   }
 
@@ -8402,6 +9856,28 @@ document.body.addEventListener("click", (event) => {
 
   if (playButton) {
     const id = playButton.dataset.playId;
+    const row = playButton.closest(".track-row");
+    if (row && id && (event.ctrlKey || event.metaKey || event.shiftKey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.shiftKey) {
+        selectTrackRange(id);
+      } else if (trackSelection.ids.has(id)) {
+        trackSelection.ids.delete(id);
+        trackSelection.anchorId = id;
+        syncTrackSelectionClasses();
+      } else {
+        trackSelection.ids.add(id);
+        trackSelection.anchorId = id;
+        syncTrackSelectionClasses();
+      }
+      return;
+    }
+    if (id && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+      trackSelection.ids = new Set([id]);
+      trackSelection.anchorId = id;
+      syncTrackSelectionClasses();
+    }
     const album = albumById(state.albumId);
     const playlist = playlistById(state.playlistId);
     let queue;
@@ -8414,7 +9890,7 @@ document.body.addEventListener("click", (event) => {
       source = { kind: "album", id: album.id };
     } else if (state.view === "playlist" && playlist) {
       queue = playlistTracks(playlist).map((track) => track.id);
-      source = { kind: "playlist", id: playlist.id };
+      source = { kind: isSmartPlaylist(playlist) ? "smart" : "playlist", id: playlist.id };
       recordRecentPlaylist(playlist.id);
     } else if (state.view === "mix" && state.mixId) {
       queue = mixQueueIds(mixById(state.mixId));
@@ -8479,6 +9955,12 @@ document.addEventListener("contextmenu", (event) => {
     return;
   }
 
+  if (!trackSelection.ids.has(trackId)) {
+    trackSelection.ids = new Set([trackId]);
+    trackSelection.anchorId = trackId;
+    syncTrackSelectionClasses();
+  }
+
   openContextMenu(trackId, event.clientX, event.clientY);
 });
 
@@ -8514,11 +9996,99 @@ viewArea.addEventListener("click", (event) => {
 window.addEventListener("resize", () => {
   closeContextMenu();
   closeOverflowMenu();
+  closeCreateMenu();
   closeEqPresetMenu();
   updateLibraryChipsScroll();
   syncTopBarScroll();
   syncHomeLayout();
 });
+
+window.addEventListener("focus", () => {
+  ensureSmartDateRelativeFreshness();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    ensureSmartDateRelativeFreshness();
+  }
+});
+
+(function configureSmartPlaylistEditor() {
+  const editor = window.EmpSmartPlaylistEditor;
+  if (!editor) {
+    return;
+  }
+
+  let discardRoot = null;
+  function ensureDiscardModal() {
+    if (discardRoot) {
+      return discardRoot;
+    }
+    discardRoot = document.createElement("div");
+    discardRoot.className = "details-modal-root";
+    discardRoot.hidden = true;
+    discardRoot.innerHTML = `
+      <div class="details-modal delete-modal" role="dialog" aria-modal="true" aria-labelledby="smartDiscardTitle">
+        <div class="details-modal-head">
+          <h2 id="smartDiscardTitle">Discard changes?</h2>
+          <button class="details-modal-close" type="button" data-discard-close aria-label="Close">
+            <i class="bi bi-x-lg"></i>
+          </button>
+        </div>
+        <p class="delete-modal-msg">You have unsaved smart playlist changes. Discard them?</p>
+        <div class="delete-modal-foot">
+          <button class="delete-modal-cancel" type="button" data-discard-close>Keep editing</button>
+          <button class="delete-modal-confirm" type="button" data-discard-confirm>Discard</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(discardRoot);
+    discardRoot.addEventListener("click", (event) => {
+      if (event.target === discardRoot || event.target.closest("[data-discard-close]")) {
+        discardRoot.hidden = true;
+        return;
+      }
+      if (event.target.closest("[data-discard-confirm]")) {
+        discardRoot.hidden = true;
+        const proceed = discardRoot._proceed;
+        discardRoot._proceed = null;
+        proceed?.();
+      }
+    });
+    return discardRoot;
+  }
+
+  editor.configure({
+    getContext: () => smartEvalContext(),
+    escapeHtml,
+    formatDuration: (seconds) => {
+      const total = Math.max(0, Math.floor(Number(seconds) || 0));
+      const m = Math.floor(total / 60);
+      const s = String(total % 60).padStart(2, "0");
+      return `${m}:${s}`;
+    },
+    coverUrl: (track) => track?.coverUrl || albumById(track?.albumId)?.coverUrl || "",
+    onSave: ({ mode, playlistId, name, description, smart }) => {
+      if (mode === "edit" && playlistId) {
+        updateSmartPlaylist(playlistId, { name, description, smart });
+        state.recentsFilter = "playlists";
+        syncRecentsChips();
+        navigate({ view: "playlist", playlistId });
+        return;
+      }
+      const playlist = createSmartPlaylist({ name, description, smart });
+      state.recentsFilter = "playlists";
+      syncRecentsChips();
+      writeSession();
+      navigate({ view: "playlist", playlistId: playlist.id });
+    },
+    confirmDiscard: (proceed) => {
+      const root = ensureDiscardModal();
+      root._proceed = proceed;
+      root.hidden = false;
+    }
+  });
+})();
 
 new ResizeObserver(() => {
   syncHomeLayout();
@@ -8605,6 +10175,12 @@ function mountTopCollection() {
 }
 
 viewArea.addEventListener("input", (event) => {
+  const crossfadeSeconds = event.target.closest("[data-crossfade-seconds]");
+  if (crossfadeSeconds) {
+    setPlaybackSetting("crossfadeSeconds", crossfadeSeconds.value);
+    updateSlider(crossfadeSeconds);
+    return;
+  }
   const input = event.target.closest("[data-eq-band-input]");
   if (!input) {
     return;
@@ -8681,7 +10257,11 @@ document.getElementById("refreshBtn").addEventListener("click", () => {
 
 createPlaylistBtn?.addEventListener("click", (event) => {
   event.preventDefault();
-  createPlaylistFromSidebar();
+  if (createMenuRoot && !createMenuRoot.hidden) {
+    closeCreateMenu();
+    return;
+  }
+  openCreateMenu(createPlaylistBtn);
 });
 
 sidebarCollapseBtn?.addEventListener("click", (event) => {
@@ -8964,12 +10544,14 @@ muteBtn.addEventListener("click", () => {
 
 function bindPlaybackElement(player) {
   const el = player.el;
+  const bindGeneration = playbackElementBindGeneration;
   el.addEventListener("timeupdate", () => {
+    if (bindGeneration !== playbackElementBindGeneration) {
+      return;
+    }
     if (el !== currentAudio() || isRemotePlayback() || isConnectingPlayback()) {
       return;
     }
-
-    refreshNormalize(currentPlayer());
 
     if (state.seeking) {
       lastAudioTime = el.currentTime;
@@ -9012,6 +10594,9 @@ function bindPlaybackElement(player) {
   });
 
   el.addEventListener("ended", () => {
+    if (bindGeneration !== playbackElementBindGeneration) {
+      return;
+    }
     if (el !== currentAudio() || playbackTransitioning || isRemotePlayback() || isConnectingPlayback()) {
       return;
     }
@@ -9058,6 +10643,9 @@ function bindPlaybackElement(player) {
   });
 
   el.addEventListener("pause", () => {
+    if (bindGeneration !== playbackElementBindGeneration) {
+      return;
+    }
     if (el !== currentAudio() || playbackTransitioning || isRemotePlayback() || isConnectingPlayback()) {
       return;
     }
@@ -9076,6 +10664,11 @@ document.addEventListener("visibilitychange", () => {
     tickListenStats();
     postListenStatsUpdates();
     writeSession();
+    return;
+  }
+  if (state.playing && !isRemotePlayback()) {
+    ensureAudioGraph();
+    resumeAudioContext();
   }
 });
 
@@ -9086,6 +10679,21 @@ window.addEventListener("pagehide", () => {
 
 document.addEventListener("keydown", (event) => {
   if (event.code === "Escape") {
+    if (window.EmpMetadataEditor?.isOpen?.()) {
+      // Metadata editor handles Escape itself (preview back / dirty confirm).
+      return;
+    }
+    if (window.EmpSmartPlaylistEditor?.isOpen?.()) {
+      event.preventDefault();
+      window.EmpSmartPlaylistEditor.requestClose();
+      return;
+    }
+    if (createMenuRoot && !createMenuRoot.hidden) {
+      event.preventDefault();
+      closeCreateMenu();
+      createPlaylistBtn?.focus();
+      return;
+    }
     if (deviceDrawerIsOpen()) {
       event.preventDefault();
       closeDeviceDrawer();
@@ -9117,6 +10725,10 @@ document.addEventListener("keydown", (event) => {
       closeEqPresetMenu();
       return;
     }
+  }
+
+  if (window.EmpMetadataEditor?.isOpen?.()) {
+    return;
   }
 
   if (detailsModal && !detailsModal.hidden) {
@@ -9279,6 +10891,7 @@ window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.deta
 window.addEventListener("emp-lyrics", (event) => applyLyricsResult(event.detail));
 window.addEventListener("emp-storage", (event) => applyStorageUsage(event.detail));
 window.addEventListener("emp-app-settings", (event) => applyHostAppSettings(event.detail));
+window.addEventListener("emp-update-status", (event) => applyUpdateStatus(event.detail));
 window.addEventListener("emp-window-state", (event) => applyHostWindowState(event.detail));
 window.addEventListener("emp-cast", (event) => handleCastMessage(event.detail));
 window.addEventListener("emp-listen-stats", (event) => applyListenStats(event.detail));
@@ -9299,3 +10912,9 @@ updateRepeatButton();
 updateSlider(volumeBar);
 updateSlider(seekBar);
 updateDeviceButton();
+refreshAudioOutputDevices();
+if (navigator.mediaDevices?.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    refreshAudioOutputDevices();
+  });
+}
