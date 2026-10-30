@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="www/img/emp-icon-512.png" alt="EMP" width="72" height="72">
+  <img src="EMP/www/img/emp-icon-512.png" alt="EMP" width="72" height="72">
 </p>
 
 <p align="center">
-  <img src="www/img/EMP%20Music%20Player%20Showcase.png" alt="EMP — a cleaner way to listen">
+  <img src="EMP/www/img/EMP%20Music%20Player%20Showcase.png" alt="EMP — a cleaner way to listen">
 </p>
 
 <h1 align="center">EMP</h1>
@@ -24,7 +24,7 @@
   </a>
 </p>
 
-EMP combines a familiar, streaming-style interface with local playback, library management, playlists, lyrics, audio controls, and network playback — without requiring a streaming service or account.
+EMP combines a familiar, streaming-style interface with local playback, library management, playlists, smart playlists, personalized mixes, lyrics, metadata editing, audio controls, automatic updates, and network playback — without requiring a streaming service or account.
 
 ## Download
 
@@ -41,14 +41,35 @@ Download the Windows release, extract the archive, and run **EMP.exe**. No insta
 
 Add one or more music folders and EMP will organize your collection automatically. Changes to your music folders are detected as they happen, keeping your library up to date.
 
-- Albums, artists, singles, tracks, playlists, and Liked Songs
+- Albums, artists, singles, tracks, playlists, Smart Playlists, and Liked Songs
 - Dedicated Playlists library view with grid and list layouts
 - Library search with grid and list views
 - Recently played music and quick picks
-- Create, edit, and delete playlists
+- Create, edit, and delete regular playlists
 - Automatic library updates when files change
 - Optional artist information from MusicBrainz
 - Artwork-driven colors throughout the interface
+
+### Smart Playlists
+
+Build playlists that update themselves as your library and listening habits change.
+
+- Create from the sidebar **+** menu: **Create playlist** or **Create smart playlist**
+- Visual rule editor with Match all / Match any conditions and nested rule groups
+- Live matching-song preview while you edit rules
+- Conditions for metadata, play count, last played, never played, date added, favorites, and more
+- Sorting, track limits, and random order with reshuffle
+- Starting templates such as Recently Added, Never Played, Most Played, Forgotten Favorites, and Recently Played
+- Edit rules, refresh matches, duplicate, convert to a regular playlist, or delete from the playlist menu
+
+### Personalized mixes
+
+Home **Your Mixes** are generated from your library and listening activity — no account or recommendation service required.
+
+- Heavy Rotation, Rediscover, Library Discovery, and artist mixes
+- Mixes stay stable for the day across navigation and restarts
+- Appear as you build listening history
+- Optional toggle in **Settings → Personalization**
 
 ### Search
 
@@ -59,6 +80,16 @@ Find anything in your library from a polished Search experience — not just a s
 - Prominent Top result with the right play or open action
 - Relevance ranking across your local collection
 - Show more controls for large result sets
+
+### Metadata editor
+
+Edit tags and artwork without leaving EMP.
+
+- Open from a track’s context menu or an album’s **⋯ → Edit Album Metadata**
+- Edit title, artist, album artist, album, track and disc numbers, genre, year, comment, and embedded artwork
+- Batch-edit multiple selected tracks, including shared artwork and optional track renumbering
+- Preview changes before writing them to your files
+- Blocks unsafe edits for read-only files, unsupported formats, and tracks that are currently playing or casting
 
 ### Lyrics
 
@@ -76,14 +107,25 @@ Everything you'd expect from a modern desktop player, with your music playing di
 - Shuffle and repeat
 - Seek and volume controls
 - Queue drawer for now playing and upcoming tracks
-- Crossfade and gapless playback
-- Volume normalization
+- Crossfade with adjustable duration, or gapless playback
+- ReplayGain volume normalization with Track or Album mode when tags are available
+- Prevent clipping to reduce distortion from normalization and enhancements
 - Equalizer with presets
+- Choose a local audio output device when supported
 - Windows system media controls
 - Taskbar playback controls
 - Session restore for your queue, track, and playback position
 
 Supported formats include **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, and ALAC**.
+
+### Automatic updates
+
+Stay current without a separate installer workflow.
+
+- Check for updates from **Settings → Updates**, or enable automatic checks
+- New builds are discovered from GitHub Releases
+- Download and install only when you choose — EMP never updates without your consent
+- Downloads are verified before install, then EMP restarts to finish applying the update
 
 ### Connect to a device
 
@@ -97,7 +139,7 @@ Open **Connect to a device** from the player bar and choose where you want to li
 When casting, EMP serves the original audio file directly from your PC over your local network. Your music is not uploaded to a cloud service or transcoded.
 
 > [!NOTE]
-> Audio processing such as the equalizer, crossfade, and gapless playback applies to playback on this computer and is not applied when sending the original file to another device.
+> Audio processing such as the equalizer, ReplayGain, prevent clipping, crossfade, and gapless playback applies to playback on this computer and is not applied when sending the original file to another device.
 
 ## Why EMP?
 
@@ -106,36 +148,3 @@ EMP is for people who keep their own music collection but still want the experie
 There's no streaming catalog to subscribe to and no account required to listen. Choose your music folders and EMP builds the experience around your collection.
 
 **The goal is simple: make a local music library feel as polished and convenient as a modern streaming app.**
-
-## Requirements
-
-### Downloaded release
-
-- Windows 10 version 2004 or later
-- Microsoft Edge WebView2 Runtime
-
-WebView2 is included with most modern Windows installations.
-
-### Building from source
-
-- [.NET 10 SDK](https://dotnet.microsoft.com/download)
-- Microsoft Edge WebView2 Runtime
-
-Clone the repository, then run:
-
-```bash
-dotnet restore
-dotnet run --project EMP
-```
-
-### Packaging a release
-
-From the repository root:
-
-```powershell
-.\scripts\release.ps1 -Version 0.2.1
-```
-
-This publishes self-contained Windows x64 builds of EMP and EMP.Updater, assembles a flat ZIP, and writes a SHA-256 checksum file. Use `scripts/test-update.ps1` for an isolated update dry-run.
-
-EMP can check GitHub Releases from **Settings → Updates**. Updates never install without your consent.
