@@ -2,149 +2,124 @@
   <img src="EMP/www/img/emp-icon-512.png" alt="EMP" width="72" height="72">
 </p>
 
-<p align="center">
-  <img src="EMP/www/img/EMP%20Music%20Player%20Showcase.png" alt="EMP — a cleaner way to listen">
-</p>
-
 <h1 align="center">EMP</h1>
 
 <p align="center">
-  A modern Windows music player built around the music you already own.
+  A modern Windows music player built around the music you already own.<br>
+  Streaming-style experience. Local files. No account required.
 </p>
 
 <p align="center">
-  <a href="https://github.com/lazytitanz/EMP/releases/latest">
-    <img src="https://img.shields.io/github/v/release/lazytitanz/EMP?label=release" alt="Latest release">
-  </a>
+  <a href="https://github.com/lazytitanz/EMP/releases/latest"><img src="https://img.shields.io/github/v/release/lazytitanz/EMP?label=release" alt="Latest release"></a>
+  <a href="https://github.com/lazytitanz/EMP/releases"><img src="https://img.shields.io/github/downloads/lazytitanz/EMP/total?label=downloads" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D6?logo=windows&logoColor=white" alt="Windows 10+">
-  <img src="https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white" alt=".NET 10">
-  <img src="https://img.shields.io/badge/C%23-239120?logo=csharp&logoColor=white" alt="C#">
-  <a href="https://github.com/lazytitanz/EMP/commits/main">
-    <img src="https://img.shields.io/github/last-commit/lazytitanz/EMP" alt="Last commit">
-  </a>
+  <a href="https://github.com/lazytitanz/EMP/commits/main"><img src="https://img.shields.io/github/last-commit/lazytitanz/EMP" alt="Last commit"></a>
 </p>
 
-EMP combines a familiar, streaming-style interface with local playback, library management, playlists, smart playlists, personalized mixes, lyrics, metadata editing, audio controls, automatic updates, and network playback — without requiring a streaming service or account.
+<p align="center">
+  <a href="#download">Download</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#why-emp">Why EMP?</a> ·
+  <a href="#build-from-source">Build</a>
+</p>
+
+<p align="center">
+  <img src="EMP/www/img/image.png" alt="EMP screenshot">
+</p>
+
+EMP turns your personal music folders into a polished desktop listening app — library, playlists, smart playlists, personalized mixes, lyrics, metadata editing, and Cast/DLNA — without a streaming subscription or sign-in.
 
 ## Download
 
 **[Download the latest release →](https://github.com/lazytitanz/EMP/releases/latest)**
 
-Download the Windows release, extract the archive, and run **EMP.exe**. No installer is required.
+1. Download the Windows release archive
+2. Extract it anywhere
+3. Run **EMP.exe** — no installer required
+
+### Quick start
+
+1. Add one or more music folders when prompted (or later in **Settings**)
+2. Wait for EMP to scan and organize your library
+3. Play from Home, Search, or your library — then build playlists and mixes as you go
 
 > [!NOTE]
-> EMP is currently in early development. You may encounter bugs or unfinished features.
+> EMP is in early development and improving quickly. You may hit rough edges — bug reports via [Issues](https://github.com/lazytitanz/EMP/issues) are welcome.
 
 ## Features
 
-### Your music library
+| | What you get |
+|---|---|
+| **Your library** | Albums, artists, singles, playlists, Liked Songs — scanned from your folders and kept up to date as files change |
+| **Smart playlists** | Rule-based playlists with live preview, templates, sorting, and limits |
+| **Your Mixes** | Heavy Rotation, Rediscover, Library Discovery, and artist mixes from your listening history — no recommendation service |
+| **Search** | Dedicated search with top result, ranked matches, and browse shortcuts |
+| **Playback** | Queue, shuffle/repeat, crossfade or gapless, ReplayGain, equalizer, output device, Windows media & taskbar controls |
+| **Lyrics** | Synced lyrics with active-line highlighting, plain lyrics fallback, and local caching |
+| **Metadata** | Edit tags and artwork in-app, including batch edits with preview |
+| **Connect** | Google Cast and DLNA/UPnP — original files streamed from your PC on the local network |
+| **Updates** | Optional checks from GitHub Releases; you choose when to install |
 
-Add one or more music folders and EMP will organize your collection automatically. Changes to your music folders are detected as they happen, keeping your library up to date.
+Supported formats: **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, ALAC**.
 
-- Albums, artists, singles, tracks, playlists, Smart Playlists, and Liked Songs
-- Dedicated Playlists library view with grid and list layouts
-- Library search with grid and list views
-- Recently played music and quick picks
+<details>
+<summary><strong>Library details</strong></summary>
+
+- Grid and list layouts for library and playlists
+- Recently played and quick picks
 - Create, edit, and delete regular playlists
-- Automatic library updates when files change
 - Optional artist information from MusicBrainz
 - Artwork-driven colors throughout the interface
+</details>
 
-### Smart Playlists
+<details>
+<summary><strong>Smart playlist details</strong></summary>
 
-Build playlists that update themselves as your library and listening habits change.
-
-- Create from the sidebar **+** menu: **Create playlist** or **Create smart playlist**
-- Visual rule editor with Match all / Match any conditions and nested rule groups
-- Live matching-song preview while you edit rules
+- Create from the sidebar **+** menu
+- Visual rule editor with Match all / Match any and nested groups
 - Conditions for metadata, play count, last played, never played, date added, favorites, and more
-- Sorting, track limits, and random order with reshuffle
-- Starting templates such as Recently Added, Never Played, Most Played, Forgotten Favorites, and Recently Played
-- Edit rules, refresh matches, duplicate, convert to a regular playlist, or delete from the playlist menu
+- Templates such as Recently Added, Never Played, Most Played, Forgotten Favorites, and Recently Played
+- Edit rules, refresh matches, duplicate, convert to a regular playlist, or delete
+</details>
 
-### Personalized mixes
+<details>
+<summary><strong>Playback & audio details</strong></summary>
 
-Home **Your Mixes** are generated from your library and listening activity — no account or recommendation service required.
-
-- Heavy Rotation, Rediscover, Library Discovery, and artist mixes
-- Mixes stay stable for the day across navigation and restarts
-- Appear as you build listening history
-- Optional toggle in **Settings → Personalization**
-
-### Search
-
-Find anything in your library from a polished Search experience — not just a simple filter.
-
-- Landing page with recent searches and Browse your library shortcuts
-- Results for artists, playlists, albums & singles, and songs
-- Prominent Top result with the right play or open action
-- Relevance ranking across your local collection
-- Show more controls for large result sets
-
-### Metadata editor
-
-Edit tags and artwork without leaving EMP.
-
-- Open from a track’s context menu or an album’s **⋯ → Edit Album Metadata**
-- Edit title, artist, album artist, album, track and disc numbers, genre, year, comment, and embedded artwork
-- Batch-edit multiple selected tracks, including shared artwork and optional track renumbering
-- Preview changes before writing them to your files
-- Blocks unsafe edits for read-only files, unsupported formats, and tracks that are currently playing or casting
-
-### Lyrics
-
-Follow along with the current track in a full lyrics panel.
-
-- Synced lyrics with active-line highlighting when timing is available
-- Plain lyrics fallback when synced lines are not available
-- Cover-tinted lyrics stage that matches the playing track
-- Local caching so lyrics load quickly on repeat listens
-
-### Playback
-
-Everything you'd expect from a modern desktop player, with your music playing directly from your PC.
-
-- Shuffle and repeat
-- Seek and volume controls
-- Queue drawer for now playing and upcoming tracks
-- Crossfade with adjustable duration, or gapless playback
-- ReplayGain volume normalization with Track or Album mode when tags are available
+- Session restore for queue, track, and position
+- ReplayGain Track or Album mode when tags are available
 - Prevent clipping to reduce distortion from normalization and enhancements
 - Equalizer with presets
-- Choose a local audio output device when supported
-- Windows system media controls
-- Taskbar playback controls
-- Session restore for your queue, track, and playback position
+</details>
 
-Supported formats include **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, and ALAC**.
+<details>
+<summary><strong>Casting notes</strong></summary>
 
-### Automatic updates
+Open **Connect to a device** from the player bar. When casting, EMP serves the original audio file from your PC — nothing is uploaded or transcoded.
 
-Stay current without a separate installer workflow.
-
-- Check for updates from **Settings → Updates**, or enable automatic checks
-- New builds are discovered from GitHub Releases
-- Download and install only when you choose — EMP never updates without your consent
-- Downloads are verified before install, then EMP restarts to finish applying the update
-
-### Connect to a device
-
-Send your music to compatible speakers, TVs, and other devices on your local network.
-
-- **Google Cast** — Chromecast and Cast-enabled speakers and displays
-- **DLNA / UPnP** — compatible TVs, speakers, and media renderers
-
-Open **Connect to a device** from the player bar and choose where you want to listen.
-
-When casting, EMP serves the original audio file directly from your PC over your local network. Your music is not uploaded to a cloud service or transcoded.
-
-> [!NOTE]
-> Audio processing such as the equalizer, ReplayGain, prevent clipping, crossfade, and gapless playback applies to playback on this computer and is not applied when sending the original file to another device.
+Audio processing (equalizer, ReplayGain, prevent clipping, crossfade, gapless) applies on this computer and is not applied when sending the original file to another device.
+</details>
 
 ## Why EMP?
 
-EMP is for people who keep their own music collection but still want the experience of a modern desktop music app.
+EMP is for people who keep their own music collection but still want a modern desktop music app.
 
 There's no streaming catalog to subscribe to and no account required to listen. Choose your music folders and EMP builds the experience around your collection.
 
 **The goal is simple: make a local music library feel as polished and convenient as a modern streaming app.**
+
+## Build from source
+
+Requires [.NET 10 SDK](https://dotnet.microsoft.com/download) on Windows 10 or later.
+
+```bash
+git clone https://github.com/lazytitanz/EMP.git
+cd EMP
+dotnet run --project EMP
+```
+
+## Contributing
+
+Ideas, bugs, and pull requests are welcome.
+
+- [Open an issue](https://github.com/lazytitanz/EMP/issues)
+- [Start a discussion](https://github.com/lazytitanz/EMP/discussions)
