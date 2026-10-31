@@ -121,7 +121,10 @@ namespace EMP.Library.Metadata
                     preview = "data:" + mime + ";base64," + Convert.ToBase64String(picture.Data.Data);
                 }
 
-                bool canEdit = !readOnly && !file.PossiblyCorrupt;
+                // TagLibSharp can read many WebM tags, but write/artwork round-trips are
+                // not reliable enough to expose in the metadata editor.
+                bool webm = MusicLibraryScanner.IsWebmExtension(extension);
+                bool canEdit = !webm && !readOnly && !file.PossiblyCorrupt;
                 return new EditableTrackMetadata
                 {
                     TrackId = trackId,
@@ -131,6 +134,8 @@ namespace EMP.Library.Metadata
                     ReadOnly = readOnly,
                     CanEditTags = canEdit,
                     CanEditArtwork = canEdit,
+                    ErrorCode = webm ? MetadataErrorCode.Unsupported : null,
+                    ErrorMessage = webm ? MetadataErrorMessages.For(MetadataErrorCode.Unsupported) : null,
                     Busy = false,
                     LastWriteUtcTicks = info.LastWriteTimeUtc.Ticks,
                     Length = info.Length,

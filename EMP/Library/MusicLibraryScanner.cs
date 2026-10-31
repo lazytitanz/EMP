@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using EMP.Library.Metadata;
 
 namespace EMP.Library
 {
@@ -11,7 +12,7 @@ namespace EMP.Library
 
         private static readonly HashSet<string> AudioExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
-            ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".wma", ".aiff", ".alac"
+            ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".wma", ".aiff", ".alac", ".webm"
         };
 
         private static readonly HashSet<string> IgnoredWatchExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -85,10 +86,26 @@ namespace EMP.Library
 
         public static MusicLibrary Scan(string musicRoot, string artworkRoot)
         {
-            return Scan([musicRoot], artworkRoot);
+            return Scan([musicRoot], artworkRoot, previousCoverUrlsByAlbumId: null);
+        }
+
+        public static MusicLibrary Scan(
+            string musicRoot,
+            string artworkRoot,
+            IReadOnlyDictionary<string, string?>? previousCoverUrlsByAlbumId)
+        {
+            return Scan([musicRoot], artworkRoot, previousCoverUrlsByAlbumId);
         }
 
         public static MusicLibrary Scan(IReadOnlyList<string> musicRoots, string artworkRoot)
+        {
+            return Scan(musicRoots, artworkRoot, previousCoverUrlsByAlbumId: null);
+        }
+
+        public static MusicLibrary Scan(
+            IReadOnlyList<string> musicRoots,
+            string artworkRoot,
+            IReadOnlyDictionary<string, string?>? previousCoverUrlsByAlbumId)
         {
             ArgumentNullException.ThrowIfNull(musicRoots);
             ArgumentException.ThrowIfNullOrWhiteSpace(artworkRoot);
@@ -156,7 +173,9 @@ namespace EMP.Library
                     .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
                     ?? albumFiles[0].AlbumHint;
                 int? year = albumFiles.Select(file => file.Year).FirstOrDefault(value => value is > 0);
-                string? coverUrl = ExtractArtwork(albumId, albumFiles, artworkRoot);
+                string? previousCoverUrl = null;
+                _ = previousCoverUrlsByAlbumId?.TryGetValue(albumId, out previousCoverUrl);
+                string? coverUrl = ExtractArtwork(albumId, albumFiles, artworkRoot, previousCoverUrl);
 
                 AlbumInfo album = new()
                 {
@@ -255,9 +274,15 @@ namespace EMP.Library
             {
                 foreach (string path in Directory.EnumerateFiles(directory))
                 {
-                    if (IsSupportedAudioPath(path))
+                    if (!IsSupportedAudioPath(path))
                     {
-                        results.Add(ReadAudioFile(musicRoot, path));
+                        continue;
+                    }
+
+                    AudioFileInfo? file = TryReadLibraryAudioFile(musicRoot, path);
+                    if (file is not null)
+                    {
+                        results.Add(file);
                     }
                 }
 
@@ -272,7 +297,12 @@ namespace EMP.Library
             }
         }
 
-        private static AudioFileInfo ReadAudioFile(string musicRoot, string path)
+        /// <summary>
+        /// Reads a candidate library audio file. Returns null when the path is a WebM
+        /// (or other allowed container) that TagLib reports as containing a video stream.
+        /// Corrupted / unreadable files still return filename fallbacks.
+        /// </summary>
+        private static AudioFileInfo? TryReadLibraryAudioFile(string musicRoot, string path)
         {
             string directory = Path.GetDirectoryName(path) ?? musicRoot;
             string albumHint = DirectoryEquals(directory, musicRoot)
@@ -297,6 +327,12 @@ namespace EMP.Library
             try
             {
                 using TagLib.File file = TagLib.File.Create(path);
+                if (IsWebmExtension(format)
+                    && (file.Properties.MediaTypes & TagLib.MediaTypes.Video) != 0)
+                {
+                    return null;
+                }
+
                 if (!string.IsNullOrWhiteSpace(file.Tag.Title))
                 {
                     title = file.Tag.Title.Trim();
@@ -377,6 +413,17 @@ namespace EMP.Library
             };
         }
 
+        internal static bool IsWebmExtension(string? extensionOrFormat)
+        {
+            if (string.IsNullOrWhiteSpace(extensionOrFormat))
+            {
+                return false;
+            }
+
+            string value = extensionOrFormat.Trim().TrimStart('.').ToLowerInvariant();
+            return value == "webm";
+        }
+
         private static string NormalizeFormat(string? extension)
         {
             if (string.IsNullOrWhiteSpace(extension))
@@ -403,24 +450,27 @@ namespace EMP.Library
             return Path.GetFileName(parent);
         }
 
-        private static string? ExtractArtwork(string albumId, IReadOnlyList<AudioFileInfo> files, string artworkRoot)
+        private static string? ExtractArtwork(
+            string albumId,
+            IReadOnlyList<AudioFileInfo> files,
+            string artworkRoot,
+            string? previousCoverUrl)
         {
+            // Deterministic: albumFiles are ordered by TrackNumber then Title; first picture wins.
             AudioFileInfo? source = files.FirstOrDefault(file => file.PictureData is { Length: > 0 });
             if (source?.PictureData is null)
             {
                 return null;
             }
 
-            string extension = source.PictureMime?.Contains("png", StringComparison.OrdinalIgnoreCase) == true
-                ? ".png"
-                : ".jpg";
-            string fileName = albumId + extension;
-            string outputPath = Path.Combine(artworkRoot, fileName);
-
             try
             {
-                File.WriteAllBytes(outputPath, source.PictureData);
-                return "artwork/" + fileName;
+                return AlbumArtworkCache.EnsureAlbumCover(
+                    artworkRoot,
+                    albumId,
+                    source.PictureData,
+                    source.PictureMime,
+                    previousCoverUrl);
             }
             catch (Exception)
             {
@@ -430,12 +480,13 @@ namespace EMP.Library
 
         private static string? ResolveArtworkPath(string artworkRoot, string? coverUrl)
         {
-            if (string.IsNullOrWhiteSpace(coverUrl))
+            string? stripped = AlbumArtworkCache.StripCoverUrlQuery(coverUrl);
+            if (string.IsNullOrWhiteSpace(stripped))
             {
                 return null;
             }
 
-            string fileName = Path.GetFileName(coverUrl.Replace('/', Path.DirectorySeparatorChar));
+            string fileName = Path.GetFileName(stripped.Replace('/', Path.DirectorySeparatorChar));
             if (string.IsNullOrWhiteSpace(fileName) || fileName.Contains("..", StringComparison.Ordinal))
             {
                 return null;

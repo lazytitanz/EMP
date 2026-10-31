@@ -1,6 +1,6 @@
 <Project>
   <PropertyGroup>
-    <Version>0.3.1</Version>
+    <Version>0.3.2</Version>
     <InformationalVersion>$(Version)</InformationalVersion>
     <Company>EMP</Company>
     <Product>EMP</Product>

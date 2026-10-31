@@ -21,4 +21,8 @@
     <ProjectReference Include="..\EMP\EMP.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="Fixtures\Webm\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

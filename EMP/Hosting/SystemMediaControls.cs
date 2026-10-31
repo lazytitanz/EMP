@@ -1,3 +1,4 @@
+using EMP.Library.Metadata;
 using Microsoft.Web.WebView2.WinForms;
 using Windows.Media;
 using Windows.Media.Playback;
@@ -135,12 +136,13 @@ namespace EMP.Hosting
 
         private static string? ResolveCoverPath(string? coverUrl)
         {
-            if (string.IsNullOrWhiteSpace(coverUrl))
+            string? stripped = AlbumArtworkCache.StripCoverUrlQuery(coverUrl);
+            if (string.IsNullOrWhiteSpace(stripped))
             {
                 return null;
             }
 
-            string relative = coverUrl
+            string relative = stripped
                 .Replace('/', Path.DirectorySeparatorChar)
                 .TrimStart(Path.DirectorySeparatorChar);
 

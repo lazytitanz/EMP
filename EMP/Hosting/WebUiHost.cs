@@ -108,6 +108,10 @@ namespace EMP.Hosting
 
             try
             {
+                // Keep HTTP cache disabled: media virtual URLs are path-stable without
+                // version busting, so in-place file replace/retag would serve stale audio.
+                // Artwork uses content-hash ?v= for fingerprint/UI; that alone cannot
+                // selectively re-enable cache (CDP toggle is process-global).
                 await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
                     "Network.setCacheDisabled",
                     "{\"cacheDisabled\":true}");
@@ -476,7 +480,10 @@ namespace EMP.Hosting
             LibraryScanResult result;
             try
             {
-                MusicLibrary scanned = MusicLibraryScanner.Scan(folders, scanArtworkRoot);
+                MusicLibrary scanned = MusicLibraryScanner.Scan(
+                    folders,
+                    scanArtworkRoot,
+                    BuildPreviousCoverUrlsByAlbumId(lastCompleteCache));
                 MusicLibrary merged = LibraryCacheStore.MergeUnavailableFromCache(
                     scanned,
                     folders,
@@ -603,6 +610,26 @@ namespace EMP.Hosting
                 Singles = library.Singles,
                 Tracks = library.Tracks
             };
+        }
+
+        private static IReadOnlyDictionary<string, string?>? BuildPreviousCoverUrlsByAlbumId(
+            CachedMusicLibrary? cache)
+        {
+            if (cache?.Library is null)
+            {
+                return null;
+            }
+
+            Dictionary<string, string?> map = new(StringComparer.OrdinalIgnoreCase);
+            foreach (AlbumInfo album in cache.Library.Albums.Concat(cache.Library.Singles))
+            {
+                if (!string.IsNullOrWhiteSpace(album.Id))
+                {
+                    map[album.Id] = album.CoverUrl;
+                }
+            }
+
+            return map.Count == 0 ? null : map;
         }
 
         private static void PostLibraryMessage(LibraryMessage message)

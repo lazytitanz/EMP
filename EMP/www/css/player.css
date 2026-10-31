@@ -643,8 +643,9 @@ html.is-window-maximized .player-bar {
   width: 100%;
 }
 
-img.artist-cover,
-.artist-cover {
+.artist-cover,
+.artist-cover > .cover-img,
+.artist-cover > .cover-slot-fallback {
   border-radius: 50%;
 }
 
@@ -923,6 +924,7 @@ img.artist-cover,
   overflow: hidden;
   object-fit: cover;
   display: block;
+  position: relative;
 }
 
 .playlist-play {
@@ -1076,29 +1078,6 @@ img.artist-cover,
   }
 }
 
-img.media-cover {
-  width: 100%;
-  height: 100%;
-  aspect-ratio: unset;
-  object-fit: cover;
-  display: block;
-  border-radius: 6px;
-}
-
-img.album-hero-cover {
-  width: 232px;
-  height: 232px;
-  object-fit: cover;
-  display: block;
-}
-
-.now-cover img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
 .cover-fallback,
 .playlist-cover,
 .media-cover,
@@ -1106,6 +1085,78 @@ img.album-hero-cover {
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
+}
+
+/*
+ * Cover slots wrap <img.cover-img>. The wrapper must keep the same box model as the
+ * pre-slot <img class="…"> (especially .media-cover abspos fill). Never let .cover-slot's
+ * position:relative override .media-cover's absolute placement — that put the bitmap in
+ * normal flow and blew shelf/flex rows up to intrinsic image size.
+ */
+.cover-slot,
+.cover-mosaic-tile {
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+}
+
+.cover-slot:not(.media-cover) {
+  position: relative;
+}
+
+.media-cover.cover-slot {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  aspect-ratio: unset;
+  border-radius: 6px;
+}
+
+.now-cover-art.cover-slot {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+}
+
+.cover-slot .cover-slot-fallback {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.cover-slot > .cover-img,
+.cover-mosaic-tile > .cover-img {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  object-fit: cover;
+  object-position: center;
+  display: block;
+  opacity: 0;
+  border-radius: inherit;
+}
+
+.cover-img.is-ready {
+  opacity: 1;
+}
+
+.cover-slot.is-failed > .cover-img,
+.cover-mosaic-tile.is-failed > .cover-img {
+  display: none;
 }
 
 .cover-fallback {
@@ -1141,19 +1192,28 @@ img.album-hero-cover {
   place-items: stretch;
 }
 
-.cover-mosaic img,
+.cover-mosaic-tile,
 .cover-mosaic-fallback {
   width: 100%;
   height: 100%;
-  object-fit: cover;
-  display: block;
   min-width: 0;
   min-height: 0;
   border-radius: 0;
 }
 
+.cover-mosaic-tile {
+  position: relative;
+  overflow: hidden;
+}
+
 .cover-mosaic-fallback {
+  display: block;
   background: linear-gradient(135deg, #2a2a2a, #181818);
+}
+
+.cover-mosaic-tile > .cover-mosaic-fallback {
+  position: absolute;
+  inset: 0;
 }
 
 .playlist-cover.cover-mosaic {
@@ -2859,6 +2919,8 @@ input[type="range"].slider.settings-duration-slider {
   overflow: hidden;
   border-radius: 6px;
   flex-shrink: 0;
+  min-width: 0;
+  min-height: 0;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
@@ -3035,6 +3097,12 @@ input[type="range"].slider.settings-duration-slider {
 
 .track-row:hover,
 .track-row.active {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--emp-text);
+}
+
+/* Multi-select (Ctrl/Shift) only — never a green play highlight */
+.track-row.selected {
   background: rgba(255, 255, 255, 0.08);
   color: var(--emp-text);
 }
@@ -3334,6 +3402,7 @@ input[type="range"].slider.settings-duration-slider {
 }
 
 .search-top-cover {
+  position: relative;
   width: 92px;
   height: 92px;
   border-radius: 6px;
@@ -3357,7 +3426,8 @@ input[type="range"].slider.settings-duration-slider {
 }
 
 .search-top-cover.artist-cover,
-img.search-top-cover.artist-cover {
+.search-top-cover.artist-cover .cover-img,
+.search-top-cover.artist-cover .cover-slot-fallback {
   border-radius: 50%;
 }
 
@@ -3632,6 +3702,7 @@ img.search-top-cover.artist-cover {
 }
 
 .now-cover {
+  position: relative;
   width: 56px;
   height: 56px;
   border-radius: 4px;
@@ -3643,6 +3714,7 @@ img.search-top-cover.artist-cover {
   color: inherit;
 }
 
+.now-cover .cover-img,
 .now-cover img {
   width: 100%;
   height: 100%;
@@ -3931,6 +4003,7 @@ input[type="range"].slider:hover::-webkit-slider-thumb {
 }
 
 .lyrics-track-cover {
+  position: relative;
   width: 56px;
   height: 56px;
   border-radius: 4px;
@@ -4161,10 +4234,13 @@ input[type="range"].slider:hover::-webkit-slider-thumb {
 }
 
 .album-hero-cover {
+  position: relative;
   width: 232px;
   height: 232px;
   border-radius: 8px;
   flex-shrink: 0;
+  min-width: 0;
+  min-height: 0;
   box-shadow: 0 8px 36px rgba(0, 0, 0, 0.42);
   display: grid;
   place-items: center;
@@ -4294,11 +4370,15 @@ input[type="range"].slider:hover::-webkit-slider-thumb {
 }
 
 .album-meta-avatar {
+  position: relative;
   width: 24px;
   height: 24px;
   border-radius: 50%;
   object-fit: cover;
   flex-shrink: 0;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
 }
 
 .album-meta-avatar.cover-fallback {
@@ -4524,8 +4604,8 @@ input[type="range"].slider:hover::-webkit-slider-thumb {
 }
 
 .details-modal-cover,
-.details-cover,
-img.details-cover {
+.details-cover {
+  position: relative;
   width: 180px;
   height: 180px;
   border-radius: 4px;
@@ -5148,12 +5228,16 @@ img.details-cover {
 }
 
 .queue-row-cover {
+  position: relative;
   width: 48px;
   height: 48px;
   border-radius: 4px;
   flex-shrink: 0;
   object-fit: cover;
   font-size: 1.1rem;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
 }
 
 .queue-row .device-row-name {
@@ -5223,8 +5307,7 @@ img.details-cover {
 
 /* Content-width breakpoints on .album-page (sidebar excluded). */
 @container album (max-width: 720px) {
-  .album-hero-cover,
-  img.album-hero-cover {
+  .album-hero-cover {
     width: 160px;
     height: 160px;
   }
@@ -5247,8 +5330,7 @@ img.details-cover {
     gap: 16px;
   }
 
-  .album-hero-cover,
-  img.album-hero-cover {
+  .album-hero-cover {
     width: 148px;
     height: 148px;
   }

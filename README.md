@@ -61,7 +61,7 @@ EMP turns your personal music folders into a polished desktop listening app — 
 | **Connect** | Google Cast and DLNA/UPnP — original files streamed from your PC on the local network |
 | **Updates** | Optional checks from GitHub Releases; you choose when to install |
 
-Supported formats: **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, ALAC**.
+Supported formats: **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, ALAC, WebM** (audio-only).
 
 <details>
 <summary><strong>Library details</strong></summary>

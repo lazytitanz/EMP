@@ -20,6 +20,11 @@ namespace EMP.Library.Metadata
                 return Fail(trackId, MetadataErrorCode.NotFound);
             }
 
+            if (MusicLibraryScanner.IsWebmExtension(Path.GetExtension(path)))
+            {
+                return Fail(trackId, MetadataErrorCode.Unsupported);
+            }
+
             (bool busy, MetadataErrorCode busyCode) = busyCheck(trackId);
             if (busy)
             {

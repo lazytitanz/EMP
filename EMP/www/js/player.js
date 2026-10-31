@@ -2101,6 +2101,7 @@ function renderQueueDrawer() {
     ${rows}
     ${more}
   `;
+  syncCoverImages(queueDrawerBody);
 
   if (hadFocus) {
     const target = (focusedId && queueDrawerBody.querySelector(`[data-queue-track="${CSS.escape(focusedId)}"]:not([data-queue-current])`))
@@ -3409,6 +3410,7 @@ function mountCollectionVirtual({ items, mode, showingArtists, renderItem }) {
       }
     }
     spacer.insertAdjacentHTML("afterend", chunks.join(""));
+    syncCoverImages(container);
     libraryPerfLog("collection paint", paintStarted, `rows ${firstRow}-${lastRow} / ${rowCount}`);
   };
 
@@ -3450,9 +3452,24 @@ function coverBackground(item) {
   return `background: linear-gradient(135deg, ${color}, #121212);`;
 }
 
+function coverPlaceholderStyle(item) {
+  const color = item?.color || "#282828";
+  return `background: linear-gradient(135deg, ${color}, #121212);`;
+}
+
+/** Browser cover URLs may include ?v=; collage identity uses the path only. */
+function coverUrlIdentity(coverUrl) {
+  const raw = typeof coverUrl === "string" ? coverUrl.trim() : "";
+  if (!raw) {
+    return "";
+  }
+  const query = raw.indexOf("?");
+  return query < 0 ? raw : raw.slice(0, query);
+}
+
 /**
  * First distinct album artworks in track order.
- * Dedupes by albumId AND coverUrl so same-album tracks and shared artwork
+ * Dedupes by albumId AND cover path (ignoring ?v=) so same-album tracks and shared artwork
  * files cannot fill multiple collage tiles.
  */
 function selectDistinctCoverUrls(tracks, max = 4) {
@@ -3465,17 +3482,20 @@ function selectDistinctCoverUrls(tracks, max = 4) {
     if (!coverUrl) {
       continue;
     }
+    const identity = coverUrlIdentity(coverUrl);
     const albumId = typeof track?.albumId === "string" ? track.albumId.trim() : "";
     if (albumId && seenAlbums.has(albumId)) {
       continue;
     }
-    if (seenCovers.has(coverUrl)) {
+    if (identity && seenCovers.has(identity)) {
       continue;
     }
     if (albumId) {
       seenAlbums.add(albumId);
     }
-    seenCovers.add(coverUrl);
+    if (identity) {
+      seenCovers.add(identity);
+    }
     urls.push(coverUrl);
     if (urls.length >= max) {
       break;
@@ -3493,7 +3513,10 @@ function coverMosaicMarkup(urls, className) {
   for (let i = 0; i < 4; i += 1) {
     const url = urls[i];
     if (url) {
-      tiles.push(`<img src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">`);
+      tiles.push(`<div class="cover-mosaic-tile">
+        <div class="cover-mosaic-fallback" aria-hidden="true"></div>
+        <img class="cover-img" src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">
+      </div>`);
     } else {
       tiles.push(`<div class="cover-mosaic-fallback" aria-hidden="true"></div>`);
     }
@@ -3523,10 +3546,72 @@ function coverMarkup(item, className) {
   }
 
   if (item?.coverUrl) {
-    return `<img class="${className}" src="${escapeHtml(item.coverUrl)}" alt="" loading="lazy" decoding="async">`;
+    return `<div class="${className} cover-slot">
+      <div class="cover-slot-fallback cover-fallback" aria-hidden="true" style="${coverPlaceholderStyle(item)}"><i class="bi bi-music-note-beamed"></i></div>
+      <img class="cover-img" src="${escapeHtml(item.coverUrl)}" alt="" loading="lazy" decoding="async">
+    </div>`;
   }
 
   return `<div class="${className} cover-fallback" style="${coverBackground(item)}"><i class="bi bi-music-note-beamed"></i></div>`;
+}
+
+function markCoverImageReady(img) {
+  if (!(img instanceof HTMLImageElement) || !img.classList.contains("cover-img")) {
+    return;
+  }
+  img.classList.add("is-ready");
+  img.closest(".cover-slot, .cover-mosaic-tile")?.classList.remove("is-failed");
+}
+
+function markCoverImageFailed(img) {
+  if (!(img instanceof HTMLImageElement) || !img.classList.contains("cover-img")) {
+    return;
+  }
+  img.classList.remove("is-ready");
+  const slot = img.closest(".cover-slot, .cover-mosaic-tile");
+  if (slot) {
+    slot.classList.add("is-failed");
+  }
+  img.removeAttribute("src");
+  img.remove();
+}
+
+function syncCoverImages(root) {
+  if (!root?.querySelectorAll) {
+    return;
+  }
+  root.querySelectorAll("img.cover-img").forEach((img) => {
+    if (img.complete) {
+      if (img.naturalWidth > 0) {
+        markCoverImageReady(img);
+      } else {
+        markCoverImageFailed(img);
+      }
+    }
+  });
+}
+
+function onCoverImageLifecycleEvent(event) {
+  const img = event.target;
+  if (!(img instanceof HTMLImageElement) || !img.classList.contains("cover-img")) {
+    return;
+  }
+  if (event.type === "load") {
+    markCoverImageReady(img);
+    return;
+  }
+  if (event.type === "error") {
+    markCoverImageFailed(img);
+  }
+}
+
+function bindCoverImageLifecycle(root) {
+  if (!root || root.dataset.coverLifecycleBound === "1") {
+    return;
+  }
+  root.dataset.coverLifecycleBound = "1";
+  root.addEventListener("load", onCoverImageLifecycleEvent, true);
+  root.addEventListener("error", onCoverImageLifecycleEvent, true);
 }
 
 function songLabel(count) {
@@ -3734,21 +3819,6 @@ function setHomeStageAccent(color, depth = 400) {
   mainStage.style.background =
     `linear-gradient(180deg, ${soft} 0%, ${mid} ${midStop}px, var(--emp-bg) ${depth}px)`;
   mainStage.style.setProperty("--stage-accent-bar", darkenColor(soft, 0.5) || "");
-}
-
-async function setHomeStageAccentFromArt(coverUrl, fallbackColor, depth = 400) {
-  const seq = renderSeq;
-  if (coverUrl) {
-    const color = await extractVibrantColor(coverUrl);
-    if (seq !== renderSeq) {
-      return;
-    }
-    if (color) {
-      setHomeStageAccent(color, depth);
-      return;
-    }
-  }
-  setHomeStageAccent(fallbackColor, depth);
 }
 
 function setStageSolid(color) {
@@ -4339,6 +4409,8 @@ function render(entry) {
   mountTopCollection();
   updateCollectionControls();
   syncTopBarScroll();
+  syncCoverImages(viewArea);
+  syncCoverImages(libraryList);
 }
 
 function renderLibraryList() {
@@ -4373,8 +4445,9 @@ function renderLibraryList() {
           ${sidebarPlayOverlay(`data-play-id="${track.id}"`, track.title, playing)}
         </div>
       </li>
-    `;
+`;
     }).join("");
+    syncCoverImages(libraryList);
     return;
   }
 
@@ -4410,6 +4483,7 @@ function renderLibraryList() {
         </li>
       `;
     }).join("");
+    syncCoverImages(libraryList);
     return;
   }
 
@@ -4440,6 +4514,7 @@ function renderLibraryList() {
     </li>
   `;
   }).join("");
+  syncCoverImages(libraryList);
 }
 
 function albumCard(album, options) {
@@ -4764,7 +4839,7 @@ function shelfSection(title, items, filter, { subtitleMode = "type", shelf = "" 
 }
 
 function renderHome() {
-  const { albums, singles, tracks } = state.library;
+  const { singles, tracks } = state.library;
   if (!tracks.length) {
     renderEmpty();
     return;
@@ -4772,21 +4847,8 @@ function renderHome() {
 
   const recents = recentHomeItems();
   const quick = homeQuickItems();
-  const accentAlbum = quick.find((item) => item.kind === "album")?.album
-    || recents.find((item) => item.kind === "album")?.album
-    || albums[0]
-    || singles[0]
-    || null;
-  const accentPlaylist = !accentAlbum
-    ? (quick.find((item) => item.kind === "playlist")?.playlist
-      || recents.find((item) => item.kind === "playlist")?.playlist)
-    : null;
-  const coverUrl = accentAlbum?.coverUrl
-    || (accentPlaylist ? playlistArtworkUrls(accentPlaylist)[0] : null)
-    || null;
-  const fallbackAccent = accentAlbum?.color || "#1e3b2a";
-  setHomeStageAccent(fallbackAccent);
-  setHomeStageAccentFromArt(coverUrl, fallbackAccent);
+  // Fixed Home accent — do not derive from recently played / album art.
+  setHomeStageAccent("#1e3b2a");
 
   const canShuffleLibrary = tracks.length > 0;
   const mixes = state.personalizedMixes !== false ? ensurePersonalizedMixes() : [];
@@ -4808,6 +4870,7 @@ function renderHome() {
     </div>
   `;
   syncHomeLayout();
+  syncCoverImages(viewArea);
 }
 
 function catalogAlbums() {
@@ -7280,6 +7343,7 @@ function mountTrackVirtual(tracks, showAlbum) {
       row.style.top = `${(start + index) * TRACK_ROW_HEIGHT}px`;
       row.style.height = `${TRACK_ROW_HEIGHT}px`;
     });
+    syncCoverImages(table);
   };
 
   const onScroll = () => paint();
@@ -8543,7 +8607,11 @@ function updateNowPlaying() {
   nowCover.removeAttribute("style");
   if (track.coverUrl) {
     nowCover.classList.remove("cover-fallback");
-    nowCover.innerHTML = `<img src="${escapeHtml(track.coverUrl)}" alt="">`;
+    nowCover.innerHTML = coverMarkup(
+      { coverUrl: track.coverUrl, color: track.color || albumById(track.albumId)?.color },
+      "now-cover-art"
+    );
+    syncCoverImages(nowCover);
   } else {
     nowCover.classList.add("cover-fallback");
     nowCover.setAttribute("style", coverBackground(track));
@@ -10451,9 +10519,10 @@ document.body.addEventListener("click", (event) => {
       return;
     }
     if (id && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
-      trackSelection.ids = new Set([id]);
+      // Play should not leave a selection highlight; keep anchor for Shift ranges.
+      trackSelection.ids.clear();
       trackSelection.anchorId = id;
-      syncTrackSelectionClasses();
+      document.querySelectorAll(".track-row.selected").forEach((row) => row.classList.remove("selected"));
     }
     const album = albumById(state.albumId);
     const playlist = playlistById(state.playlistId);
@@ -11484,6 +11553,11 @@ syncSidebarSortUi();
 updateLibraryChipsScroll();
 syncTopBarScroll();
 syncHomeLayout();
+
+bindCoverImageLifecycle(viewArea);
+bindCoverImageLifecycle(libraryList);
+bindCoverImageLifecycle(nowCover);
+bindCoverImageLifecycle(queueDrawerBody);
 
 window.addEventListener("emp-library", (event) => bindLibrary(event.detail));
 window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.detail));

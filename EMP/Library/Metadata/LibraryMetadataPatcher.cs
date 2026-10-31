@@ -166,7 +166,8 @@ namespace EMP.Library.Metadata
                             string? artPath = null;
                             if (!string.IsNullOrWhiteSpace(newCoverUrl))
                             {
-                                string fileName = Path.GetFileName(newCoverUrl.Split('?')[0].Replace('/', Path.DirectorySeparatorChar));
+                                string? stripped = AlbumArtworkCache.StripCoverUrlQuery(newCoverUrl);
+                                string fileName = Path.GetFileName((stripped ?? "").Replace('/', Path.DirectorySeparatorChar));
                                 artPath = Path.Combine(artworkRoot, fileName);
                             }
 

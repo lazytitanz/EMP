@@ -769,10 +769,6 @@ textarea.meta-input {
   }
 }
 
-.track-row.selected {
-  background: rgba(29, 185, 84, 0.16);
-}
-
 body.meta-modal-open {
   overflow: hidden;
 }

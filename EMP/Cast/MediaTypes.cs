@@ -21,6 +21,7 @@ namespace EMP.Cast
                 ".wma" => "audio/x-ms-wma",
                 ".aiff" => "audio/aiff",
                 ".alac" => "audio/mp4",
+                ".webm" => "audio/webm",
                 ".jpg" or ".jpeg" => "image/jpeg",
                 ".png" => "image/png",
                 ".webp" => "image/webp",
@@ -30,6 +31,7 @@ namespace EMP.Cast
 
         public static bool IsCastAudio(string? extension)
         {
+            // WebM is intentionally omitted until Chromecast support is verified.
             return extension?.ToLowerInvariant() is ".mp3" or ".m4a" or ".aac" or ".flac" or ".wav" or ".ogg" or ".opus";
         }
     }
