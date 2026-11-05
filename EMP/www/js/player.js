@@ -1,6 +1,7 @@
 const CROSSFADE_SECONDS = 8;
 const ReplayGain = globalThis.EmpReplayGain;
 const Transitions = globalThis.EmpPlaybackTransitions;
+const QueueModel = globalThis.EmpQueueModel;
 
 function clampCrossfadeSeconds(value) {
   return Transitions?.clampCrossfadeSeconds?.(value) ?? CROSSFADE_SECONDS;
@@ -15,8 +16,14 @@ let currentPlayerIndex = 0;
 let audioOutputDevices = [];
 let audioOutputSupported = false;
 let transitionGeneration = 0;
-let preloadGeneration = 0;
 let fadeRaf = 0;
+let plannedSonoraPreloadGeneration = 0;
+let plannedSonoraNextTrackId = null;
+let queueClearUndo = null;
+let queueClearUndoTimer = 0;
+let queueDragActive = false;
+let queueDrawerFocusUid = "";
+let queueAnnounceTimer = 0;
 let playbackTransitioning = false;
 let pendingSonoraPreloadAfterLoad = false;
 let sonoraPendingPlay = false;
@@ -44,9 +51,14 @@ const state = {
   artist: null,
   query: "",
   queue: [],
+  entries: [],
   queueSource: null,
   shuffleBag: [],
   index: -1,
+  orderRevision: 0,
+  playNextCount: 0,
+  queueDirty: false,
+  preloadGeneration: 0,
   playing: false,
   seeking: false,
   shuffle: false,
@@ -94,6 +106,13 @@ const state = {
   startupOnLogin: "no",
   closeMinimizes: false,
   automaticUpdateChecks: true,
+  appearance: window.EmpAppearance?.cloneDefaults?.() || {
+    theme: "dark",
+    accent: "emp",
+    accentCustom: "#20c77a",
+    density: "comfortable",
+    artworkAccents: true
+  },
   appVersion: "",
   sonoraVersion: "",
   updateStatus: {
@@ -177,11 +196,14 @@ const SEARCH_HISTORY_KEY = "emp.searchHistory.v1";
 const SEARCH_HISTORY_MAX = 8;
 const SEARCH_HISTORY_MIN_LEN = 2;
 const SEARCH_HISTORY_IDLE_MS = 2500;
+/** Fallbacks when CSS density vars are unavailable; prefer EmpAppearance.readDensityMetrics. */
 const TRACK_ROW_HEIGHT = 58;
 const ARTIST_INFO_TIMEOUT_MS = 15000;
 const DEVICE_SCAN_MS = 6000;
 const DEVICE_DRAWER_EXIT_MS = 280;
 const QUEUE_DRAWER_LIMIT = 100;
+const QUEUE_ROW_HEIGHT = 60;
+const QUEUE_VIRTUAL_OVERSCAN = 8;
 const QUEUE_SOURCE_KINDS = ["album", "playlist", "smart", "artist", "recents", "library", "songs", "mix"];
 const SONGS_SORT_OPTIONS = [
   { id: "title", label: "Title" },
@@ -204,6 +226,93 @@ const COLLECTION_GRID_MIN = 160;
 const COLLECTION_GRID_GAP = 18;
 const COLLECTION_LIST_ROW_HEIGHT = 64;
 const COLLECTION_OVERSCAN_ROWS = 4;
+
+function densityMetrics() {
+  return window.EmpAppearance?.readDensityMetrics?.(document.documentElement, state.appearance?.density) || {
+    density: state.appearance?.density === "compact" ? "compact" : "comfortable",
+    trackRowHeight: TRACK_ROW_HEIGHT,
+    queueRowHeight: QUEUE_ROW_HEIGHT,
+    collectionListRowHeight: COLLECTION_LIST_ROW_HEIGHT
+  };
+}
+
+function appearancePrefs() {
+  return window.EmpAppearance?.normalizeAppearance?.(state.appearance)
+    || window.EmpAppearance?.cloneDefaults?.()
+    || state.appearance;
+}
+
+function resolvedAppearanceTheme() {
+  return window.EmpAppearance?.resolveTheme?.(appearancePrefs().theme) || "dark";
+}
+
+function artworkAccentsEnabled() {
+  return appearancePrefs().artworkAccents !== false;
+}
+
+function neutralStageColor() {
+  return resolvedAppearanceTheme() === "light" ? "#ececef" : "#121212";
+}
+
+/**
+ * Theme-aware stage wash from a source accent.
+ * Dark: preserves EMP's established deep stage colors.
+ * Light: desaturated pastel blended into the light canvas — never near-black.
+ */
+function stageColorForTheme(color, role = "wash") {
+  const rgb = parseColor(color);
+  if (!rgb) {
+    return neutralStageColor();
+  }
+  if (resolvedAppearanceTheme() !== "light") {
+    if (role === "home") {
+      return softenHomeAccentDark(color) || color;
+    }
+    return color;
+  }
+
+  let [h, s, l] = rgbToHsl(rgb);
+  // Soft pastel: keep hue identity, remove heavy darkness.
+  s = Math.min(Math.max(s * 0.42, 0.08), role === "home" ? 0.26 : 0.22);
+  l = Math.max(0.86, Math.min(0.93, 0.9 - Math.min(0.04, s * 0.08)));
+  const pastel = hslToRgb([h, s, l]);
+  const pastelCss = `rgb(${pastel[0]}, ${pastel[1]}, ${pastel[2]})`;
+  // Blend into the light canvas so the wash settles into --emp-bg naturally.
+  return mixRgbColors(pastelCss, "#f4f4f5", role === "home" ? 0.28 : 0.38);
+}
+
+function stageBarColorForTheme(stageColor) {
+  if (resolvedAppearanceTheme() !== "light") {
+    return darkenColor(stageColor, 0.55) || stageColor;
+  }
+  // Slightly deeper pastel for the scrolled top bar — still light.
+  const rgb = parseColor(stageColor);
+  if (!rgb) {
+    return "#e4e4e8";
+  }
+  let [h, s, l] = rgbToHsl(rgb);
+  s = Math.min(s * 1.05, 0.24);
+  l = Math.max(0.8, Math.min(0.88, l - 0.05));
+  const out = hslToRgb([h, s, l]);
+  return `rgb(${out[0]}, ${out[1]}, ${out[2]})`;
+}
+
+function refreshDensityDependentUi() {
+  if (queueDrawerRoot && !queueDrawerRoot.hidden) {
+    paintQueueUpcomingVirtual();
+  }
+  trackVirtual?.paint?.();
+  if (collectionVirtual?.remeasure) {
+    const anchor = typeof captureCollectionScrollAnchor === "function" ? captureCollectionScrollAnchor() : null;
+    collectionVirtual.remeasure();
+    if (anchor && typeof applyCollectionScrollAnchor === "function") {
+      applyCollectionScrollAnchor(anchor);
+    }
+    collectionVirtual.paint?.();
+    return;
+  }
+  viewArea?.dispatchEvent(new Event("scroll"));
+}
 const LYRICS_FALLBACK_COLOR = "#535353";
 // Keeps white lyrics text at roughly 4.5:1 contrast or better.
 const LYRICS_MAX_LUMINANCE = 0.18;
@@ -929,6 +1038,9 @@ let lyricsRequestKey = "";
 let lyricsLines = [];
 let lyricsActiveIndex = -1;
 let lyricsUserScrollUntil = 0;
+let nowPlayingTrackId = null;
+let nowPlayingCoverIdentity = "";
+let nowPlayingGeneration = 0;
 let deviceScanTimer = 0;
 let deviceScanUntil = 0;
 
@@ -1225,19 +1337,31 @@ function queueMatchesFullLibrary(ids = state.queue) {
 }
 
 function canCompactSessionQueue() {
-  const kind = state.queueSource?.kind;
-  return (kind === "library" || kind === "songs") && queueMatchesFullLibrary();
+  if (!QueueModel) {
+    const kind = state.queueSource?.kind;
+    return (kind === "library" || kind === "songs") && queueMatchesFullLibrary();
+  }
+  return QueueModel.canCompactSessionQueue(state, {
+    queueMatchesFullLibrary: (ids) => queueMatchesFullLibrary(ids)
+  });
 }
 
 function buildSessionPayload({ compactQueue = false } = {}) {
   const track = currentTrack();
   const compact = compactQueue && canCompactSessionQueue();
+  const queueSession = QueueModel && !compact
+    ? QueueModel.serializeQueueSession(state)
+    : null;
   return {
     trackId: track?.id ?? null,
-    queue: compact ? [] : state.queue,
+    queue: compact ? [] : (queueSession?.queue ?? state.queue),
+    entries: compact ? [] : (queueSession?.entries ?? state.entries),
     queueSource: state.queueSource,
     queueCompact: compact ? true : undefined,
-    shuffleBag: compact ? [] : state.shuffleBag,
+    queueDirty: compact ? false : Boolean(state.queueDirty),
+    playNextCount: compact ? 0 : Math.max(0, Number(state.playNextCount) || 0),
+    orderRevision: Number(state.orderRevision) || 0,
+    shuffleBag: [],
     index: state.index,
     position: Number.isFinite(playbackPosition()) ? playbackPosition() : 0,
     volume: state.volume,
@@ -1272,7 +1396,8 @@ function buildSessionPayload({ compactQueue = false } = {}) {
     equalizerGains: cloneEqGains(state.equalizerGains),
     startupOnLogin: state.startupOnLogin,
     closeMinimizes: state.closeMinimizes,
-    automaticUpdateChecks: state.automaticUpdateChecks !== false
+    automaticUpdateChecks: state.automaticUpdateChecks !== false,
+    appearance: appearancePrefs()
   };
 }
 
@@ -1327,6 +1452,11 @@ function restoreEqualizerState(session) {
 (function applySavedPreferences() {
   const session = readSession();
   if (!session) {
+    applyAppearanceFromState({ refreshStage: false, refreshDensity: false, persist: false });
+    window.EmpAppearance?.bindSystemThemeListener?.(
+      () => appearancePrefs(),
+      () => applyAppearanceFromState({ refreshStage: true, refreshDensity: false, persist: false })
+    );
     return;
   }
 
@@ -1379,6 +1509,9 @@ function restoreEqualizerState(session) {
   if (typeof session.automaticUpdateChecks === "boolean") {
     state.automaticUpdateChecks = session.automaticUpdateChecks;
   }
+  state.appearance = window.EmpAppearance?.normalizeAppearance?.(session.appearance)
+    || window.EmpAppearance?.cloneDefaults?.()
+    || state.appearance;
   try {
     restoreEqualizerState(session);
   } catch {
@@ -1390,6 +1523,11 @@ function restoreEqualizerState(session) {
   volumeBar.value = state.muted ? "0" : String(state.volume);
   applyVolume();
   syncRecentsChips();
+  applyAppearanceFromState({ refreshStage: false, refreshDensity: false, persist: false });
+  window.EmpAppearance?.bindSystemThemeListener?.(
+    () => appearancePrefs(),
+    () => applyAppearanceFromState({ refreshStage: true, refreshDensity: false, persist: false })
+  );
 })();
 
 function greeting() {
@@ -1538,11 +1676,63 @@ function tracksByArtist(name) {
 }
 
 function activeOrder() {
+  if (state.entries?.length) {
+    return QueueModel ? QueueModel.trackIdsFromEntries(state.entries) : state.entries.map((entry) => entry.trackId);
+  }
   return state.shuffle && state.shuffleBag.length ? state.shuffleBag : state.queue;
 }
 
 function currentTrack() {
+  if (state.entries?.length && state.index >= 0) {
+    return trackById(state.entries[state.index]?.trackId) ?? null;
+  }
   return trackById(activeOrder()[state.index]) ?? null;
+}
+
+function currentQueueEntry() {
+  return QueueModel?.currentEntry(state) ?? state.entries?.[state.index] ?? null;
+}
+
+function syncQueueProjection() {
+  if (QueueModel) {
+    QueueModel.syncQueueProjection(state);
+  } else {
+    state.queue = (state.entries || []).map((entry) => entry.trackId);
+  }
+}
+
+function commitQueueMutation({ announce = "", focusUid = "", preserveScroll = true } = {}) {
+  syncQueueProjection();
+  invalidateIncomingPreload();
+  postNowPlaying();
+  if (focusUid) {
+    queueDrawerFocusUid = focusUid;
+  }
+  if (announce) {
+    announceQueueChange(announce);
+  }
+  const scrollTop = preserveScroll && queueDrawerBody ? queueDrawerBody.scrollTop : 0;
+  updateNowPlaying();
+  if (preserveScroll && queueDrawerBody) {
+    queueDrawerBody.scrollTop = scrollTop;
+  }
+  writeSession();
+}
+
+function announceQueueChange(message) {
+  if (!queueDrawerStatus || !message) {
+    return;
+  }
+  window.clearTimeout(queueAnnounceTimer);
+  const prior = queueDrawerStatus.dataset.stableText || queueDrawerStatus.textContent || "";
+  queueDrawerStatus.dataset.stableText = prior;
+  queueDrawerStatus.innerHTML = `<span>${escapeHtml(message)}</span>`;
+  queueAnnounceTimer = window.setTimeout(() => {
+    queueAnnounceTimer = 0;
+    if (queueDrawerIsOpen()) {
+      renderQueueDrawer(true);
+    }
+  }, 1200);
 }
 
 function isRemotePlayback() {
@@ -1917,7 +2107,7 @@ function trapDrawerFocus(root, event) {
   if (event.key !== "Tab") {
     return;
   }
-  const focusable = [...root.querySelectorAll("button:not([disabled])")];
+  const focusable = [...root.querySelectorAll("button:not([disabled]), [data-queue-handle], .queue-row[tabindex]")];
   if (!focusable.length) {
     return;
   }
@@ -1948,27 +2138,56 @@ function queueSourceLabel(source) {
   }
 }
 
-function upcomingQueueIds() {
+function upcomingQueueEntries() {
   if (!currentTrack()) {
     return [];
   }
+  // Editable upcoming only — do not project repeat-all wrap-around history into the drawer.
+  if (QueueModel && state.entries.length) {
+    return QueueModel.upcomingEntries(state);
+  }
   const order = activeOrder();
-  const after = order.slice(state.index + 1);
-  return state.repeat === "all" ? [...after, ...order.slice(0, state.index)] : after;
+  return order.slice(state.index + 1).map((trackId, index) => ({
+    uid: `legacy_${index}_${trackId}`,
+    trackId,
+    origin: "source"
+  }));
 }
 
-function queueRowMarkup(track, current = false) {
+function upcomingQueueIds() {
+  return upcomingQueueEntries().map((entry) => entry.trackId);
+}
+
+function queueRowMarkup(track, { current = false, entry = null, upcomingIndex = -1 } = {}) {
   const mark = current && state.playing ? nowEqMarkup() : "";
+  const uid = entry?.uid || "";
+  const handle = current || !entry
+    ? ""
+    : `<span class="queue-row-handle" role="button" tabindex="0" data-queue-handle
+        aria-label="Reorder ${escapeHtml(track.title)} by ${escapeHtml(track.artist)}"
+        data-queue-entry="${escapeHtml(uid)}" data-queue-upcoming-index="${upcomingIndex}">
+        <i class="bi bi-grip-vertical" aria-hidden="true"></i>
+      </span>`;
+  const more = current || !entry
+    ? ""
+    : `<button class="queue-row-more" type="button" data-queue-more aria-label="More options for ${escapeHtml(track.title)}">
+        <i class="bi bi-three-dots" aria-hidden="true"></i>
+      </button>`;
   return `
-    <button class="device-row queue-row${current ? " is-current" : ""}" type="button"
-      data-queue-track="${escapeHtml(track.id)}"${current ? " data-queue-current" : ""}>
+    <div class="device-row queue-row${current ? " is-current" : ""}" role="button" tabindex="0"
+      data-queue-track="${escapeHtml(track.id)}"
+      ${uid ? `data-queue-entry="${escapeHtml(uid)}"` : ""}
+      ${upcomingIndex >= 0 ? `data-queue-upcoming-index="${upcomingIndex}"` : ""}
+      ${current ? " data-queue-current" : ""}>
+      ${handle}
       ${coverMarkup(track, "queue-row-cover")}
       <span class="device-row-copy">
         <span class="device-row-name">${escapeHtml(track.title)}</span>
         <span class="device-row-meta"><span>${escapeHtml(track.artist)}</span></span>
       </span>
+      ${more}
       <span class="device-row-mark">${mark}</span>
-    </button>
+    </div>
   `;
 }
 
@@ -1976,26 +2195,111 @@ function queueDrawerIsOpen() {
   return Boolean(queueDrawerRoot && !queueDrawerRoot.hidden);
 }
 
-function renderQueueDrawer() {
-  if (!queueDrawerBody || !queueDrawerIsOpen()) {
+function queuePrefersReducedMotion() {
+  return Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+}
+
+function upcomingEntriesForPaint() {
+  const entries = upcomingQueueEntries();
+  if (!queuePointerDrag?.order?.length) {
+    return entries;
+  }
+  const byUid = new Map(entries.map((entry) => [entry.uid, entry]));
+  return queuePointerDrag.order.map((uid) => byUid.get(uid)).filter(Boolean);
+}
+
+function paintQueueUpcomingVirtual({ animate = false } = {}) {
+  const host = queueDrawerBody?.querySelector("[data-queue-upcoming]");
+  if (!host) {
+    return;
+  }
+  const rowHeight = densityMetrics().queueRowHeight;
+  const entries = upcomingEntriesForPaint();
+  const total = entries.length;
+  host.style.height = `${Math.max(total, 0) * rowHeight}px`;
+  if (!total) {
+    host.innerHTML = `<p class="queue-empty-note">You've reached the end of the queue.</p>`;
+    return;
+  }
+
+  const scrollTop = queueDrawerBody.scrollTop;
+  const hostTop = host.offsetTop;
+  const viewStart = Math.max(0, scrollTop - hostTop);
+  const start = Math.max(0, Math.floor(viewStart / rowHeight) - QUEUE_VIRTUAL_OVERSCAN);
+  const visible = Math.ceil(queueDrawerBody.clientHeight / rowHeight) + QUEUE_VIRTUAL_OVERSCAN * 2;
+  const end = Math.min(total, start + Math.max(visible, QUEUE_DRAWER_LIMIT));
+  const slice = entries.slice(start, end);
+  const dragUid = queuePointerDrag?.uid || "";
+  const canAnimate = animate && !queuePrefersReducedMotion();
+  const existing = new Map();
+  host.querySelectorAll(".queue-virtual-row[data-queue-entry]").forEach((node) => {
+    existing.set(node.dataset.queueEntry, node);
+  });
+  const seen = new Set();
+
+  slice.forEach((entry, offset) => {
+    const track = trackById(entry.trackId);
+    if (!track) {
+      return;
+    }
+    const upcomingIndex = start + offset;
+    const top = upcomingIndex * rowHeight;
+    let row = existing.get(entry.uid);
+    const isNew = !row;
+    const isDragSlot = Boolean(dragUid && entry.uid === dragUid);
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "queue-virtual-row";
+      row.dataset.queueEntry = entry.uid;
+      row.style.height = `${rowHeight}px`;
+      row.innerHTML = queueRowMarkup(track, { entry, upcomingIndex });
+      host.appendChild(row);
+      syncCoverImages(row);
+    } else {
+      const inner = row.querySelector(".queue-row");
+      if (inner) {
+        inner.dataset.queueUpcomingIndex = String(upcomingIndex);
+      }
+      const handle = row.querySelector("[data-queue-handle]");
+      if (handle) {
+        handle.dataset.queueUpcomingIndex = String(upcomingIndex);
+      }
+    }
+    seen.add(entry.uid);
+    row.classList.toggle("is-drag-slot", isDragSlot);
+    // Only animate existing rows to their new slots; new virtual rows jump into place.
+    row.classList.toggle("is-shifting", canAnimate && !isDragSlot && !isNew);
+    row.style.top = `${top}px`;
+  });
+
+  existing.forEach((node, uid) => {
+    if (!seen.has(uid)) {
+      node.remove();
+    }
+  });
+  host.querySelector(".queue-empty-note")?.remove();
+  host.querySelector(".queue-insert-line")?.remove();
+}
+
+function renderQueueDrawer(force = false) {
+  if (!queueDrawerBody || !queueDrawerIsOpen() || queueDragActive) {
     return;
   }
 
   const track = currentTrack();
-  const upcoming = upcomingQueueIds().map(trackById).filter(Boolean);
-  const shown = upcoming.slice(0, QUEUE_DRAWER_LIMIT);
+  const currentEntry = currentQueueEntry();
+  const upcoming = upcomingQueueEntries();
   const source = queueSourceLabel(state.queueSource);
-  // updateNowPlaying runs on every remote status poll, so skip redraws that
-  // would change nothing and reset hover and focus.
   const signature = JSON.stringify([
-    track?.id ?? null,
+    currentEntry?.uid ?? track?.id ?? null,
     state.playing,
     state.shuffle,
+    state.orderRevision,
     source,
     upcoming.length,
-    shown.map((item) => item.id)
+    upcoming.map((entry) => entry.uid)
   ]);
-  if (signature === queueDrawerSignature) {
+  if (!force && signature === queueDrawerSignature) {
     return;
   }
   queueDrawerSignature = signature;
@@ -2008,6 +2312,7 @@ function renderQueueDrawer() {
         text += " · Shuffle on";
       }
     }
+    queueDrawerStatus.dataset.stableText = text;
     queueDrawerStatus.innerHTML = `<span>${escapeHtml(text)}</span>`;
   }
 
@@ -2024,26 +2329,25 @@ function renderQueueDrawer() {
 
   const active = document.activeElement;
   const hadFocus = queueDrawerBody.contains(active);
-  const focusedId = hadFocus && !active.hasAttribute("data-queue-current") ? active.dataset.queueTrack : "";
+  const focusedUid = queueDrawerFocusUid
+    || (hadFocus ? active.closest?.("[data-queue-entry]")?.dataset.queueEntry : "")
+    || "";
 
   const heading = source ? `Next from: ${source}` : "Next up";
-  const rows = shown.length
-    ? shown.map((item) => queueRowMarkup(item)).join("")
-    : `<p class="queue-empty-note">You've reached the end of the queue.</p>`;
-  const hidden = upcoming.length - shown.length;
-  const more = hidden > 0 ? `<p class="queue-more">And ${songLabel(hidden)} more</p>` : "";
-
   queueDrawerBody.innerHTML = `
     <div class="queue-section-label">Now playing</div>
-    ${queueRowMarkup(track, true)}
-    <div class="queue-section-label">${escapeHtml(heading)}</div>
-    ${rows}
-    ${more}
+    ${queueRowMarkup(track, { current: true, entry: currentEntry })}
+    <div class="queue-section-label queue-section-label-next">
+      <span>${escapeHtml(heading)}</span>
+    </div>
+    <div class="queue-upcoming" data-queue-upcoming></div>
   `;
-  syncCoverImages(queueDrawerBody);
+  paintQueueUpcomingVirtual();
 
-  if (hadFocus) {
-    const target = (focusedId && queueDrawerBody.querySelector(`[data-queue-track="${CSS.escape(focusedId)}"]:not([data-queue-current])`))
+  const restoreUid = focusedUid || queueDrawerFocusUid;
+  queueDrawerFocusUid = "";
+  if (hadFocus || restoreUid) {
+    const target = (restoreUid && queueDrawerBody.querySelector(`[data-queue-entry="${CSS.escape(restoreUid)}"][data-queue-handle], [data-queue-entry="${CSS.escape(restoreUid)}"]`))
       || queueDrawerBody.querySelector("[data-queue-current]");
     target?.focus({ preventScroll: true });
   }
@@ -2096,13 +2400,191 @@ function closeQueueDrawer() {
   }
 }
 
-function playQueuedTrack(trackId, isCurrent) {
+function playQueuedTrack(trackId, isCurrent, entryUid = "") {
   if (isCurrent) {
     togglePlay();
     return;
   }
+  if (entryUid && QueueModel) {
+    const entry = QueueModel.jumpToEntry(state, entryUid);
+    if (entry) {
+      playTrack(entry.trackId, null, { keepBag: true, keepEntries: true, entryUid: entry.uid });
+      return;
+    }
+  }
   if (trackById(trackId)) {
-    playTrack(trackId, null, { keepBag: true });
+    playTrack(trackId, null, { keepBag: true, keepEntries: true });
+  }
+}
+
+function playNextTracks(trackIds) {
+  if (!QueueModel || !trackIds?.length) {
+    return;
+  }
+  const ids = trackIds.filter((id) => trackById(id));
+  if (!ids.length) {
+    return;
+  }
+  const wasEmpty = !state.entries.length;
+  QueueModel.playNextTracks(state, ids);
+  commitQueueMutation({ announce: ids.length === 1 ? "Queued to play next" : `Queued ${ids.length} songs to play next` });
+  if (wasEmpty) {
+    playTrack(ids[0], null, { keepEntries: true, entryUid: state.entries[0]?.uid, autoplay: true });
+  }
+}
+
+function addToQueueTracks(trackIds) {
+  if (!QueueModel || !trackIds?.length) {
+    return;
+  }
+  const ids = trackIds.filter((id) => trackById(id));
+  if (!ids.length) {
+    return;
+  }
+  const wasEmpty = !state.entries.length;
+  QueueModel.addToQueueTracks(state, ids);
+  commitQueueMutation({ announce: ids.length === 1 ? "Added to queue" : `Added ${ids.length} songs to queue` });
+  if (wasEmpty) {
+    playTrack(ids[0], null, { keepEntries: true, entryUid: state.entries[0]?.uid, autoplay: true });
+  }
+}
+
+function removeQueueEntry(uid) {
+  if (!QueueModel || !uid) {
+    return;
+  }
+  const result = QueueModel.removeEntry(state, uid);
+  if (!result.removed) {
+    return;
+  }
+  commitQueueMutation({ announce: "Removed from queue" });
+}
+
+function moveQueueEntry(uid, toUpcomingIndex) {
+  if (!QueueModel || !uid) {
+    return false;
+  }
+  const moved = QueueModel.moveUpcomingEntry(state, uid, toUpcomingIndex);
+  if (!moved) {
+    return false;
+  }
+  commitQueueMutation({ focusUid: uid, announce: "Moved in queue" });
+  return true;
+}
+
+function clearUpcomingQueue() {
+  if (!QueueModel || !state.entries.length) {
+    return;
+  }
+  const { removed } = QueueModel.clearUpcoming(state);
+  if (!removed.length) {
+    return;
+  }
+  queueClearUndo = {
+    removed: QueueModel.cloneEntries(removed),
+    index: state.index
+  };
+  window.clearTimeout(queueClearUndoTimer);
+  queueClearUndoTimer = window.setTimeout(() => {
+    queueClearUndo = null;
+    queueClearUndoTimer = 0;
+  }, 8000);
+  commitQueueMutation({ announce: "Cleared upcoming songs" });
+  showQueueUndoToast(removed.length);
+}
+
+function undoClearUpcomingQueue() {
+  if (!QueueModel || !queueClearUndo?.removed?.length) {
+    return;
+  }
+  QueueModel.restoreClearedUpcoming(state, queueClearUndo.removed);
+  queueClearUndo = null;
+  window.clearTimeout(queueClearUndoTimer);
+  queueClearUndoTimer = 0;
+  commitQueueMutation({ announce: "Restored upcoming songs" });
+}
+
+function showQueueUndoToast(count) {
+  const host = ensureSonoraToastHost();
+  const toast = document.createElement("div");
+  toast.className = "meta-toast";
+  toast.innerHTML = `
+    <i class="bi bi-music-note-list" aria-hidden="true"></i>
+    <div class="meta-toast-body">
+      <div class="meta-toast-title">Cleared ${songLabel(count)}</div>
+      <div class="meta-toast-msg">Upcoming songs removed from the queue.</div>
+    </div>
+    <button class="meta-toast-action" type="button">Undo</button>
+  `;
+  toast.querySelector(".meta-toast-action")?.addEventListener("click", () => {
+    toast.remove();
+    undoClearUpcomingQueue();
+  });
+  host.appendChild(toast);
+  window.setTimeout(() => toast.remove(), 8000);
+}
+
+function openQueueEntryMenu(uid, x, y, anchor = null) {
+  closeOverflowMenu();
+  const entry = state.entries.find((item) => item.uid === uid);
+  const track = entry ? trackById(entry.trackId) : null;
+  if (!entry || !track || entry.uid === currentQueueEntry()?.uid) {
+    return;
+  }
+  const root = ensureContextRoot();
+  contextMenuState.mode = "queue";
+  contextMenuState.trackId = track.id;
+  contextMenuState.trackIds = [track.id];
+  contextMenuState.entryUid = uid;
+  contextMenuState.playlistId = null;
+  contextMenuState.naming = false;
+  contextMenuState.query = "";
+  updateContextPlaylistActions();
+  updateContextQueueActions();
+  root.hidden = false;
+  const submenu = root.querySelector(".ctx-submenu");
+  if (submenu) {
+    submenu.hidden = true;
+  }
+  if (anchor) {
+    const rect = anchor.getBoundingClientRect();
+    positionContextMenu(rect.left, rect.bottom + 4);
+  } else {
+    positionContextMenu(x, y);
+  }
+}
+
+function updateContextQueueActions() {
+  const root = contextRoot;
+  if (!root) {
+    return;
+  }
+  const queueMode = contextMenuState.mode === "queue";
+  const headerMode = contextMenuState.mode === "queue-header";
+  root.querySelectorAll("[data-ctx-queue-only]").forEach((node) => {
+    node.hidden = !queueMode;
+  });
+  root.querySelectorAll("[data-ctx-library-queue]").forEach((node) => {
+    node.hidden = queueMode || headerMode;
+  });
+  root.querySelector("[data-ctx-clear-upcoming]")?.toggleAttribute("hidden", !headerMode);
+  const moveEnd = root.querySelector("[data-ctx-queue-end]");
+  if (moveEnd && queueMode && contextMenuState.entryUid) {
+    const upcoming = upcomingQueueEntries();
+    const index = upcoming.findIndex((entry) => entry.uid === contextMenuState.entryUid);
+    moveEnd.disabled = index < 0 || index === upcoming.length - 1;
+  }
+  const editMeta = root.querySelector("[data-ctx-edit-meta]");
+  if (editMeta) {
+    editMeta.hidden = queueMode || headerMode;
+  }
+  const addPlaylist = root.querySelector("[data-ctx-add]");
+  if (addPlaylist) {
+    addPlaylist.hidden = queueMode || headerMode;
+  }
+  const playlistActions = root.querySelector("[data-ctx-playlist-actions]");
+  if (playlistActions && (queueMode || headerMode)) {
+    playlistActions.hidden = true;
   }
 }
 
@@ -2305,6 +2787,16 @@ function randomQueueId(ids) {
 }
 
 function rebuildShuffleBag(currentId) {
+  if (QueueModel && state.entries.length) {
+    QueueModel.enableShuffle(state, shuffleInPlace);
+    if (currentId && state.entries[state.index]?.trackId !== currentId) {
+      const found = QueueModel.findEntryForTrackPlay(state, currentId);
+      if (found) {
+        state.index = found.index;
+      }
+    }
+    return;
+  }
   const rest = state.queue.filter((id) => id !== currentId);
   shuffleInPlace(rest);
   state.shuffleBag = currentId ? [currentId, ...rest] : [...rest];
@@ -2312,6 +2804,11 @@ function rebuildShuffleBag(currentId) {
 }
 
 function setShuffle(enabled) {
+  if (QueueModel && state.entries.length) {
+    QueueModel.setShuffle(state, enabled, shuffleInPlace);
+    commitQueueMutation();
+    return;
+  }
   const currentId = currentTrack()?.id;
   state.shuffle = enabled;
   if (enabled) {
@@ -3286,17 +3783,18 @@ function mountCollectionVirtual({ items, mode, showingArtists, renderItem }) {
     return;
   }
 
+  const listRowHeight = () => densityMetrics().collectionListRowHeight;
   const metrics = {
     columns: 1,
-    rowHeight: COLLECTION_LIST_ROW_HEIGHT,
-    cardHeight: COLLECTION_LIST_ROW_HEIGHT
+    rowHeight: listRowHeight(),
+    cardHeight: listRowHeight()
   };
 
   const remeasure = () => {
     if (mode === "list") {
       metrics.columns = 1;
-      metrics.cardHeight = COLLECTION_LIST_ROW_HEIGHT;
-      metrics.rowHeight = COLLECTION_LIST_ROW_HEIGHT;
+      metrics.cardHeight = listRowHeight();
+      metrics.rowHeight = listRowHeight();
     } else {
       metrics.columns = computeCollectionColumns(container.clientWidth);
       metrics.cardHeight = measureCollectionGridCardHeight(container, metrics.columns);
@@ -3702,13 +4200,22 @@ function darkenColor(color, factor) {
 }
 
 function setStageAccent(color, depth = 320) {
-  mainStage.style.background = color
-    ? `linear-gradient(180deg, ${color} 0%, var(--emp-bg) ${depth}px)`
+  if (!artworkAccentsEnabled()) {
+    setStageSolid(neutralStageColor());
+    return;
+  }
+  const themed = stageColorForTheme(color, "wash");
+  mainStage.style.background = themed
+    ? `linear-gradient(180deg, ${themed} 0%, var(--emp-bg) ${depth}px)`
     : "";
-  mainStage.style.setProperty("--stage-accent-bar", (color && darkenColor(color, 0.55)) || "");
+  mainStage.style.setProperty("--stage-accent-bar", themed ? stageBarColorForTheme(themed) : "");
 }
 
 async function setStageAccentFromArt(coverUrl, fallbackColor, depth = 320) {
+  if (!artworkAccentsEnabled()) {
+    setStageSolid(neutralStageColor());
+    return;
+  }
   const seq = renderSeq;
   if (coverUrl) {
     const color = await extractVibrantColor(coverUrl);
@@ -3723,8 +4230,8 @@ async function setStageAccentFromArt(coverUrl, fallbackColor, depth = 320) {
   setStageAccent(fallbackColor, depth);
 }
 
-/** Soften an accent for Home only — does not mutate extractVibrantColor / cache. */
-function softenHomeAccent(color) {
+/** Dark-only home soften — preserves existing Home stage look. */
+function softenHomeAccentDark(color) {
   const rgb = parseColor(color);
   if (!rgb) {
     return color;
@@ -3747,22 +4254,239 @@ function mixRgbColors(left, right, amount) {
 }
 
 function setHomeStageAccent(color, depth = 400) {
-  const soft = softenHomeAccent(color);
+  if (!artworkAccentsEnabled()) {
+    setStageSolid(neutralStageColor());
+    return;
+  }
+  const soft = stageColorForTheme(color, "home");
   if (!soft) {
     mainStage.style.background = "";
     mainStage.style.setProperty("--stage-accent-bar", "");
     return;
   }
-  const mid = mixRgbColors(soft, "#121212", 0.58);
+  const mixTarget = resolvedAppearanceTheme() === "light" ? "#f4f4f5" : "#121212";
+  const midBlend = resolvedAppearanceTheme() === "light" ? 0.55 : 0.58;
+  const mid = mixRgbColors(soft, mixTarget, midBlend);
   const midStop = Math.round(depth * 0.52);
   mainStage.style.background =
     `linear-gradient(180deg, ${soft} 0%, ${mid} ${midStop}px, var(--emp-bg) ${depth}px)`;
-  mainStage.style.setProperty("--stage-accent-bar", darkenColor(soft, 0.5) || "");
+  mainStage.style.setProperty("--stage-accent-bar", stageBarColorForTheme(soft) || "");
+}
+
+function applyNavStageAccent(color, depth = 320) {
+  if (!artworkAccentsEnabled()) {
+    setStageSolid(neutralStageColor());
+    return;
+  }
+  setStageAccent(color, depth);
+}
+
+function refreshLyricsStage() {
+  const track = currentTrack();
+  const trackId = track?.id ?? null;
+  const album = track ? albumById(track.albumId) : null;
+  const coverUrl = track?.coverUrl || album?.coverUrl || "";
+  const sourceFallback = album?.color || LYRICS_FALLBACK_COLOR;
+  if (!artworkAccentsEnabled()) {
+    setLyricsStage(LYRICS_FALLBACK_COLOR, { accents: false });
+    return;
+  }
+  setLyricsStage(coverUrl ? LYRICS_FALLBACK_COLOR : sourceFallback);
+  if (coverUrl) {
+    const seq = renderSeq;
+    extractVibrantColor(coverUrl).then((color) => {
+      if (seq === renderSeq && lyricsTrackId === trackId) {
+        setLyricsStage(color || sourceFallback);
+      }
+    });
+  }
+}
+
+/** Re-apply the visible stage for theme / artwork-accent changes without remounting the app. */
+function refreshStageForAppearance() {
+  const view = state.view;
+  if (view === "nowPlaying") {
+    return;
+  }
+  if (view === "lyrics") {
+    refreshLyricsStage();
+    return;
+  }
+  if (view === "home") {
+    setHomeStageAccent("#1e3b2a");
+    return;
+  }
+  if (view === "songs" || view === "tracks") {
+    applyNavStageAccent("#121826");
+    return;
+  }
+  if (view === "search") {
+    applyNavStageAccent("#1f1f1f");
+    return;
+  }
+  if (view === "albums") {
+    applyNavStageAccent("#3a1f12");
+    return;
+  }
+  if (view === "playlists") {
+    applyNavStageAccent("#2a1a3a");
+    return;
+  }
+  if (view === "mixes") {
+    applyNavStageAccent("#1e3b2a");
+    return;
+  }
+  if (view === "album" && state.albumId) {
+    const album = albumById(state.albumId);
+    if (!album) {
+      return;
+    }
+    setStageAccent(album.color, 420);
+    setStageAccentFromArt(album.coverUrl, album.color, 420);
+    return;
+  }
+  if (view === "playlist" && state.playlistId) {
+    const playlist = playlistById(state.playlistId);
+    if (!playlist) {
+      return;
+    }
+    const cover = playlistCoverItem(playlist);
+    const tracks = playlistTracks(playlist);
+    const album = albumById(tracks[0]?.albumId);
+    const playlistFallback = isLikedPlaylist(playlist) ? "#450af5" : (album?.color || cover.color || "#3a1f12");
+    setStageAccent(playlistFallback, 420);
+    if (!isLikedPlaylist(playlist)) {
+      setStageAccentFromArt(cover.coverUrl || album?.coverUrl, playlistFallback, 420);
+    }
+    return;
+  }
+  if (view === "mix" && state.mixId) {
+    const mix = typeof mixById === "function" ? mixById(state.mixId) : null;
+    if (!mix) {
+      setHomeStageAccent("#1e3b2a");
+      return;
+    }
+    const tracks = typeof mixTracks === "function" ? mixTracks(mix) : [];
+    const accentAlbum = albumById(tracks[0]?.albumId);
+    const fallback = accentAlbum?.color || "#1e3b2a";
+    setStageAccent(fallback, 420);
+    setStageAccentFromArt(tracks[0]?.coverUrl || accentAlbum?.coverUrl, fallback, 420);
+    return;
+  }
+  if (view === "artist" && state.artist) {
+    const albums = sortAlbums(albumsByArtist(state.artist));
+    const tracks = tracksByArtist(state.artist);
+    const accent = albums[0]?.color || tracks[0]?.color || "#3a1f12";
+    const artistArtUrl = albums[0]?.coverUrl || tracks[0]?.coverUrl;
+    setStageAccent(accent, 420);
+    setStageAccentFromArt(artistArtUrl, accent, 420);
+  }
+}
+
+function applyAppearanceFromState({ refreshStage = true, refreshDensity = false, persist = false } = {}) {
+  const prefs = appearancePrefs();
+  state.appearance = prefs;
+  window.EmpAppearance?.applyAppearance?.(prefs);
+  if (refreshStage) {
+    refreshStageForAppearance();
+  }
+  if (refreshDensity) {
+    refreshDensityDependentUi();
+  }
+  if (persist) {
+    writeSession();
+  }
+  return prefs;
+}
+
+function setAppearance(patch, options = {}) {
+  const next = window.EmpAppearance?.normalizeAppearance?.({
+    ...appearancePrefs(),
+    ...patch
+  }) || { ...appearancePrefs(), ...patch };
+  const prev = appearancePrefs();
+  state.appearance = next;
+  const densityChanged = prev.density !== next.density;
+  const stageChanged = prev.theme !== next.theme
+    || prev.artworkAccents !== next.artworkAccents;
+  applyAppearanceFromState({
+    refreshStage: options.refreshStage ?? stageChanged,
+    refreshDensity: options.refreshDensity ?? densityChanged,
+    persist: options.persist !== false
+  });
+  if (state.settingsOpen || state.view === "settings") {
+    if (options.rerenderSettings !== false) {
+      renderSettings();
+    }
+  }
+  return next;
+}
+
+function resetAppearanceToDefaults() {
+  return setAppearance(window.EmpAppearance?.cloneDefaults?.() || {
+    theme: "dark",
+    accent: "emp",
+    accentCustom: "#20c77a",
+    density: "comfortable",
+    artworkAccents: true
+  }, { refreshStage: true, refreshDensity: true });
 }
 
 function setStageSolid(color) {
   mainStage.style.background = color;
   mainStage.style.setProperty("--stage-accent-bar", color);
+}
+
+/**
+ * Lyrics stage paint. Dark keeps EMP's deep solid fill for white lyric text.
+ * Light builds a soft full-stage artwork wash that settles into the canvas —
+ * never a flat saturated slab, never pure white.
+ */
+function setLyricsStage(sourceColor, { accents = true } = {}) {
+  if (!accents || !artworkAccentsEnabled()) {
+    if (resolvedAppearanceTheme() === "light") {
+      setStageSolid(neutralStageColor());
+      return;
+    }
+    setStageSolid(lyricsBackgroundColor(LYRICS_FALLBACK_COLOR));
+    return;
+  }
+
+  if (resolvedAppearanceTheme() !== "light") {
+    setStageSolid(lyricsBackgroundColor(sourceColor));
+    return;
+  }
+
+  const wash = lyricsLightStageWash(sourceColor);
+  mainStage.style.background =
+    `linear-gradient(165deg, ${wash.top} 0%, ${wash.mid} 40%, ${wash.low} 72%, var(--emp-bg) 100%)`;
+  mainStage.style.setProperty("--stage-accent-bar", wash.bar);
+}
+
+/** Soft, desaturated Light lyrics atmosphere from an artwork accent. */
+function lyricsLightStageWash(sourceColor) {
+  const rgb = parseColor(sourceColor) ?? parseColor(LYRICS_FALLBACK_COLOR);
+  let [h, s] = rgbToHsl(rgb);
+  const nearGrey = s < 0.08;
+  const baseS = nearGrey
+    ? 0.04
+    : Math.min(0.34, Math.max(0.1, s * 0.46));
+
+  const tone = (sat, light, blend) => {
+    const out = hslToRgb([h, sat, light]);
+    return mixRgbColors(
+      `rgb(${out[0]}, ${out[1]}, ${out[2]})`,
+      "#eef0f3",
+      blend
+    );
+  };
+
+  // Gentle tonal steps — same hue family, soft depth, no hard seams.
+  const top = tone(baseS, nearGrey ? 0.88 : 0.82, 0.12);
+  const mid = tone(Math.min(baseS * 0.9, 0.3), 0.88, 0.28);
+  const low = tone(Math.min(baseS * 0.55, 0.18), 0.93, 0.46);
+  const bar = tone(Math.min(baseS * 1.08, 0.32), 0.78, 0.1);
+  return { top, mid, low, bar };
 }
 
 function rgbToHsl([r, g, b]) {
@@ -4247,6 +4971,7 @@ function navigate(entry, { push = true } = {}) {
 
 function render(entry) {
   renderSeq += 1;
+  const leavingNowPlaying = state.view === "nowPlaying" && entry.view !== "nowPlaying";
   if (entry.view !== "settings" && state.settingsOpen) {
     hideSettingsOverlayDom();
     state.settingsOpen = false;
@@ -4304,25 +5029,25 @@ function render(entry) {
     setHomeStageAccent("#1e3b2a");
     renderHome();
   } else if (entry.view === "songs") {
-    setStageAccent("#121826");
+    applyNavStageAccent("#121826");
     ensureListenStatsForSongs();
     renderSongs();
   } else if (entry.view === "search") {
-    setStageAccent("#1f1f1f");
+    applyNavStageAccent("#1f1f1f");
     clearTimeout(searchDebounceTimer);
     searchDebounceTimer = 0;
     renderSearch({ requestId: ++searchRequestId });
   } else if (entry.view === "albums") {
-    setStageAccent("#3a1f12");
+    applyNavStageAccent("#3a1f12");
     renderAlbumGrid();
     if (resetBrowseScroll) {
       viewArea.scrollTop = 0;
     }
   } else if (entry.view === "tracks") {
-    setStageAccent("#121826");
+    applyNavStageAccent("#121826");
     renderAllTracks();
   } else if (entry.view === "playlists") {
-    setStageAccent("#2a1a3a");
+    applyNavStageAccent("#2a1a3a");
     renderPlaylistsLibrary();
   } else if (entry.view === "album") {
     renderAlbum(entry.albumId);
@@ -4339,9 +5064,18 @@ function render(entry) {
     openSettingsOverlay(entry.section, { fromHistory: true });
   } else if (entry.view === "lyrics") {
     renderLyrics();
+  } else if (entry.view === "nowPlaying") {
+    renderNowPlaying();
   }
+
+  if (leavingNowPlaying) {
+    teardownNowPlayingAmbient();
+  }
+
   mainStage.classList.toggle("is-lyrics", entry.view === "lyrics");
+  mainStage.classList.toggle("is-now-playing", entry.view === "nowPlaying");
   syncLyricsButton();
+  syncNowPlayingCoverButton();
 
   renderLibraryList();
   mountTopCollection();
@@ -6256,6 +6990,86 @@ function renderPersonalizationSettingsSection() {
     </section>`;
 }
 
+function renderAppearanceAccentSwatches(prefs) {
+  const presets = window.EmpAppearance?.ACCENT_PRESETS || {};
+  const presetButtons = Object.values(presets).map((preset) => {
+    const selected = prefs.accent === preset.id;
+    return `
+      <button type="button"
+        class="appearance-swatch${selected ? " is-selected" : ""}"
+        style="--swatch-color:${escapeHtml(preset.color)}"
+        data-appearance-accent="${escapeHtml(preset.id)}"
+        role="radio"
+        aria-checked="${selected ? "true" : "false"}"
+        aria-label="${escapeHtml(preset.label)}"
+        title="${escapeHtml(preset.label)}"></button>`;
+  }).join("");
+  const customSelected = prefs.accent === "custom";
+  const customColor = escapeHtml(prefs.accentCustom || "#20c77a");
+  return `
+    <div class="appearance-swatches" role="radiogroup" aria-label="Accent color">
+      ${presetButtons}
+      <label class="appearance-swatch appearance-swatch-custom${customSelected ? " is-selected" : ""}"
+        style="--swatch-color:${customColor}"
+        title="Custom"
+        tabindex="0">
+        <input type="color"
+          value="${customColor}"
+          data-appearance-accent-custom
+          aria-label="Custom accent color">
+        <span class="appearance-swatch-custom-glyph" aria-hidden="true">
+          <i class="bi bi-eyedropper"></i>
+        </span>
+      </label>
+    </div>`;
+}
+
+function renderAppearanceSettingsSection() {
+  const prefs = appearancePrefs();
+  return `
+    <section class="settings-group">
+      <h2>Appearance</h2>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Theme</span>
+          <span class="settings-desc">Choose Dark, Light, or match your system setting.</span>
+        </div>
+        <div class="settings-segmented" role="group" aria-label="Theme">
+          <button type="button" class="settings-segment${prefs.theme === "dark" ? " is-selected" : ""}" data-appearance-theme="dark">Dark</button>
+          <button type="button" class="settings-segment${prefs.theme === "light" ? " is-selected" : ""}" data-appearance-theme="light">Light</button>
+          <button type="button" class="settings-segment${prefs.theme === "system" ? " is-selected" : ""}" data-appearance-theme="system">System</button>
+        </div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Accent color</span>
+          <span class="settings-desc">Used for selected controls, progress, and highlights.</span>
+        </div>
+        ${renderAppearanceAccentSwatches(prefs)}
+      </div>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Interface density</span>
+          <span class="settings-desc">Comfortable keeps EMP's current spacing. Compact tightens lists and tables.</span>
+        </div>
+        <div class="settings-segmented" role="group" aria-label="Interface density">
+          <button type="button" class="settings-segment${prefs.density === "comfortable" ? " is-selected" : ""}" data-appearance-density="comfortable">Comfortable</button>
+          <button type="button" class="settings-segment${prefs.density === "compact" ? " is-selected" : ""}" data-appearance-density="compact">Compact</button>
+        </div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Artwork-derived backgrounds</span>
+          <span class="settings-desc">Use colors from album artwork to personalize album and library pages.</span>
+        </div>
+        ${settingSwitch("artworkAccents", prefs.artworkAccents !== false, "Artwork-derived backgrounds")}
+      </div>
+      <div class="settings-row settings-folder-actions">
+        <button class="eq-reset" type="button" data-appearance-reset>Reset Appearance to Defaults</button>
+      </div>
+    </section>`;
+}
+
 function renderPreampControl() {
   const preamp = window.EmpSonoraPreamp;
   const min = preamp?.PREAMP_MIN_DB ?? -24;
@@ -6405,6 +7219,8 @@ function renderSettingsSectionContent(sectionId) {
       return renderGeneralSettingsSection();
     case "library":
       return renderLibrarySettingsGroup();
+    case "appearance":
+      return renderAppearanceSettingsSection();
     case "playback":
       return renderPlaybackSettingsSection();
     case "audio":
@@ -7040,7 +7856,7 @@ function renderMixes() {
     `;
     return;
   }
-  setStageAccent("#1e3b2a");
+  applyNavStageAccent("#1e3b2a");
   viewArea.innerHTML = `
     <div class="home-page">
       <h1 class="greeting">Your Mixes</h1>
@@ -7278,19 +8094,7 @@ function renderLyrics() {
   const track = currentTrack();
   const trackId = track?.id ?? null;
   lyricsTrackId = trackId;
-  const album = track ? albumById(track.albumId) : null;
-  const coverUrl = track?.coverUrl || album?.coverUrl || "";
-  const fallback = lyricsBackgroundColor(album?.color || LYRICS_FALLBACK_COLOR);
-
-  setStageSolid(coverUrl ? lyricsBackgroundColor(LYRICS_FALLBACK_COLOR) : fallback);
-  if (coverUrl) {
-    const seq = renderSeq;
-    extractVibrantColor(coverUrl).then((color) => {
-      if (seq === renderSeq && lyricsTrackId === trackId) {
-        setStageSolid(color ? lyricsBackgroundColor(color) : fallback);
-      }
-    });
-  }
+  refreshLyricsStage();
 
   // While a track change is still debouncing, syncLyricsRequests will ask for this track.
   if (track && !lyricsRequestTimer) {
@@ -7663,6 +8467,190 @@ function toggleLyricsView() {
   }
 }
 
+function teardownNowPlayingAmbient() {
+  window.EmpNowPlayingAmbient?.unmount();
+  nowPlayingTrackId = null;
+  nowPlayingCoverIdentity = "";
+}
+
+function syncNowPlayingCoverButton() {
+  if (!nowCover) {
+    return;
+  }
+  const open = state.view === "nowPlaying";
+  nowCover.classList.toggle("is-now-playing-open", open);
+  const label = open ? "Close Now Playing" : "Open Now Playing";
+  setTooltipTitle(nowCover, label);
+  const icon = nowCover.querySelector(".now-cover-expand i");
+  if (icon) {
+    icon.className = open ? "bi bi-arrows-angle-contract" : "bi bi-arrows-angle-expand";
+  }
+}
+
+function ensureNowCoverExpandChrome() {
+  if (!nowCover) {
+    return;
+  }
+  let overlay = nowCover.querySelector(".now-cover-expand");
+  if (!overlay) {
+    overlay = document.createElement("span");
+    overlay.className = "now-cover-expand";
+    overlay.setAttribute("aria-hidden", "true");
+    overlay.innerHTML = '<i class="bi bi-arrows-angle-expand"></i>';
+    nowCover.appendChild(overlay);
+  }
+  syncNowPlayingCoverButton();
+}
+
+function toggleNowPlayingView() {
+  if (state.view !== "nowPlaying") {
+    navigate({ view: "nowPlaying" });
+    return;
+  }
+  if (historyIndex > 0) {
+    historyIndex -= 1;
+    render(historyStack[historyIndex]);
+  } else {
+    navigate({ view: "home" });
+  }
+}
+
+function renderNowPlaying() {
+  setStageSolid("#090909");
+  nowPlayingTrackId = null;
+  nowPlayingCoverIdentity = "";
+  viewArea.innerHTML = `
+    <div class="now-playing-page" data-now-playing>
+      <canvas class="now-playing-ambient" aria-hidden="true"></canvas>
+      <div class="now-playing-dim" aria-hidden="true"></div>
+      <div class="now-playing-empty empty-state" data-np-empty hidden>
+        <h2>Nothing playing yet</h2>
+        <p>Choose a song from your library to bring this space to life.</p>
+      </div>
+      <div class="now-playing-content" data-np-content hidden>
+        <div class="now-playing-layout">
+          <div class="now-playing-art-wrap" data-np-art></div>
+          <div class="now-playing-meta">
+            <h1 class="now-playing-title" data-np-title></h1>
+            <button class="now-playing-artist" type="button" data-np-artist data-open-artist=""></button>
+            <p class="now-playing-album" data-np-album></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  const canvas = viewArea.querySelector(".now-playing-ambient");
+  window.EmpNowPlayingAmbient?.mount(canvas);
+  updateNowPlayingPageContent({ immediate: true });
+}
+
+function updateNowPlayingPageContent({ immediate = false } = {}) {
+  const root = viewArea.querySelector("[data-now-playing]");
+  if (!root || state.view !== "nowPlaying") {
+    return;
+  }
+
+  const emptyEl = root.querySelector("[data-np-empty]");
+  const contentEl = root.querySelector("[data-np-content]");
+  const artEl = root.querySelector("[data-np-art]");
+  const titleEl = root.querySelector("[data-np-title]");
+  const artistEl = root.querySelector("[data-np-artist]");
+  const albumEl = root.querySelector("[data-np-album]");
+  const Ambient = window.EmpNowPlayingAmbient;
+  const track = currentTrack();
+  const generation = ++nowPlayingGeneration;
+
+  if (!track) {
+    emptyEl?.removeAttribute("hidden");
+    contentEl?.setAttribute("hidden", "");
+    if (artEl) {
+      artEl.innerHTML = "";
+      artEl.style.removeProperty("--np-art-glow");
+    }
+    if (titleEl) {
+      titleEl.textContent = "";
+    }
+    if (artistEl) {
+      artistEl.textContent = "";
+      artistEl.dataset.openArtist = "";
+      artistEl.disabled = true;
+    }
+    if (albumEl) {
+      albumEl.textContent = "";
+    }
+    nowPlayingTrackId = null;
+    nowPlayingCoverIdentity = "";
+    Ambient?.setArtwork("", { generation, immediate: true });
+    return;
+  }
+
+  emptyEl?.setAttribute("hidden", "");
+  contentEl?.removeAttribute("hidden");
+
+  const album = albumById(track.albumId);
+  const coverUrl = track.coverUrl || album?.coverUrl || "";
+  const coverIdentity = coverUrlIdentity(coverUrl);
+  const year = album?.year ? String(album.year) : "";
+  const albumLine = [track.album || album?.title || "", year].filter(Boolean).join(" · ");
+  const glowColor = album?.color || "#5a5a5a";
+
+  if (titleEl) {
+    titleEl.textContent = track.title || "";
+  }
+  if (artistEl) {
+    artistEl.textContent = track.artist || "";
+    artistEl.dataset.openArtist = track.artist || "";
+    artistEl.disabled = !track.artist;
+  }
+  if (albumEl) {
+    albumEl.textContent = albumLine;
+  }
+
+  if (artEl) {
+    artEl.style.setProperty("--np-art-glow", glowColor);
+    const artChanged = artEl.dataset.coverIdentity !== coverIdentity
+      || (!coverIdentity && artEl.dataset.trackId !== String(track.id));
+    if (artChanged) {
+      artEl.dataset.coverIdentity = coverIdentity;
+      artEl.dataset.trackId = String(track.id);
+      artEl.innerHTML = coverMarkup(
+        {
+          coverUrl: coverUrl || undefined,
+          title: track.title,
+          color: album?.color
+        },
+        "now-playing-art"
+      );
+      syncCoverImages(artEl);
+    }
+  }
+
+  nowPlayingTrackId = track.id;
+  if (coverIdentity !== nowPlayingCoverIdentity || immediate) {
+    nowPlayingCoverIdentity = coverIdentity;
+    Ambient?.setArtwork(coverUrl, {
+      generation,
+      immediate,
+      seedColors: album?.color ? [album.color] : undefined
+    });
+  }
+}
+
+function syncNowPlayingView() {
+  syncNowPlayingCoverButton();
+  if (state.view !== "nowPlaying") {
+    window.EmpNowPlayingAmbient?.setVisible(false);
+    return;
+  }
+  window.EmpNowPlayingAmbient?.setVisible(true);
+  const track = currentTrack();
+  const trackId = track?.id ?? null;
+  const coverIdentity = coverUrlIdentity(track?.coverUrl || albumById(track?.albumId)?.coverUrl || "");
+  if (trackId !== nowPlayingTrackId || coverIdentity !== nowPlayingCoverIdentity) {
+    updateNowPlayingPageContent();
+  }
+}
+
 function renderEmpty() {
   const hasFolders = musicFolders().length > 0;
   viewArea.innerHTML = `
@@ -7728,21 +8716,24 @@ function mountTrackVirtual(tracks, showAlbum) {
     return;
   }
 
-  spacer.style.height = `${tracks.length * TRACK_ROW_HEIGHT}px`;
+  const rowHeight = () => densityMetrics().trackRowHeight;
+  spacer.style.height = `${tracks.length * rowHeight()}px`;
 
   const paint = () => {
+    const stride = rowHeight();
+    spacer.style.height = `${tracks.length * stride}px`;
     const currentId = currentTrack()?.id;
     const tableTop = table.offsetTop;
-    const start = Math.max(0, Math.floor((viewArea.scrollTop - tableTop) / TRACK_ROW_HEIGHT) - 12);
-    const visible = Math.ceil(viewArea.clientHeight / TRACK_ROW_HEIGHT) + 24;
+    const start = Math.max(0, Math.floor((viewArea.scrollTop - tableTop) / stride) - 12);
+    const visible = Math.ceil(viewArea.clientHeight / stride) + 24;
     const end = Math.min(tracks.length, start + visible);
     const slice = tracks.slice(start, end);
 
     table.querySelectorAll(".track-row").forEach((row) => row.remove());
     spacer.insertAdjacentHTML("afterend", slice.map((track, index) => trackRow(track, start + index, showAlbum, currentId)).join(""));
     table.querySelectorAll(".track-row").forEach((row, index) => {
-      row.style.top = `${(start + index) * TRACK_ROW_HEIGHT}px`;
-      row.style.height = `${TRACK_ROW_HEIGHT}px`;
+      row.style.top = `${(start + index) * stride}px`;
+      row.style.height = `${stride}px`;
     });
     syncCoverImages(table);
   };
@@ -8069,6 +9060,9 @@ function cancelTransition() {
 }
 
 function peekNextId({ wrap = true } = {}) {
+  if (QueueModel && state.entries.length) {
+    return QueueModel.peekNextTrackId(state, { wrap });
+  }
   const order = activeOrder();
   if (!order.length) {
     return null;
@@ -8080,6 +9074,11 @@ function peekNextId({ wrap = true } = {}) {
 }
 
 function advanceQueueTo(trackId) {
+  if (QueueModel && state.entries.length) {
+    QueueModel.advanceToTrackId(state, trackId);
+    syncQueueProjection();
+    return;
+  }
   const order = activeOrder();
   const index = order.indexOf(trackId);
   if (index >= 0) {
@@ -8088,7 +9087,6 @@ function advanceQueueTo(trackId) {
 }
 
 function invalidateIncomingPreload() {
-  preloadGeneration += 1;
   maybePreloadSonoraNext();
 }
 
@@ -8454,6 +9452,7 @@ function updateNowPlaying() {
     nowCover.removeAttribute("style");
     nowCover.innerHTML = "";
     nowCover.classList.remove("cover-fallback");
+    ensureNowCoverExpandChrome();
     nowTitle.textContent = "Select a track";
     nowArtist.textContent = "EMP";
     setNowPlayingInteractive(false);
@@ -8466,6 +9465,7 @@ function updateNowPlaying() {
     renderQueueDrawer();
     syncLyricsRequests();
     syncLyricsView();
+    syncNowPlayingView();
     postNowPlaying();
     return;
   }
@@ -8483,6 +9483,7 @@ function updateNowPlaying() {
     nowCover.setAttribute("style", coverBackground(track));
     nowCover.innerHTML = '<i class="bi bi-music-note-beamed"></i>';
   }
+  ensureNowCoverExpandChrome();
   nowTitle.textContent = track.title;
   nowArtist.textContent = track.artist;
   setNowPlayingInteractive(true);
@@ -8512,6 +9513,7 @@ function updateNowPlaying() {
   renderQueueDrawer();
   syncLyricsRequests();
   syncLyricsView();
+  syncNowPlayingView();
   postNowPlaying();
 }
 
@@ -8522,14 +9524,56 @@ async function playTrack(id, queueIds, options = {}) {
   cancelTransition();
 
   if (queueIds) {
-    state.queue = [...queueIds];
-    state.queueSource = normalizeQueueSource(options.source);
-  } else if (!state.queue.length) {
-    state.queue = state.library.tracks.map((track) => track.id);
-    state.queueSource = { kind: "library" };
+    if (QueueModel) {
+      QueueModel.replaceQueue(state, [...queueIds], id, {
+        source: normalizeQueueSource(options.source)
+      });
+      if (state.shuffle) {
+        QueueModel.enableShuffle(state, shuffleInPlace);
+      }
+    } else {
+      state.queue = [...queueIds];
+      state.queueSource = normalizeQueueSource(options.source);
+    }
+  } else if (!state.entries.length && !state.queue.length) {
+    const libraryIds = state.library.tracks.map((track) => track.id);
+    if (QueueModel) {
+      QueueModel.replaceQueue(state, libraryIds, id, { source: { kind: "library" } });
+    } else {
+      state.queue = libraryIds;
+      state.queueSource = { kind: "library" };
+    }
   }
 
-  if (state.shuffle) {
+  if (QueueModel && state.entries.length) {
+    if (options.entryUid) {
+      const index = QueueModel.entryIndexByUid(state.entries, options.entryUid);
+      if (index >= 0) {
+        state.index = index;
+        if (!options.keepEntries && !options.keepBag) {
+          state.playNextCount = 0;
+        }
+        syncQueueProjection();
+      }
+    } else if (options.keepBag || options.keepEntries) {
+      const found = QueueModel.findEntryForTrackPlay(state, id, { preferUid: options.entryUid });
+      if (found) {
+        state.index = found.index;
+        syncQueueProjection();
+      }
+    } else if (!queueIds) {
+      const found = QueueModel.findEntryForTrackPlay(state, id);
+      if (found) {
+        state.index = found.index;
+        syncQueueProjection();
+      } else {
+        QueueModel.addToQueueTracks(state, [id]);
+        state.index = state.entries.length - 1;
+        syncQueueProjection();
+      }
+    }
+    state.shuffleBag = [];
+  } else if (state.shuffle) {
     if (options.keepBag && state.shuffleBag.includes(id)) {
       state.index = state.shuffleBag.indexOf(id);
     } else {
@@ -8695,17 +9739,51 @@ function handleSonoraPlaybackError(detail) {
 
 function maybePreloadSonoraNext() {
   if (!window.EmpSonora?.available || isRemotePlayback()) {
+    plannedSonoraPreloadGeneration = QueueModel
+      ? QueueModel.bumpPreloadGeneration(state)
+      : (state.preloadGeneration = (Number(state.preloadGeneration) || 0) + 1);
+    plannedSonoraNextTrackId = null;
     return;
   }
-  const nextId = peekNextId({ wrap: state.repeat === "all" });
-  const shouldPreload = state.repeat !== "one"
-    && (state.gapless || state.crossfade)
-    && Boolean(nextId);
-  if (!shouldPreload) {
-    window.EmpSonora.clearNext();
+
+  const shouldPreload = state.repeat !== "one" && (state.gapless || state.crossfade);
+  const plan = QueueModel
+    ? QueueModel.planNextPreload(state, {
+      wrap: state.repeat === "all",
+      repeatOne: state.repeat === "one",
+      shouldPreload
+    })
+    : {
+      generation: (state.preloadGeneration = (Number(state.preloadGeneration) || 0) + 1),
+      nextTrackId: shouldPreload ? peekNextId({ wrap: state.repeat === "all" }) : null,
+      action: shouldPreload && peekNextId({ wrap: state.repeat === "all" }) ? "preload" : "clear"
+    };
+
+  plannedSonoraPreloadGeneration = plan.generation;
+  plannedSonoraNextTrackId = plan.action === "preload" ? plan.nextTrackId : null;
+
+  if (plan.action !== "preload" || !plan.nextTrackId) {
+    window.EmpSonora.clearNext?.();
     return;
   }
-  window.EmpSonora.preloadNext(nextId);
+
+  window.EmpSonora.preloadNext(plan.nextTrackId);
+
+  // Re-check after the post in case a later mutation already superseded this plan.
+  if (QueueModel && !QueueModel.isPreloadPlanCurrent(state, plan.generation)) {
+    maybePreloadSonoraNext();
+  }
+}
+
+function sonoraPreloadMatchesPlan(trackId) {
+  if (!QueueModel) {
+    return true;
+  }
+  if (!QueueModel.isPreloadPlanCurrent(state, plannedSonoraPreloadGeneration)) {
+    return false;
+  }
+  const expected = plannedSonoraNextTrackId ?? peekNextId({ wrap: state.repeat === "all" });
+  return !trackId || trackId === expected;
 }
 
 /**
@@ -8786,14 +9864,39 @@ async function restoreSession() {
     return;
   }
 
-  const compactLibrary = session.queueCompact === true
+  const hasEntrySession = Array.isArray(session.entries) && session.entries.length;
+  const userModified = Boolean(session.queueDirty)
+    || (hasEntrySession && session.entries.some((entry) => entry?.origin === "user"));
+  const compactLibrary = !userModified
+    && session.queueCompact === true
     && (session.queueSource?.kind === "library" || session.queueSource?.kind === "songs");
+
+  if (QueueModel) {
+    if (compactLibrary) {
+      const libraryIds = state.library.tracks.map((track) => track.id);
+      QueueModel.replaceQueue(state, libraryIds, session.trackId, {
+        source: normalizeQueueSource(session.queueSource) || { kind: "library" }
+      });
+      state.shuffle = Boolean(session.shuffle);
+      if (state.shuffle) {
+        QueueModel.enableShuffle(state, shuffleInPlace);
+      }
+    } else {
+      QueueModel.restoreQueueSession(state, {
+        ...session,
+        shuffle: session.shuffle ?? state.shuffle
+      }, { trackExists: (id) => Boolean(trackById(id)) });
+    }
+  }
+
   const queue = compactLibrary
     ? state.library.tracks.map((track) => track.id)
-    : (Array.isArray(session.queue) ? session.queue.filter((id) => trackById(id)) : []);
+    : (state.queue.length
+      ? state.queue
+      : (Array.isArray(session.queue) ? session.queue.filter((id) => trackById(id)) : []));
   const trackId = session.trackId && trackById(session.trackId)
     ? session.trackId
-    : queue[0];
+    : (currentQueueEntry()?.trackId || queue[0]);
 
   if (!trackId) {
     updateNowPlaying();
@@ -8815,20 +9918,20 @@ async function restoreSession() {
   }
   renderLibraryList();
 
-  const restoredQueue = queue.length ? queue : state.library.tracks.map((track) => track.id);
-  if (state.shuffle && Array.isArray(session.shuffleBag) && session.shuffleBag.length) {
-    state.shuffleBag = session.shuffleBag.filter((id) => trackById(id) && restoredQueue.includes(id));
-  } else if (state.shuffle && compactLibrary) {
-    state.shuffleBag = [];
-  }
+  const restoredQueue = state.queue.length
+    ? state.queue
+    : (queue.length ? queue : state.library.tracks.map((track) => track.id));
+  const entryUid = currentQueueEntry()?.uid;
 
-  await playTrack(trackId, restoredQueue, {
-    source: queue.length || compactLibrary
+  await playTrack(trackId, QueueModel && state.entries.length ? null : restoredQueue, {
+    source: restoredQueue.length || compactLibrary
       ? normalizeQueueSource(session.queueSource) || { kind: "library" }
       : { kind: "library" },
     autoplay: false,
     recordRecent: false,
-    keepBag: state.shuffle && state.shuffleBag.includes(trackId),
+    keepBag: true,
+    keepEntries: true,
+    entryUid,
     position: Math.max(0, Number(session.position) || 0)
   });
 }
@@ -9197,6 +10300,10 @@ function handleSonoraHostEvent(detail) {
     const nextId = detail.nextTrackId;
     const nextTrackInfo = nextId ? trackById(nextId) : null;
     if (nextTrackInfo) {
+      if (!sonoraPreloadMatchesPlan(nextId)) {
+        // Stale transition after rapid queue edits — resync preload to the authoritative next.
+        maybePreloadSonoraNext();
+      }
       advanceQueueTo(nextId);
       state.sonoraPosition = 0;
       state.playing = true;
@@ -9233,6 +10340,24 @@ function hasNextTrack() {
 }
 
 function nextTrack({ wrap = true } = {}) {
+  if (QueueModel && state.entries.length) {
+    if (!wrap && !hasNextTrack()) {
+      stopAtEndOfQueue();
+      return;
+    }
+    const stepped = QueueModel.stepNextIndex(state, { wrap });
+    if (!stepped.ok) {
+      stopAtEndOfQueue();
+      return;
+    }
+    playTrack(stepped.entry.trackId, null, {
+      keepBag: true,
+      keepEntries: true,
+      entryUid: stepped.entry.uid
+    });
+    return;
+  }
+
   const order = activeOrder();
   if (!order.length) {
     return;
@@ -9257,10 +10382,6 @@ function nextTrack({ wrap = true } = {}) {
 }
 
 function previousTrack() {
-  const order = activeOrder();
-  if (!order.length) {
-    return;
-  }
   if (playbackPosition() > 3) {
     if (isRemotePlayback()) {
       postCastCommand("seek", { position: 0 });
@@ -9273,6 +10394,24 @@ function previousTrack() {
     lastAudioTime = 0;
     updateNowPlaying();
     writeSession();
+    return;
+  }
+
+  if (QueueModel && state.entries.length) {
+    const stepped = QueueModel.stepPreviousIndex(state);
+    if (!stepped.ok) {
+      return;
+    }
+    playTrack(stepped.entry.trackId, null, {
+      keepBag: true,
+      keepEntries: true,
+      entryUid: stepped.entry.uid
+    });
+    return;
+  }
+
+  const order = activeOrder();
+  if (!order.length) {
     return;
   }
   state.index = (state.index - 1 + order.length) % order.length;
@@ -9461,8 +10600,10 @@ function isTypingTarget(target) {
 
 let contextRoot = null;
 const contextMenuState = {
+  mode: "library",
   trackId: null,
   trackIds: [],
+  entryUid: null,
   playlistId: null,
   naming: false,
   query: ""
@@ -9525,6 +10666,8 @@ function closeContextMenu() {
   if (submenu) {
     submenu.hidden = true;
   }
+  contextMenuState.mode = "library";
+  contextMenuState.entryUid = null;
   contextMenuState.trackId = null;
   contextMenuState.trackIds = [];
   contextMenuState.playlistId = null;
@@ -9979,6 +11122,76 @@ function bindContextRoot(root) {
       return;
     }
 
+    if (event.target.closest("[data-ctx-clear-upcoming]")) {
+      closeContextMenu();
+      clearUpcomingQueue();
+      return;
+    }
+
+    if (event.target.closest("[data-ctx-play-next]")) {
+      const ids = contextMenuState.trackIds?.length
+        ? contextMenuState.trackIds
+        : contextMenuState.trackId
+          ? [contextMenuState.trackId]
+          : [];
+      const fromQueueUid = contextMenuState.mode === "queue" ? contextMenuState.entryUid : null;
+      closeContextMenu();
+      if (fromQueueUid && QueueModel) {
+        const upcoming = upcomingQueueEntries();
+        const index = upcoming.findIndex((entry) => entry.uid === fromQueueUid);
+        if (index > 0) {
+          moveQueueEntry(fromQueueUid, 0);
+        } else if (index < 0 && ids.length) {
+          playNextTracks(ids);
+        }
+      } else if (ids.length) {
+        playNextTracks(ids);
+      }
+      return;
+    }
+
+    if (event.target.closest("[data-ctx-add-queue]")) {
+      const ids = contextMenuState.trackIds?.length
+        ? contextMenuState.trackIds
+        : contextMenuState.trackId
+          ? [contextMenuState.trackId]
+          : [];
+      closeContextMenu();
+      if (ids.length) {
+        addToQueueTracks(ids);
+      }
+      return;
+    }
+
+    if (event.target.closest("[data-ctx-queue-play]")) {
+      const uid = contextMenuState.entryUid;
+      const trackId = contextMenuState.trackId;
+      closeContextMenu();
+      if (uid) {
+        playQueuedTrack(trackId, false, uid);
+      }
+      return;
+    }
+
+    if (event.target.closest("[data-ctx-queue-end]")) {
+      const uid = contextMenuState.entryUid;
+      closeContextMenu();
+      if (uid && QueueModel) {
+        QueueModel.moveEntryToEnd(state, uid);
+        commitQueueMutation({ focusUid: uid, announce: "Moved to end of queue" });
+      }
+      return;
+    }
+
+    if (event.target.closest("[data-ctx-queue-remove]")) {
+      const uid = contextMenuState.entryUid;
+      closeContextMenu();
+      if (uid) {
+        removeQueueEntry(uid);
+      }
+      return;
+    }
+
     if (event.target.closest("[data-ctx-edit-meta]")) {
       const ids = contextMenuState.trackIds?.length
         ? contextMenuState.trackIds
@@ -10056,6 +11269,30 @@ function ensureContextRoot() {
   contextRoot.hidden = true;
   contextRoot.innerHTML = `
     <div class="ctx-menu" role="menu">
+      <button class="ctx-item" type="button" data-ctx-library-queue data-ctx-play-next>
+        <i class="bi bi-skip-end"></i>
+        <span>Play Next</span>
+      </button>
+      <button class="ctx-item" type="button" data-ctx-library-queue data-ctx-add-queue>
+        <i class="bi bi-list-ul"></i>
+        <span>Add to Queue</span>
+      </button>
+      <button class="ctx-item" type="button" data-ctx-queue-only data-ctx-queue-play hidden>
+        <i class="bi bi-play-fill"></i>
+        <span>Play Now</span>
+      </button>
+      <button class="ctx-item" type="button" data-ctx-queue-only data-ctx-play-next hidden>
+        <i class="bi bi-skip-end"></i>
+        <span>Play Next</span>
+      </button>
+      <button class="ctx-item" type="button" data-ctx-queue-only data-ctx-queue-end hidden>
+        <i class="bi bi-arrow-bar-down"></i>
+        <span>Move to End</span>
+      </button>
+      <button class="ctx-item ctx-item-danger" type="button" data-ctx-queue-only data-ctx-queue-remove hidden>
+        <i class="bi bi-dash-circle"></i>
+        <span>Remove from Queue</span>
+      </button>
       <button class="ctx-item" type="button" data-ctx-edit-meta>
         <i class="bi bi-pencil-square"></i>
         <span data-ctx-edit-meta-label>Edit Metadata</span>
@@ -10135,10 +11372,13 @@ function openContextMenu(trackId, x, y) {
   const selected = trackSelection.ids.has(trackId) && trackSelection.ids.size > 1
     ? [...trackSelection.ids]
     : [trackId];
+  contextMenuState.mode = "library";
+  contextMenuState.entryUid = null;
   contextMenuState.trackId = trackId;
   contextMenuState.trackIds = selected;
   contextMenuState.playlistId = state.view === "playlist" ? state.playlistId : null;
   updateContextPlaylistActions();
+  updateContextQueueActions();
   const editLabel = root.querySelector("[data-ctx-edit-meta-label]");
   if (editLabel) {
     editLabel.textContent = selected.length > 1
@@ -10358,6 +11598,34 @@ document.body.addEventListener("click", (event) => {
     return;
   }
 
+  const appearanceThemeButton = event.target.closest("[data-appearance-theme]");
+  if (appearanceThemeButton) {
+    event.preventDefault();
+    setAppearance({ theme: appearanceThemeButton.dataset.appearanceTheme }, { refreshStage: true });
+    return;
+  }
+
+  const appearanceDensityButton = event.target.closest("[data-appearance-density]");
+  if (appearanceDensityButton) {
+    event.preventDefault();
+    setAppearance({ density: appearanceDensityButton.dataset.appearanceDensity }, { refreshDensity: true });
+    return;
+  }
+
+  const appearanceAccentButton = event.target.closest("[data-appearance-accent]");
+  if (appearanceAccentButton) {
+    event.preventDefault();
+    setAppearance({ accent: appearanceAccentButton.dataset.appearanceAccent }, { refreshStage: false });
+    return;
+  }
+
+  const appearanceReset = event.target.closest("[data-appearance-reset]");
+  if (appearanceReset) {
+    event.preventDefault();
+    resetAppearanceToDefaults();
+    return;
+  }
+
   const audioOutputToggle = event.target.closest("[data-audio-output-toggle]");
   if (audioOutputToggle) {
     event.preventDefault();
@@ -10502,6 +11770,8 @@ document.body.addEventListener("click", (event) => {
       setPlaybackSetting(key, !state[key]);
     } else if (key === "personalizedMixes") {
       setPersonalizedMixes(state.personalizedMixes === false);
+    } else if (key === "artworkAccents") {
+      setAppearance({ artworkAccents: !appearancePrefs().artworkAccents }, { refreshStage: true });
     } else if (key === "closeMinimizes") {
       setCloseMinimizes(!state.closeMinimizes);
     } else if (key === "automaticUpdateChecks") {
@@ -11064,6 +12334,26 @@ function mountTopCollection() {
 }
 
 document.addEventListener("input", (event) => {
+  const accentCustom = event.target.closest("[data-appearance-accent-custom]");
+  if (accentCustom) {
+    setAppearance({
+      accent: "custom",
+      accentCustom: accentCustom.value
+    }, { refreshStage: false, rerenderSettings: false });
+    const swatches = accentCustom.closest(".appearance-swatches");
+    swatches?.querySelectorAll("[data-appearance-accent], .appearance-swatch-custom").forEach((node) => {
+      const selected = node === accentCustom.closest(".appearance-swatch-custom");
+      node.classList.toggle("is-selected", selected);
+      if (node.hasAttribute("aria-checked")) {
+        node.setAttribute("aria-checked", selected ? "true" : "false");
+      }
+    });
+    const customSwatch = accentCustom.closest(".appearance-swatch-custom");
+    if (customSwatch) {
+      customSwatch.style.setProperty("--swatch-color", accentCustom.value);
+    }
+    return;
+  }
   const crossfadeSeconds = event.target.closest("[data-crossfade-seconds]");
   if (crossfadeSeconds) {
     setPlaybackSetting("crossfadeSeconds", crossfadeSeconds.value);
@@ -11293,7 +12583,7 @@ searchInput.addEventListener("keydown", (event) => {
   }
 });
 
-nowCover.addEventListener("click", openNowPlayingAlbum);
+nowCover.addEventListener("click", toggleNowPlayingView);
 nowTitle.addEventListener("click", openNowPlayingAlbum);
 nowArtist.addEventListener("click", openNowPlayingArtist);
 
@@ -11344,24 +12634,325 @@ queueBtn?.addEventListener("click", () => {
   }
 });
 
+let queuePointerDrag = null;
+let queueSuppressClick = false;
+let queueDragAutoScrollRaf = 0;
+
+function queueDragTargetIndexFromPoint(clientY) {
+  const host = queueDrawerBody?.querySelector("[data-queue-upcoming]");
+  const count = queuePointerDrag?.originalOrder?.length || upcomingQueueEntries().length;
+  if (!host || count <= 0) {
+    return 0;
+  }
+  const y = clientY - host.getBoundingClientRect().top;
+  return Math.max(0, Math.min(count - 1, Math.floor(y / densityMetrics().queueRowHeight)));
+}
+
+function buildQueueDragOrder(fromIndex, toIndex) {
+  const order = (queuePointerDrag?.originalOrder || []).slice();
+  if (!order.length) {
+    return order;
+  }
+  const from = Math.max(0, Math.min(order.length - 1, fromIndex));
+  const to = Math.max(0, Math.min(order.length - 1, toIndex));
+  const [uid] = order.splice(from, 1);
+  order.splice(to, 0, uid);
+  return order;
+}
+
+function syncQueueDragVisualOrder(toIndex, { animate = true, forcePaint = false } = {}) {
+  if (!queuePointerDrag) {
+    return;
+  }
+  const nextIndex = Math.max(0, Math.min((queuePointerDrag.originalOrder?.length || 1) - 1, toIndex));
+  const unchanged = queuePointerDrag.currentIndex === nextIndex && queuePointerDrag.order?.length;
+  if (unchanged && !forcePaint) {
+    return;
+  }
+  queuePointerDrag.currentIndex = nextIndex;
+  queuePointerDrag.order = buildQueueDragOrder(queuePointerDrag.fromIndex, nextIndex);
+  paintQueueUpcomingVirtual({ animate: unchanged ? false : animate });
+}
+
+function ensureQueueDragFloat(row, clientX, clientY) {
+  if (!queuePointerDrag) {
+    return null;
+  }
+  if (queuePointerDrag.floatEl) {
+    return queuePointerDrag.floatEl;
+  }
+  const rect = row.getBoundingClientRect();
+  const floatEl = row.cloneNode(true);
+  floatEl.classList.add("queue-drag-float");
+  floatEl.classList.remove("is-dragging");
+  floatEl.removeAttribute("tabindex");
+  floatEl.querySelectorAll("[tabindex], button").forEach((node) => {
+    node.removeAttribute("tabindex");
+    if (node.tagName === "BUTTON") {
+      node.disabled = true;
+    }
+  });
+  floatEl.style.width = `${rect.width}px`;
+  floatEl.style.height = `${rect.height}px`;
+  document.body.appendChild(floatEl);
+  queuePointerDrag.floatEl = floatEl;
+  queuePointerDrag.offsetX = clientX - rect.left;
+  queuePointerDrag.offsetY = clientY - rect.top;
+  positionQueueDragFloat(clientX, clientY);
+  return floatEl;
+}
+
+function positionQueueDragFloat(clientX, clientY) {
+  const floatEl = queuePointerDrag?.floatEl;
+  if (!floatEl) {
+    return;
+  }
+  const x = clientX - (queuePointerDrag.offsetX || 0);
+  const y = clientY - (queuePointerDrag.offsetY || 0);
+  floatEl.style.transform = `translate3d(${Math.round(x)}px, ${Math.round(y)}px, 0)`;
+}
+
+function clearQueueDragFloat() {
+  queuePointerDrag?.floatEl?.remove();
+  if (queuePointerDrag) {
+    queuePointerDrag.floatEl = null;
+  }
+  document.querySelectorAll(".queue-drag-float").forEach((node) => node.remove());
+}
+
+function stopQueueDragAutoScroll() {
+  if (queueDragAutoScrollRaf) {
+    cancelAnimationFrame(queueDragAutoScrollRaf);
+    queueDragAutoScrollRaf = 0;
+  }
+}
+
+function queueDragAutoScrollStep() {
+  if (!queuePointerDrag || !queueDrawerBody) {
+    stopQueueDragAutoScroll();
+    return;
+  }
+  const clientY = queuePointerDrag.lastClientY;
+  const rect = queueDrawerBody.getBoundingClientRect();
+  const edge = 40;
+  let delta = 0;
+  if (clientY < rect.top + edge) {
+    delta = -Math.max(8, (rect.top + edge - clientY) * 0.35);
+  } else if (clientY > rect.bottom - edge) {
+    delta = Math.max(8, (clientY - (rect.bottom - edge)) * 0.35);
+  }
+  if (!delta) {
+    stopQueueDragAutoScroll();
+    return;
+  }
+  queueDrawerBody.scrollTop += delta;
+  syncQueueDragVisualOrder(queueDragTargetIndexFromPoint(clientY), { animate: true, forcePaint: true });
+  queueDragAutoScrollRaf = requestAnimationFrame(queueDragAutoScrollStep);
+}
+
+function beginQueueDragAutoScroll(clientY) {
+  if (!queuePointerDrag) {
+    return;
+  }
+  queuePointerDrag.lastClientY = clientY;
+  if (queueDragAutoScrollRaf) {
+    return;
+  }
+  queueDragAutoScrollRaf = requestAnimationFrame(queueDragAutoScrollStep);
+}
+
 queueDrawerRoot?.addEventListener("click", (event) => {
   if (event.target === queueDrawerRoot) {
     closeQueueDrawer();
     return;
   }
+  if (queueSuppressClick) {
+    queueSuppressClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+  if (event.target.closest("[data-queue-handle]")) {
+    return;
+  }
+  const more = event.target.closest("[data-queue-more]");
+  if (more) {
+    event.preventDefault();
+    event.stopPropagation();
+    const row = more.closest("[data-queue-entry]");
+    if (row?.dataset.queueEntry) {
+      openQueueEntryMenu(row.dataset.queueEntry, event.clientX, event.clientY, more);
+    }
+    return;
+  }
   const row = event.target.closest("[data-queue-track]");
   if (row?.dataset.queueTrack) {
-    playQueuedTrack(row.dataset.queueTrack, row.hasAttribute("data-queue-current"));
+    playQueuedTrack(
+      row.dataset.queueTrack,
+      row.hasAttribute("data-queue-current"),
+      row.dataset.queueEntry || ""
+    );
   }
 });
+
+queueDrawerRoot?.addEventListener("contextmenu", (event) => {
+  const row = event.target.closest("[data-queue-entry]:not([data-queue-current])");
+  if (!row?.dataset.queueEntry) {
+    return;
+  }
+  event.preventDefault();
+  openQueueEntryMenu(row.dataset.queueEntry, event.clientX, event.clientY);
+});
+
+queueDrawerBody?.addEventListener("scroll", () => {
+  paintQueueUpcomingVirtual({ animate: Boolean(queuePointerDrag) });
+}, { passive: true });
+
+queueDrawerRoot?.addEventListener("pointerdown", (event) => {
+  const handle = event.target.closest("[data-queue-handle]");
+  if (!handle || event.button !== 0) {
+    return;
+  }
+  const row = handle.closest(".queue-row");
+  const uid = handle.dataset.queueEntry;
+  const fromIndex = Number(handle.dataset.queueUpcomingIndex);
+  if (!row || !uid || !Number.isFinite(fromIndex)) {
+    return;
+  }
+  event.preventDefault();
+  const originalOrder = upcomingQueueEntries().map((entry) => entry.uid);
+  queueDragActive = true;
+  queuePointerDrag = {
+    uid,
+    fromIndex,
+    currentIndex: fromIndex,
+    originalOrder,
+    order: originalOrder.slice(),
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    lastClientY: event.clientY,
+    moved: false,
+    floatEl: null,
+    offsetX: 0,
+    offsetY: 0
+  };
+  document.body.classList.add("is-queue-dragging");
+  handle.setPointerCapture?.(event.pointerId);
+  ensureQueueDragFloat(row, event.clientX, event.clientY);
+  paintQueueUpcomingVirtual({ animate: false });
+});
+
+queueDrawerRoot?.addEventListener("pointermove", (event) => {
+  if (!queuePointerDrag || event.pointerId !== queuePointerDrag.pointerId) {
+    return;
+  }
+  const dx = event.clientX - queuePointerDrag.startX;
+  const dy = event.clientY - queuePointerDrag.startY;
+  if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+    queuePointerDrag.moved = true;
+  }
+  queuePointerDrag.lastClientY = event.clientY;
+  if (!queuePointerDrag.floatEl) {
+    const row = queueDrawerBody?.querySelector(`.queue-row[data-queue-entry="${CSS.escape(queuePointerDrag.uid)}"]`);
+    if (row) {
+      ensureQueueDragFloat(row, event.clientX, event.clientY);
+    }
+  }
+  positionQueueDragFloat(event.clientX, event.clientY);
+  syncQueueDragVisualOrder(queueDragTargetIndexFromPoint(event.clientY), { animate: true });
+  beginQueueDragAutoScroll(event.clientY);
+});
+
+function endQueuePointerDrag(event, commit) {
+  if (!queuePointerDrag) {
+    return;
+  }
+  if (event && queuePointerDrag.pointerId != null && event.pointerId !== queuePointerDrag.pointerId) {
+    return;
+  }
+  const { uid, fromIndex, currentIndex, moved } = queuePointerDrag;
+  const handle = queueDrawerRoot?.querySelector(`[data-queue-handle][data-queue-entry="${CSS.escape(uid)}"]`);
+  handle?.releasePointerCapture?.(queuePointerDrag.pointerId);
+  stopQueueDragAutoScroll();
+  clearQueueDragFloat();
+  document.body.classList.remove("is-queue-dragging");
+  const shouldCommit = Boolean(commit && moved && currentIndex !== fromIndex);
+  queuePointerDrag = null;
+  queueDragActive = false;
+  if (shouldCommit) {
+    queueSuppressClick = true;
+    moveQueueEntry(uid, currentIndex);
+  } else {
+    paintQueueUpcomingVirtual({ animate: false });
+  }
+}
+
+queueDrawerRoot?.addEventListener("pointerup", (event) => endQueuePointerDrag(event, true));
+queueDrawerRoot?.addEventListener("pointercancel", (event) => endQueuePointerDrag(event, false));
 
 document.getElementById("queueDrawerClose")?.addEventListener("click", (event) => {
   event.stopPropagation();
   closeQueueDrawer();
 });
 
+document.getElementById("queueDrawerMore")?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  closeOverflowMenu();
+  const root = ensureContextRoot();
+  contextMenuState.mode = "queue-header";
+  contextMenuState.entryUid = null;
+  contextMenuState.trackId = null;
+  contextMenuState.trackIds = [];
+  contextMenuState.playlistId = null;
+  updateContextPlaylistActions();
+  updateContextQueueActions();
+  root.querySelectorAll("[data-ctx-library-queue], [data-ctx-queue-only], [data-ctx-edit-meta], [data-ctx-add], [data-ctx-playlist-actions]").forEach((node) => {
+    node.hidden = true;
+  });
+  let clearBtn = root.querySelector("[data-ctx-clear-upcoming]");
+  if (!clearBtn) {
+    clearBtn = document.createElement("button");
+    clearBtn.className = "ctx-item";
+    clearBtn.type = "button";
+    clearBtn.dataset.ctxClearUpcoming = "true";
+    clearBtn.innerHTML = `<i class="bi bi-trash"></i><span>Clear Upcoming</span>`;
+    root.querySelector(".ctx-menu")?.prepend(clearBtn);
+  }
+  clearBtn.hidden = false;
+  clearBtn.disabled = upcomingQueueEntries().length === 0;
+  root.hidden = false;
+  root.querySelector(".ctx-submenu").hidden = true;
+  const rect = event.currentTarget.getBoundingClientRect();
+  positionContextMenu(rect.left, rect.bottom + 4);
+});
+
 queueDrawerRoot?.addEventListener("keydown", (event) => {
   trapDrawerFocus(queueDrawerRoot, event);
+  const row = event.target.closest?.("[data-queue-entry]:not([data-queue-current])");
+  if (!row?.dataset.queueEntry) {
+    if ((event.key === "Enter" || event.key === " ") && event.target.closest?.("[data-queue-current]")) {
+      event.preventDefault();
+      togglePlay();
+    }
+    return;
+  }
+  const uid = row.dataset.queueEntry;
+  const upcomingIndex = Number(row.dataset.queueUpcomingIndex);
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    playQueuedTrack(row.dataset.queueTrack, false, uid);
+    return;
+  }
+  if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+    event.preventDefault();
+    const delta = event.key === "ArrowUp" ? -1 : 1;
+    const nextIndex = upcomingIndex + delta;
+    if (nextIndex < 0 || nextIndex >= upcomingQueueEntries().length) {
+      return;
+    }
+    moveQueueEntry(uid, nextIndex);
+  }
 });
 
 shuffleBtn.addEventListener("click", () => {
@@ -11477,7 +13068,40 @@ window.addEventListener("pagehide", () => {
 });
 
 document.addEventListener("keydown", (event) => {
+  const appearanceSwatch = event.target.closest?.(".appearance-swatches [data-appearance-accent], .appearance-swatch-custom");
+  if (appearanceSwatch && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Home" || event.key === "End")) {
+    const group = appearanceSwatch.closest(".appearance-swatches");
+    const items = [...(group?.querySelectorAll("[data-appearance-accent], .appearance-swatch-custom") || [])];
+    const index = items.indexOf(appearanceSwatch);
+    if (index >= 0 && items.length) {
+      event.preventDefault();
+      let nextIndex = index;
+      if (event.key === "ArrowRight") {
+        nextIndex = (index + 1) % items.length;
+      } else if (event.key === "ArrowLeft") {
+        nextIndex = (index - 1 + items.length) % items.length;
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        nextIndex = items.length - 1;
+      }
+      const next = items[nextIndex];
+      next?.focus?.();
+      if (next?.dataset?.appearanceAccent) {
+        setAppearance({ accent: next.dataset.appearanceAccent }, { refreshStage: false });
+      } else if (next?.classList?.contains("appearance-swatch-custom")) {
+        next.querySelector("[data-appearance-accent-custom]")?.focus?.();
+      }
+      return;
+    }
+  }
+
   if (event.code === "Escape") {
+    if (queuePointerDrag) {
+      event.preventDefault();
+      endQueuePointerDrag(null, false);
+      return;
+    }
     if (window.EmpMetadataEditor?.isOpen?.()) {
       // Metadata editor handles Escape itself (preview back / dirty confirm).
       return;
@@ -11493,6 +13117,16 @@ document.addEventListener("keydown", (event) => {
       createPlaylistBtn?.focus();
       return;
     }
+    if (overflowRoot && !overflowRoot.hidden) {
+      event.preventDefault();
+      closeOverflowMenu();
+      return;
+    }
+    if (contextRoot && !contextRoot.hidden) {
+      event.preventDefault();
+      closeContextMenu();
+      return;
+    }
     if (deviceDrawerIsOpen()) {
       event.preventDefault();
       closeDeviceDrawer();
@@ -11506,16 +13140,6 @@ document.addEventListener("keydown", (event) => {
     if (detailsModal && !detailsModal.hidden) {
       event.preventDefault();
       closeDetailsModal();
-      return;
-    }
-    if (overflowRoot && !overflowRoot.hidden) {
-      event.preventDefault();
-      closeOverflowMenu();
-      return;
-    }
-    if (contextRoot && !contextRoot.hidden) {
-      event.preventDefault();
-      closeContextMenu();
       return;
     }
     const openMenu = [...settingsRoot().querySelectorAll(".eq-preset-menu, .songs-sort-menu")].find((menu) => !menu.hidden);

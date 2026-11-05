@@ -17,6 +17,8 @@ namespace EMP.Forms
         public MainForm()
         {
             InitializeComponent();
+            ChromeThemeStore.Load();
+            ChromeThemeStore.ApplyTo(this, webView);
             ApplyWindowIcon();
             windowChrome = new CustomWindowChrome(this);
             windowChrome.Apply();

@@ -254,6 +254,10 @@ namespace EMP.Hosting
                     {
                         HandleWindowAction(document.RootElement);
                     }
+                    else if (kind == "chromeTheme")
+                    {
+                        HandleChromeTheme(document.RootElement);
+                    }
                     else if (kind == "listenStatsUpdate")
                     {
                         HandleListenStatsUpdate(document.RootElement);
@@ -609,6 +613,28 @@ namespace EMP.Hosting
             }
 
             WindowActionRequested?.Invoke(action);
+        }
+
+        private static void HandleChromeTheme(JsonElement message)
+        {
+            string theme = ReadString(message, "theme") == "light" ? "light" : "dark";
+            ChromeThemeStore.ApplyResolved(theme);
+            PostToUi(() =>
+            {
+                if (hostView is null || hostView.IsDisposed)
+                {
+                    return;
+                }
+
+                Form? form = hostView.FindForm();
+                if (form is null || form.IsDisposed)
+                {
+                    hostView.DefaultBackgroundColor = ChromeThemeStore.WebViewColor;
+                    return;
+                }
+
+                ChromeThemeStore.ApplyTo(form, hostView);
+            });
         }
 
         private static void HandleOpenUrl(string? url)

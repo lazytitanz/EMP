@@ -17,6 +17,7 @@ describe("settings overlay nav", () => {
     assert.deepEqual(ids, [
       "general",
       "library",
+      "appearance",
       "playback",
       "audio",
       "equalizer",
@@ -28,6 +29,8 @@ describe("settings overlay nav", () => {
     ]);
     assert.equal(DEFAULT_SECTION, "general");
     assert.equal(SECTION_META.playback.title, "Playback");
+    assert.equal(SECTION_META.appearance.title, "Appearance");
+    assert.equal(SECTION_META.appearance.description, "Customize how EMP looks and feels.");
   });
 
   it("normalizes unknown sections to the default", () => {

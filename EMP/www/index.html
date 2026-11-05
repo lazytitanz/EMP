@@ -1,13 +1,17 @@
 <!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
+<html lang="en" data-bs-theme="dark" data-emp-theme="dark" data-emp-density="comfortable">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EMP</title>
+  <script src="js/appearance.js?v=2"></script>
+  <script>
+    try { window.EmpAppearance && window.EmpAppearance.bootFromSession("emp.playback"); } catch (_) {}
+  </script>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=94">
-  <link rel="stylesheet" href="css/metadata-editor.css?v=3">
+  <link rel="stylesheet" href="css/player.css?v=104">
+  <link rel="stylesheet" href="css/metadata-editor.css?v=4">
 </head>
 <body>
   <div id="updateToast" class="update-toast" hidden role="status" aria-live="polite">
@@ -137,7 +141,9 @@
 
     <footer class="player-bar" aria-label="Playback controls">
       <div class="now-playing">
-        <button class="now-cover" type="button" id="nowCover" disabled aria-label="Open album"></button>
+        <button class="now-cover" type="button" id="nowCover" disabled aria-label="Open Now Playing" data-bs-toggle="tooltip" data-bs-title="Open Now Playing">
+          <span class="now-cover-expand" aria-hidden="true"><i class="bi bi-arrows-angle-expand"></i></span>
+        </button>
         <div class="now-meta">
           <button class="now-title" type="button" id="nowTitle" disabled>Select a track</button>
           <button class="now-artist" type="button" id="nowArtist" disabled>EMP</button>
@@ -238,9 +244,14 @@
           <h2 id="queueDrawerTitle">Queue</h2>
           <p class="device-drawer-sub" id="queueDrawerStatus" role="status" aria-live="polite"></p>
         </div>
-        <button class="device-drawer-close" type="button" id="queueDrawerClose" aria-label="Close">
-          <i class="bi bi-x-lg"></i>
-        </button>
+        <div class="queue-drawer-head-actions">
+          <button class="device-drawer-close queue-drawer-more" type="button" id="queueDrawerMore" aria-label="Queue options" aria-haspopup="menu" aria-expanded="false">
+            <i class="bi bi-three-dots"></i>
+          </button>
+          <button class="device-drawer-close" type="button" id="queueDrawerClose" aria-label="Close">
+            <i class="bi bi-x-lg"></i>
+          </button>
+        </div>
       </div>
       <div class="device-drawer-body" id="queueDrawerBody"></div>
     </aside>
@@ -271,15 +282,17 @@
   <script src="js/listen-date-split.js?v=1"></script>
   <script src="js/replay-gain.js?v=1"></script>
   <script src="js/playback-transitions.js?v=1"></script>
+  <script src="js/queue-model.js?v=1"></script>
   <script src="js/sonora-volume.js?v=1"></script>
   <script src="js/sonora-preamp.js?v=2"></script>
-  <script src="js/settings-overlay.js?v=6"></script>
+  <script src="js/settings-overlay.js?v=7"></script>
   <script src="js/listening-insights.js?v=2"></script>
   <script src="js/sonora-bridge.js?v=8"></script>
   <script src="js/sonora-playback-errors.js?v=1"></script>
   <script src="js/smart-playlists.js?v=1"></script>
   <script src="js/smart-playlist-editor.js?v=4"></script>
   <script src="js/metadata-editor.js?v=2"></script>
-  <script src="js/player.js?v=91"></script>
+  <script src="js/now-playing-ambient.js?v=5"></script>
+  <script src="js/player.js?v=98"></script>
 </body>
 </html>
