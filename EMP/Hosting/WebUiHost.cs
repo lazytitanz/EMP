@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using EMP.Cast;
+using EMP.Hosting.Sonora;
 using EMP.Library;
 using EMP.Library.Metadata;
 using EMP.Lyrics;
@@ -36,6 +38,7 @@ namespace EMP.Hosting
         private static MusicFolderWatchers? folderWatchers;
         private static CastCoordinator? cast;
         private static LyricsService? lyrics;
+        private static SonoraPlaybackService? sonoraPlayback;
         private static WebView2? hostView;
         private static string artworkRoot = string.Empty;
         private static bool pageLoaded;
@@ -54,6 +57,23 @@ namespace EMP.Hosting
         public static event Action<string>? WindowActionRequested;
 
         public static Func<bool>? IsWindowMaximized { get; set; }
+
+        /// <summary>Phase 1+ local PCM host. Null when Sonora is unavailable or disposed.</summary>
+        public static SonoraPlaybackService? SonoraPlayback => sonoraPlayback;
+
+        public static void AttachSonoraPlayback(SonoraPlaybackService? playback)
+        {
+            sonoraPlayback = playback;
+            SonoraWebBridge.Attach(playback, static message =>
+            {
+                if (hostView?.CoreWebView2 is null)
+                {
+                    return;
+                }
+
+                hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
+            });
+        }
 
         public static async Task InitializeAsync(WebView2 webView)
         {
@@ -96,15 +116,7 @@ namespace EMP.Hosting
             settings.IsWebMessageEnabled = true;
             settings.IsNonClientRegionSupportEnabled = true;
 
-            // Unlock media device labels for Audio Output selection (enumerateDevices).
-            webView.CoreWebView2.PermissionRequested += (_, args) =>
-            {
-                if (args.PermissionKind == CoreWebView2PermissionKind.Microphone)
-                {
-                    args.State = CoreWebView2PermissionState.Allow;
-                    args.Handled = true;
-                }
-            };
+            // Phase 6b: local output devices come from Sonora/WASAPI — no mic permission probe.
 
             try
             {
@@ -164,6 +176,8 @@ namespace EMP.Hosting
                     PostAppSettings();
                     UpdateCoordinator.PostStatus();
                     PostWindowState(IsWindowMaximized?.Invoke() ?? false);
+                    // EmpSonora may have missed Attach's first availability post (race with Navigate).
+                    SonoraWebBridge.RepublishAvailability();
                 }
             };
 
@@ -232,6 +246,10 @@ namespace EMP.Hosting
                     {
                         HandleCastCommand(document.RootElement);
                     }
+                    else if (kind == "sonora")
+                    {
+                        SonoraWebBridge.HandleCommand(document.RootElement);
+                    }
                     else if (kind == "window")
                     {
                         HandleWindowAction(document.RootElement);
@@ -243,6 +261,10 @@ namespace EMP.Hosting
                     else if (kind == "listenStatsRequest")
                     {
                         PostListenStatsSnapshot();
+                    }
+                    else if (kind == "listenInsightsRequest")
+                    {
+                        HandleListenInsightsRequest(document.RootElement);
                     }
                     else if (kind == "updates")
                     {
@@ -259,6 +281,10 @@ namespace EMP.Hosting
                     else if (kind == "metadataCancel")
                     {
                         MetadataEditor.CancelApply();
+                    }
+                    else if (kind == "openUrl")
+                    {
+                        HandleOpenUrl(ReadString(document.RootElement, "url"));
                     }
                 }
                 catch (JsonException)
@@ -281,6 +307,7 @@ namespace EMP.Hosting
             cast = null;
             lyrics?.Dispose();
             lyrics = null;
+            sonoraPlayback = null;
             ListenStatsCoordinator.FlushSync();
             LibraryMediaIndex.Clear();
             hostView = null;
@@ -408,6 +435,150 @@ namespace EMP.Hosting
             hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
         }
 
+        private static void HandleListenInsightsRequest(JsonElement message)
+        {
+            string range = ReadString(message, "range") ?? "last30";
+            long requestId = ReadInt64(message, "requestId");
+            if (requestId <= 0)
+            {
+                requestId = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+
+            if (hostView is null || hostView.IsDisposed)
+            {
+                return;
+            }
+
+            Dictionary<string, InsightsLiveTrack>? libraryMap = BuildInsightsLibraryMap();
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    ListeningInsightsSnapshot snapshot = ListeningInsightsAggregator.Build(
+                        range,
+                        requestId,
+                        library: libraryMap);
+                    PostListenInsightsSnapshot(snapshot);
+                }
+                catch (Exception)
+                {
+                    PostListenInsightsSnapshot(new ListeningInsightsSnapshot
+                    {
+                        RequestId = requestId,
+                        Range = ListeningInsightsAggregator.NormalizeRange(range),
+                        StartDate = "",
+                        EndDate = "",
+                        HistoryCoverage = "none",
+                        ArtistRankingCoverage = "unavailable",
+                        TopTracks = [],
+                        TopArtists = [],
+                        Activity = [],
+                        Habits = [],
+                        ShowGenericEmpty = true
+                    });
+                }
+            });
+        }
+
+        private static Dictionary<string, InsightsLiveTrack>? BuildInsightsLibraryMap()
+        {
+            MusicLibrary? library = currentLibrary ?? lastCompleteCache?.Library;
+            if (library?.Tracks is null || library.Tracks.Count == 0)
+            {
+                return null;
+            }
+
+            Dictionary<string, InsightsLiveTrack> map = new(StringComparer.OrdinalIgnoreCase);
+            foreach (TrackInfo track in library.Tracks)
+            {
+                if (string.IsNullOrWhiteSpace(track.Id))
+                {
+                    continue;
+                }
+
+                map[track.Id] = new InsightsLiveTrack
+                {
+                    Title = track.Title ?? string.Empty,
+                    Artist = track.Artist ?? string.Empty,
+                    Album = track.Album ?? string.Empty,
+                    InLibrary = true
+                };
+            }
+
+            return map;
+        }
+
+        private static void PostListenInsightsSnapshot(ListeningInsightsSnapshot snapshot)
+        {
+            var message = new
+            {
+                type = "listenInsights",
+                requestId = snapshot.RequestId,
+                range = snapshot.Range,
+                startDate = snapshot.StartDate,
+                endDate = snapshot.EndDate,
+                trackingStartedOn = snapshot.TrackingStartedOn,
+                historyCoverage = snapshot.HistoryCoverage,
+                historyCoverageStartDate = snapshot.HistoryCoverageStartDate,
+                activityScopeLabel = snapshot.ActivityScopeLabel,
+                totalListenMs = snapshot.TotalListenMs,
+                totalPlays = snapshot.TotalPlays,
+                uniqueTracks = snapshot.UniqueTracks,
+                uniqueArtists = snapshot.UniqueArtists,
+                tracksWithoutArtist = snapshot.TracksWithoutArtist,
+                artistRankingCoverage = snapshot.ArtistRankingCoverage,
+                topTracks = snapshot.TopTracks.Select(static t => new
+                {
+                    trackId = t.TrackId,
+                    title = t.Title,
+                    artist = t.Artist,
+                    album = t.Album,
+                    listenMs = t.ListenMs,
+                    playCount = t.PlayCount,
+                    inLibrary = t.InLibrary
+                }).ToList(),
+                topArtists = snapshot.TopArtists.Select(static a => new
+                {
+                    artistName = a.ArtistName,
+                    listenMs = a.ListenMs,
+                    playCount = a.PlayCount,
+                    sampleTrackIds = a.SampleTrackIds
+                }).ToList(),
+                activity = snapshot.Activity.Select(static p => new
+                {
+                    key = p.Key,
+                    label = p.Label,
+                    listenMs = p.ListenMs,
+                    playCount = p.PlayCount
+                }).ToList(),
+                habits = snapshot.Habits.Select(static h => new
+                {
+                    id = h.Id,
+                    title = h.Title,
+                    body = h.Body,
+                    trackId = h.TrackId,
+                    artistName = h.ArtistName
+                }).ToList(),
+                hasLifetimeData = snapshot.HasLifetimeData,
+                hasDailyData = snapshot.HasDailyData,
+                showGenericEmpty = snapshot.ShowGenericEmpty
+            };
+
+            // Serialize off the UI thread; only touch CoreWebView2 via PostToUi.
+            string json = JsonSerializer.Serialize(message, JsonOptions);
+            PostToUi(() =>
+            {
+                try
+                {
+                    hostView?.CoreWebView2?.PostWebMessageAsJson(json);
+                }
+                catch (Exception)
+                {
+                    // WebView may already be tearing down.
+                }
+            });
+        }
+
         public static void PostWindowState(bool maximized)
         {
             if (hostView?.CoreWebView2 is null)
@@ -438,6 +609,29 @@ namespace EMP.Hosting
             }
 
             WindowActionRequested?.Invoke(action);
+        }
+
+        private static void HandleOpenUrl(string? url)
+        {
+            if (string.IsNullOrWhiteSpace(url)
+                || !Uri.TryCreate(url, UriKind.Absolute, out Uri? uri)
+                || uri.Scheme is not ("https" or "http"))
+            {
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = uri.AbsoluteUri,
+                    UseShellExecute = true
+                });
+            }
+            catch
+            {
+                // Ignore launch failures — About links are best-effort.
+            }
         }
 
         private static void RefreshLibrary(string? requestId = null)
@@ -689,12 +883,25 @@ namespace EMP.Hosting
                       window.dispatchEvent(new CustomEvent('emp-listen-stats', { detail: message }));
                       return;
                     }
+                    if (message.type === 'listenInsights') {
+                      window.dispatchEvent(new CustomEvent('emp-listen-insights', { detail: message }));
+                      return;
+                    }
                     if (message.type === 'updateStatus') {
                       window.dispatchEvent(new CustomEvent('emp-update-status', { detail: message }));
                       return;
                     }
                     if (message.type === 'metadataResult' || message.type === 'metadataProgress' || message.type === 'metadataApplied') {
                       window.dispatchEvent(new CustomEvent('emp-metadata', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'sonora') {
+                      if (window.EmpSonora && typeof window.EmpSonora.handleHostMessage === 'function') {
+                        window.EmpSonora.handleHostMessage(message);
+                      } else {
+                        // Scripts not loaded yet; player/bridge will miss this — hello + NavigationCompleted republish.
+                        window.dispatchEvent(new CustomEvent('emp-sonora', { detail: message }));
+                      }
                     }
                   });
                 }
@@ -740,7 +947,8 @@ namespace EMP.Hosting
                 StartupOnLogin = settings.StartupOnLogin,
                 CloseMinimizes = settings.CloseMinimizes,
                 AutomaticUpdateChecks = settings.AutomaticUpdateChecks,
-                CurrentVersion = AppVersion.Current
+                CurrentVersion = AppVersion.Current,
+                SonoraVersion = SonoraPackageVersion.Current
             };
 
             hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
@@ -1717,6 +1925,8 @@ namespace EMP.Hosting
             public required bool AutomaticUpdateChecks { get; init; }
 
             public required string CurrentVersion { get; init; }
+
+            public required string SonoraVersion { get; init; }
         }
 
         private sealed class WindowStateMessage

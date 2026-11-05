@@ -91,6 +91,11 @@ function isEqPresetAvailable(id) {
   return Boolean(preset && preset.available !== false && Array.isArray(preset.gains) && preset.gains.length === 6);
 }
 
+/** Visible EQ presets only — omits unavailable entries such as Deep. */
+function listSelectableEqPresets() {
+  return EQ_PRESET_ORDER.filter((id) => isEqPresetAvailable(id));
+}
+
 function sanitizeEqGains(value) {
   if (!Array.isArray(value) || value.length !== 6) {
     return cloneEqGains(EQ_FLAT_GAINS);

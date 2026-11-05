@@ -11,6 +11,15 @@ namespace EMP.Hosting
         public long ListenMs { get; set; }
     }
 
+    internal sealed class DayListenTotal
+    {
+        public required string Day { get; init; }
+
+        public long ListenMs { get; init; }
+
+        public long PlayCount { get; init; }
+    }
+
     internal sealed class TrackListenIdentity
     {
         public string Title { get; set; } = string.Empty;
@@ -324,6 +333,81 @@ namespace EMP.Hosting
         public static Dictionary<string, DayTrackListenStats> GetYear(int year)
         {
             return GetRange($"{year:D4}-01-01", $"{year:D4}-12-31");
+        }
+
+        /// <summary>
+        /// Per-day listenMs/playCount totals for charts. Includes zero-activity days
+        /// between start and end only when those day keys already exist in history;
+        /// sparse — missing days are omitted (caller fills calendar gaps as needed).
+        /// </summary>
+        public static List<DayListenTotal> GetDailyTotals(string startDate, string endDate)
+        {
+            lock (Gate)
+            {
+                EnsureLoaded_NoLock();
+                List<DayListenTotal> rows = [];
+                foreach (KeyValuePair<string, Dictionary<string, DayTrackListenStats>> day in Days.OrderBy(static pair => pair.Key, StringComparer.Ordinal))
+                {
+                    if (string.CompareOrdinal(day.Key, startDate) < 0
+                        || string.CompareOrdinal(day.Key, endDate) > 0)
+                    {
+                        continue;
+                    }
+
+                    long listenMs = 0;
+                    long playCount = 0;
+                    foreach (DayTrackListenStats track in day.Value.Values)
+                    {
+                        listenMs += Math.Max(0, track.ListenMs);
+                        playCount += Math.Max(0, track.PlayCount);
+                    }
+
+                    rows.Add(new DayListenTotal
+                    {
+                        Day = day.Key,
+                        ListenMs = listenMs,
+                        PlayCount = playCount
+                    });
+                }
+
+                return rows;
+            }
+        }
+
+        /// <summary>
+        /// Earliest and latest day keys that contain any listening activity, or nulls if empty.
+        /// </summary>
+        public static (string? FirstDay, string? LastDay) GetActivitySpan()
+        {
+            lock (Gate)
+            {
+                EnsureLoaded_NoLock();
+                string? first = null;
+                string? last = null;
+                foreach (string key in Days.Keys)
+                {
+                    if (first is null || string.CompareOrdinal(key, first) < 0)
+                    {
+                        first = key;
+                    }
+
+                    if (last is null || string.CompareOrdinal(key, last) > 0)
+                    {
+                        last = key;
+                    }
+                }
+
+                return (first, last);
+            }
+        }
+
+        public static bool HasAnyDailyData()
+        {
+            lock (Gate)
+            {
+                EnsureLoaded_NoLock();
+                return Days.Count > 0;
+            }
         }
 
         public static long TotalListenMs(IReadOnlyDictionary<string, DayTrackListenStats> stats)

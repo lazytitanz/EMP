@@ -3,6 +3,7 @@ using Xunit;
 
 namespace EMP.Tests
 {
+    [Collection("ListenStatsPaths")]
     public sealed class ListenStatsRecoveryTests : IDisposable
     {
         private readonly string root;

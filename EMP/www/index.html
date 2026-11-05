@@ -6,16 +6,27 @@
   <title>EMP</title>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=80">
+  <link rel="stylesheet" href="css/player.css?v=94">
   <link rel="stylesheet" href="css/metadata-editor.css?v=3">
 </head>
 <body>
   <div id="updateToast" class="update-toast" hidden role="status" aria-live="polite">
     <div class="update-toast-body">
-      <p class="update-toast-message" data-update-toast-message>A new version of EMP is available.</p>
+      <div class="update-toast-top">
+        <div class="update-toast-icon" aria-hidden="true">
+          <i class="bi bi-download"></i>
+        </div>
+        <div class="update-toast-copy">
+          <p class="update-toast-title">EMP update available</p>
+          <p class="update-toast-message" data-update-toast-message>A new version of EMP is ready to download.</p>
+        </div>
+        <button class="update-toast-close" type="button" data-update-toast-action="dismiss" aria-label="Dismiss update notification">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
       <div class="update-toast-actions">
-        <button class="update-toast-btn update-toast-primary" type="button" data-update-toast-action="download">Update now</button>
-        <button class="update-toast-btn" type="button" data-update-toast-action="dismiss">Dismiss</button>
+        <button class="update-toast-btn" type="button" data-update-toast-action="dismiss">Later</button>
+        <button class="update-toast-btn update-toast-primary" type="button" data-update-toast-action="download">Download</button>
       </div>
     </div>
   </div>
@@ -235,17 +246,40 @@
     </aside>
   </div>
 
+  <div class="settings-overlay-root" id="settingsOverlayRoot" hidden>
+    <div class="settings-overlay-backdrop" data-settings-backdrop aria-hidden="true"></div>
+    <div class="settings-overlay-shell" role="dialog" aria-modal="true" aria-labelledby="settingsOverlayTitle">
+      <nav class="settings-overlay-nav" aria-label="Settings sections" data-settings-nav></nav>
+      <div class="settings-overlay-main">
+        <div class="settings-overlay-top">
+          <div class="settings-overlay-heading">
+            <h1 id="settingsOverlayTitle" data-settings-title>Settings</h1>
+            <p data-settings-description></p>
+          </div>
+          <button class="settings-overlay-close" type="button" data-settings-close aria-label="Close settings">
+            <i class="bi bi-x-lg" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div class="settings-overlay-body" data-settings-body tabindex="-1"></div>
+      </div>
+    </div>
+  </div>
+
   <script src="lib/bootstrap/5.3.8/bootstrap.bundle.min.js"></script>
-  <script src="js/eq-presets.js?v=2"></script>
+  <script src="js/eq-presets.js?v=3"></script>
   <script src="js/mixes.js?v=1"></script>
   <script src="js/listen-date-split.js?v=1"></script>
   <script src="js/replay-gain.js?v=1"></script>
   <script src="js/playback-transitions.js?v=1"></script>
-  <script src="js/peak-protect.js?v=1"></script>
-  <script src="js/audio-graph-recovery.js?v=1"></script>
+  <script src="js/sonora-volume.js?v=1"></script>
+  <script src="js/sonora-preamp.js?v=2"></script>
+  <script src="js/settings-overlay.js?v=6"></script>
+  <script src="js/listening-insights.js?v=2"></script>
+  <script src="js/sonora-bridge.js?v=8"></script>
+  <script src="js/sonora-playback-errors.js?v=1"></script>
   <script src="js/smart-playlists.js?v=1"></script>
   <script src="js/smart-playlist-editor.js?v=4"></script>
   <script src="js/metadata-editor.js?v=2"></script>
-  <script src="js/player.js?v=67"></script>
+  <script src="js/player.js?v=91"></script>
 </body>
 </html>

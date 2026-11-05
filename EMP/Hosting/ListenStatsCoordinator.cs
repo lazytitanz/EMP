@@ -42,6 +42,24 @@ namespace EMP.Hosting
             ListenHistoryStore.ResetForTests();
         }
 
+        /// <summary>
+        /// Monotonic revision for Listening Insights cache invalidation.
+        /// Combines in-memory dirty generation with flushed journal watermarks so
+        /// pending applies and persisted recovery/compaction both invalidate caches.
+        /// </summary>
+        public static long InsightsRevision
+        {
+            get
+            {
+                lock (Gate)
+                {
+                    EnsureLoaded_NoLock();
+                    long watermark = Math.Max(ListenStatsStore.LastJournalSeq, ListenHistoryStore.LastJournalSeq);
+                    return unchecked(dirtyGeneration * 1_000_000_003L + watermark);
+                }
+            }
+        }
+
         public static void Load()
         {
             lock (WriterGate)

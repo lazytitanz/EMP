@@ -1,55 +1,30 @@
 const CROSSFADE_SECONDS = 8;
-const GAPLESS_LEAD_SECONDS = 0.12;
-const PRELOAD_SECONDS = 20;
 const ReplayGain = globalThis.EmpReplayGain;
 const Transitions = globalThis.EmpPlaybackTransitions;
-const PeakProtect = globalThis.EmpPeakProtect;
-const GraphRecovery = globalThis.EmpAudioGraphRecovery;
 
 function clampCrossfadeSeconds(value) {
   return Transitions?.clampCrossfadeSeconds?.(value) ?? CROSSFADE_SECONDS;
 }
 
-function createAudioPlayer() {
-  const el = new Audio();
-  el.preload = "auto";
-  el.loop = false;
-  return {
-    el,
-    source: null,
-    gain: null,
-    analyser: null,
-    fade: 1,
-    normalize: 1,
-    trackId: null,
-    listenOccurrence: null
-  };
-}
-
-const players = [createAudioPlayer(), createAudioPlayer()];
-players[1].fade = 0;
-
+// Phase 6b: local PCM is Sonora-only (no HTMLAudioElement / AudioContext).
+const players = [
+  { trackId: null, fade: 1 },
+  { trackId: null, fade: 0 }
+];
 let currentPlayerIndex = 0;
-let audioContext = null;
-let masterGain = null;
-let eqPreamp = null;
-let eqFilters = [];
-let eqReady = false;
-let cachedEqHeadroomDb = 0;
-let audioGraphReady = false;
-let peakCompressor = null;
-let peakDryGain = null;
-let peakWetGain = null;
 let audioOutputDevices = [];
 let audioOutputSupported = false;
-let audioContextResumePromise = null;
-let playbackElementBindGeneration = 0;
 let transitionGeneration = 0;
 let preloadGeneration = 0;
 let fadeRaf = 0;
 let playbackTransitioning = false;
-let fadeStartedAt = 0;
-let fadeDurationMs = CROSSFADE_SECONDS * 1000;
+let pendingSonoraPreloadAfterLoad = false;
+let sonoraPendingPlay = false;
+let sonoraPendingTrackId = null;
+/** Track id Sonora last confirmed has a loaded primary source (snapshot). */
+let sonoraLoadedTrackId = null;
+let sonoraToastHost = null;
+let sonoraToastTimer = 0;
 
 function currentPlayer() {
   return players[currentPlayerIndex];
@@ -57,14 +32,6 @@ function currentPlayer() {
 
 function incomingPlayer() {
   return players[1 - currentPlayerIndex];
-}
-
-function currentAudio() {
-  return currentPlayer().el;
-}
-
-function swapPlayers() {
-  currentPlayerIndex = 1 - currentPlayerIndex;
 }
 
 const REPEAT_MODES = ["off", "all", "one"];
@@ -111,8 +78,16 @@ const state = {
   normalizeVolume: false,
   normalizeMode: "track",
   preventClipping: true,
+  userPreampDb: 0,
+  sonoraPosition: 0,
+  sonoraDuration: 0,
   audioOutputId: "",
   audioOutputLabel: "",
+  audioOutputMode: "shared",
+  audioEffectiveMode: "shared",
+  audioFallbackReason: "none",
+  settingsOpen: false,
+  settingsSection: "general",
   equalizerEnabled: false,
   equalizerPreset: "flat",
   equalizerGains: cloneEqGains(EQ_FLAT_GAINS),
@@ -120,6 +95,7 @@ const state = {
   closeMinimizes: false,
   automaticUpdateChecks: true,
   appVersion: "",
+  sonoraVersion: "",
   updateStatus: {
     state: "idle",
     availableVersion: null,
@@ -250,6 +226,7 @@ let rescanTimer = 0;
 let storageUsage = null;
 let updateUiShellReady = false;
 let updateToastSessionDismissedVersion = null;
+let updateToastHideTimer = 0;
 let searchIndex = null;
 let searchDebounceTimer = 0;
 let searchRequestId = 0;
@@ -275,6 +252,7 @@ let listenUpdateId = 0;
 let listenTickTimer = 0;
 let listenPostTimer = 0;
 let remoteListenOccurrence = null;
+let localListenOccurrence = null;
 let pendingFinalizedListen = [];
 
 function createListenSessionToken() {
@@ -477,8 +455,8 @@ function setPersonalizedMixes(enabled) {
   const next = Boolean(enabled);
   state.personalizedMixes = next;
   writeSession();
-  if (state.view === "settings") {
-    const toggle = viewArea.querySelector('[data-setting="personalizedMixes"]');
+  if (state.settingsOpen || state.view === "settings") {
+    const toggle = settingsRoot().querySelector('[data-setting="personalizedMixes"]');
     toggle?.setAttribute("aria-checked", next ? "true" : "false");
   }
   if (!next) {
@@ -663,10 +641,8 @@ function markListenOccurrenceSent(occ, listenMsDelta, playCountDelta, lastPlayed
 
 function allListenOccurrences() {
   const list = [];
-  for (const player of players) {
-    if (player.listenOccurrence) {
-      list.push(player.listenOccurrence);
-    }
+  if (localListenOccurrence) {
+    list.push(localListenOccurrence);
   }
   if (remoteListenOccurrence) {
     list.push(remoteListenOccurrence);
@@ -780,29 +756,6 @@ function stopListenStatsTick() {
   }
 }
 
-function playerListenProgressing(player, occ) {
-  if (!player || !occ || occ.finalized || occ.seeking || occ.stalled) {
-    return false;
-  }
-  if (!player.trackId || player.trackId !== occ.trackId) {
-    return false;
-  }
-  const el = player.el;
-  return Boolean(el && !el.paused && !el.ended);
-}
-
-function tickPlayerListen(player, now) {
-  const occ = player.listenOccurrence;
-  if (!occ || occ.finalized) {
-    return;
-  }
-  const el = player.el;
-  if (!(occ.durationSec > 0) && el && Number.isFinite(el.duration) && el.duration > 0) {
-    occ.durationSec = el.duration;
-  }
-  advanceListenOccurrence(occ, now, playerListenProgressing(player, occ));
-}
-
 function tickRemoteListen(now) {
   if (!isRemotePlayback()) {
     return;
@@ -824,39 +777,55 @@ function tickRemoteListen(now) {
   advanceListenOccurrence(remoteListenOccurrence, now, progressing);
 }
 
+function tickLocalListen(now) {
+  if (isRemotePlayback() || isConnectingPlayback()) {
+    return;
+  }
+  const track = currentTrack();
+  if (!track) {
+    return;
+  }
+  if (!localListenOccurrence || localListenOccurrence.finalized || localListenOccurrence.trackId !== track.id) {
+    return;
+  }
+  if (!(localListenOccurrence.durationSec > 0)) {
+    const duration = state.sonoraDuration || track.duration || 0;
+    if (duration > 0) {
+      localListenOccurrence.durationSec = duration;
+    }
+  }
+  const progressing = Boolean(state.playing) && !localListenOccurrence.seeking && !state.seeking;
+  advanceListenOccurrence(localListenOccurrence, now, progressing);
+}
+
 function tickListenStats() {
   const now = performance.now();
-  for (const player of players) {
-    tickPlayerListen(player, now);
-  }
+  tickLocalListen(now);
   tickRemoteListen(now);
   if (allListenOccurrences().some(listenOccurrenceHasUnsent)) {
     scheduleListenStatsPost();
   }
 }
 
-function beginPlayerListen(player, track) {
-  if (!player || !track?.id) {
+function beginLocalListen(track) {
+  finalizeLocalListen();
+  if (!track?.id) {
     return;
   }
-  finalizePlayerListen(player);
-  player.listenOccurrence = createListenOccurrence(track.id, track.duration || 0);
+  localListenOccurrence = createListenOccurrence(track.id, track.duration || state.sonoraDuration || 0);
   ensureListenStatsTick();
 }
 
-function finalizePlayerListen(player) {
-  if (!player) {
-    return;
-  }
-  const occ = player.listenOccurrence;
+function finalizeLocalListen() {
+  const occ = localListenOccurrence;
   if (!occ || occ.finalized) {
-    player.listenOccurrence = null;
+    localListenOccurrence = null;
     return;
   }
   advanceListenOccurrence(occ, performance.now(), false);
   occ.finalized = true;
   occ.checkpointMs = 0;
-  player.listenOccurrence = null;
+  localListenOccurrence = null;
   if (listenOccurrenceHasUnsent(occ)) {
     pendingFinalizedListen.push(occ);
   }
@@ -865,6 +834,7 @@ function finalizePlayerListen(player) {
 
 function beginRemoteListen(track) {
   finalizeRemoteListen();
+  finalizeLocalListen();
   if (!track?.id) {
     return;
   }
@@ -890,8 +860,7 @@ function finalizeRemoteListen() {
 
 function setListenSeeking(seeking) {
   const now = performance.now();
-  for (const player of players) {
-    const occ = player.listenOccurrence;
+  for (const occ of [localListenOccurrence, remoteListenOccurrence]) {
     if (!occ || occ.finalized) {
       continue;
     }
@@ -900,39 +869,15 @@ function setListenSeeking(seeking) {
       occ.seeking = true;
     } else {
       occ.seeking = false;
-      occ.checkpointMs = playerListenProgressing(player, occ) ? now : 0;
+      occ.checkpointMs = state.playing ? now : 0;
     }
-  }
-  if (remoteListenOccurrence && !remoteListenOccurrence.finalized) {
-    if (seeking) {
-      advanceListenOccurrence(remoteListenOccurrence, now, false);
-      remoteListenOccurrence.seeking = true;
-    } else {
-      remoteListenOccurrence.seeking = false;
-      remoteListenOccurrence.checkpointMs = state.playing ? now : 0;
-    }
-  }
-}
-
-function setPlayerListenStalled(player, stalled) {
-  const occ = player?.listenOccurrence;
-  if (!occ || occ.finalized) {
-    return;
-  }
-  const now = performance.now();
-  if (stalled) {
-    advanceListenOccurrence(occ, now, false);
-    occ.stalled = true;
-  } else {
-    occ.stalled = false;
-    occ.checkpointMs = playerListenProgressing(player, occ) ? now : 0;
   }
 }
 
 function teardownListenStatsForUnload() {
   const now = performance.now();
-  for (const player of players) {
-    const occ = player.listenOccurrence;
+  for (const key of ["localListenOccurrence", "remoteListenOccurrence"]) {
+    const occ = key === "localListenOccurrence" ? localListenOccurrence : remoteListenOccurrence;
     if (occ && !occ.finalized) {
       advanceListenOccurrence(occ, now, false);
       occ.finalized = true;
@@ -941,16 +886,8 @@ function teardownListenStatsForUnload() {
         pendingFinalizedListen.push(occ);
       }
     }
-    player.listenOccurrence = null;
   }
-  if (remoteListenOccurrence && !remoteListenOccurrence.finalized) {
-    advanceListenOccurrence(remoteListenOccurrence, now, false);
-    remoteListenOccurrence.finalized = true;
-    remoteListenOccurrence.checkpointMs = 0;
-    if (listenOccurrenceHasUnsent(remoteListenOccurrence)) {
-      pendingFinalizedListen.push(remoteListenOccurrence);
-    }
-  }
+  localListenOccurrence = null;
   remoteListenOccurrence = null;
   stopListenStatsTick();
   postListenStatsUpdates();
@@ -958,9 +895,7 @@ function teardownListenStatsForUnload() {
 
 function flushListenStatsForClose() {
   tickListenStats();
-  for (const player of players) {
-    finalizePlayerListen(player);
-  }
+  finalizeLocalListen();
   finalizeRemoteListen();
   writeSession();
   if (listenPostTimer) {
@@ -1328,8 +1263,10 @@ function buildSessionPayload({ compactQueue = false } = {}) {
     normalizeVolume: state.normalizeVolume,
     normalizeMode: state.normalizeMode,
     preventClipping: state.preventClipping !== false,
+    userPreampDb: Number.isFinite(state.userPreampDb) ? state.userPreampDb : 0,
     audioOutputId: typeof state.audioOutputId === "string" ? state.audioOutputId : "",
     audioOutputLabel: typeof state.audioOutputLabel === "string" ? state.audioOutputLabel : "",
+    audioOutputMode: state.audioOutputMode === "exclusive" ? "exclusive" : "shared",
     equalizerEnabled: state.equalizerEnabled,
     equalizerPreset: state.equalizerPreset,
     equalizerGains: cloneEqGains(state.equalizerGains),
@@ -1431,8 +1368,12 @@ function restoreEqualizerState(session) {
   state.normalizeVolume = Boolean(session.normalizeVolume);
   state.normalizeMode = ReplayGain?.normalizeMode?.(session.normalizeMode) || "track";
   state.preventClipping = session.preventClipping !== false;
+  state.userPreampDb = window.EmpSonoraPreamp?.quantizePreampDb?.(session.userPreampDb)
+    ?? window.EmpSonoraPreamp?.clampPreampDb?.(session.userPreampDb)
+    ?? 0;
   state.audioOutputId = typeof session.audioOutputId === "string" ? session.audioOutputId : "";
   state.audioOutputLabel = typeof session.audioOutputLabel === "string" ? session.audioOutputLabel : "";
+  state.audioOutputMode = session.audioOutputMode === "exclusive" ? "exclusive" : "shared";
   state.startupOnLogin = normalizeStartupOnLogin(session.startupOnLogin);
   state.closeMinimizes = Boolean(session.closeMinimizes);
   if (typeof session.automaticUpdateChecks === "boolean") {
@@ -1504,30 +1445,15 @@ function musicFolders() {
   return Array.isArray(state.library.folders) ? state.library.folders : [];
 }
 
-function playerMediaHost(player) {
-  const src = player?.el?.currentSrc || player?.el?.src;
-  if (!src) {
-    return "";
-  }
-
-  try {
-    return new URL(src, window.location.href).hostname || "";
-  } catch {
-    return "";
-  }
-}
-
 function activeMediaHosts() {
-  return [...new Set([
-    playerMediaHost(currentPlayer()),
-    playerMediaHost(incomingPlayer())
-  ].filter(Boolean))];
+  // Local Sonora playback no longer uses virtual media hosts for PCM.
+  return [];
 }
 
 function captureActiveTracks() {
   const keepIds = new Set([
-    currentPlayer().trackId,
-    incomingPlayer().trackId,
+    currentTrack()?.id,
+    peekNextId({ wrap: state.repeat === "all" }),
     state.queue[state.index]
   ].filter(Boolean));
   const kept = [];
@@ -1627,6 +1553,17 @@ function isConnectingPlayback() {
   return Boolean(state.connectingDeviceId);
 }
 
+function requireSonoraLocal() {
+  if (window.EmpSonora?.available) {
+    return true;
+  }
+  state.playing = false;
+  if (typeof nowArtist !== "undefined" && nowArtist) {
+    nowArtist.textContent = "Native audio engine unavailable";
+  }
+  return false;
+}
+
 function playbackPosition() {
   if (isRemotePlayback()) {
     const base = Number(state.remotePosition) || 0;
@@ -1635,7 +1572,7 @@ function playbackPosition() {
     }
     return Math.max(0, base + (performance.now() - (state.remoteStatusAt || performance.now())) / 1000);
   }
-  return currentAudio().currentTime || 0;
+  return Number(state.sonoraPosition) || 0;
 }
 
 function playbackDuration() {
@@ -1643,7 +1580,8 @@ function playbackDuration() {
   if (isRemotePlayback()) {
     return preferRemoteDuration(state.remoteDuration, local);
   }
-  return currentAudio().duration || local;
+  const sonora = Number(state.sonoraDuration) || 0;
+  return sonora > 0 ? sonora : local;
 }
 
 function preferRemoteDuration(remoteValue, localValue) {
@@ -1684,10 +1622,11 @@ function nextCastTrackId() {
 
 function stopLocalOutput() {
   cancelTransition();
-  currentAudio().pause();
-  incomingPlayer().el.pause();
-  finalizePlayerListen(currentPlayer());
-  finalizePlayerListen(incomingPlayer());
+  if (window.EmpSonora?.available) {
+    window.EmpSonora.stop?.();
+    window.EmpSonora.clearNext?.();
+  }
+  finalizeLocalListen();
 }
 
 function postCastDiscovery(enabled) {
@@ -4308,6 +4247,10 @@ function navigate(entry, { push = true } = {}) {
 
 function render(entry) {
   renderSeq += 1;
+  if (entry.view !== "settings" && state.settingsOpen) {
+    hideSettingsOverlayDom();
+    state.settingsOpen = false;
+  }
   const nextFilter = entry.view === "albums" ? (entry.filter ?? "all") : null;
   if (state.view === "albums" && entry.view !== "albums") {
     saveBrowseScrollForHistory();
@@ -4392,13 +4335,8 @@ function render(entry) {
   } else if (entry.view === "artist") {
     renderArtist(entry.artist);
   } else if (entry.view === "settings") {
-    setStageAccent("#1f1f1f");
-    renderSettings();
-    refreshAudioOutputDevices();
-    const durationSlider = viewArea.querySelector("[data-crossfade-seconds]");
-    if (durationSlider) {
-      updateSlider(durationSlider);
-    }
+    // Settings is an overlay — keep the underlying page in #viewArea.
+    openSettingsOverlay(entry.section, { fromHistory: true });
   } else if (entry.view === "lyrics") {
     renderLyrics();
   }
@@ -5765,13 +5703,15 @@ function expandSearchResults(kind) {
 }
 
 function renderEqualizerPanel() {
-  const presetItems = EQ_PRESET_ORDER.map((id) => {
+  const presetIds = typeof listSelectableEqPresets === "function"
+    ? listSelectableEqPresets()
+    : EQ_PRESET_ORDER.filter((id) => isEqPresetAvailable(id));
+  const presetItems = presetIds.map((id) => {
     const preset = EQ_PRESETS[id];
-    const available = isEqPresetAvailable(id);
     const selected = state.equalizerPreset === id;
     return `
-      <button class="eq-preset-item${available ? "" : " is-unavailable"}${selected ? " is-selected" : ""}" type="button" role="option" data-eq-preset="${id}" ${available ? "" : "aria-disabled=\"true\" disabled"} title="${available ? escapeHtml(preset.name) : "No verified gain values"}" aria-selected="${selected ? "true" : "false"}">
-        ${escapeHtml(preset.name)}${available ? "" : "<span class=\"eq-preset-note\">Unavailable</span>"}
+      <button class="eq-preset-item${selected ? " is-selected" : ""}" type="button" role="option" data-eq-preset="${id}" title="${escapeHtml(preset.name)}" aria-selected="${selected ? "true" : "false"}">
+        ${escapeHtml(preset.name)}
       </button>
     `;
   }).join("");
@@ -5835,13 +5775,15 @@ function audioOutputMenuOptions() {
   const options = [{ id: "", label: "System Default" }];
   const seen = new Set([""]);
   for (const device of audioOutputDevices) {
-    const id = typeof device.deviceId === "string" ? device.deviceId : "";
-    const label = typeof device.label === "string" ? device.label.trim() : "";
+    const id = typeof device.id === "string" ? device.id : (typeof device.deviceId === "string" ? device.deviceId : "");
+    const label = typeof device.name === "string"
+      ? device.name.trim()
+      : (typeof device.label === "string" ? device.label.trim() : "");
     if (!id || seen.has(id) || !label) {
       continue;
     }
     seen.add(id);
-    options.push({ id, label });
+    options.push({ id, label: device.isDefault ? `${label} (Default)` : label });
   }
   if (state.audioOutputId && !seen.has(state.audioOutputId)) {
     const savedLabel = typeof state.audioOutputLabel === "string" ? state.audioOutputLabel.trim() : "";
@@ -5865,21 +5807,10 @@ function audioOutputLabelForId(deviceId) {
   return saved || "System Default";
 }
 
-function renderAudioOutputSettingRow() {
-  if (!audioOutputSupported && !(window.AudioContext && "setSinkId" in window.AudioContext.prototype)) {
-    return `
-      <div class="settings-row">
-        <div class="settings-copy">
-          <span class="settings-label">Audio Output</span>
-          <span class="settings-desc">Output device selection is not available in this WebView2 runtime.</span>
-        </div>
-      </div>`;
-  }
-  audioOutputSupported = true;
+function renderAudioDeviceMenu() {
   const options = audioOutputMenuOptions();
   const currentId = options.some((item) => item.id === state.audioOutputId) ? state.audioOutputId : "";
   const currentLabel = audioOutputLabelForId(currentId);
-  const canPick = typeof navigator.mediaDevices?.selectAudioOutput === "function";
   const items = options.map((item) => {
     const active = item.id === currentId;
     return `
@@ -5888,150 +5819,272 @@ function renderAudioOutputSettingRow() {
         ${active ? '<i class="bi bi-check2" aria-hidden="true"></i>' : ""}
       </button>`;
   }).join("");
-  const pickItem = canPick
-    ? `
-      <button class="songs-sort-item" type="button" role="menuitem" data-audio-output-pick>
-        <span>Choose device…</span>
-      </button>`
-    : "";
-
   return `
-    <div class="settings-row">
-      <div class="settings-copy">
-        <span class="settings-label">Audio Output</span>
-        <span class="settings-desc">Choose a local playback device when supported.</span>
-      </div>
-      <div class="songs-sort-wrap settings-audio-output-wrap">
-        <button class="songs-sort-button" type="button" data-audio-output-toggle aria-haspopup="menu" aria-expanded="false" aria-label="Audio Output">
-          <span data-audio-output-label>${escapeHtml(currentLabel)}</span>
-          <i class="bi bi-chevron-down" aria-hidden="true"></i>
-        </button>
-        <div class="songs-sort-menu settings-audio-output-menu" role="menu" aria-label="Audio Output" hidden>
-          ${items}
-          ${pickItem}
-        </div>
+    <div class="songs-sort-wrap settings-audio-output-wrap">
+      <button id="settings-audio-device-toggle" class="songs-sort-button" type="button" data-audio-output-toggle aria-haspopup="menu" aria-expanded="false" aria-label="Output device">
+        <span data-audio-output-label>${escapeHtml(currentLabel)}</span>
+        <i class="bi bi-chevron-down" aria-hidden="true"></i>
+      </button>
+      <div class="songs-sort-menu settings-audio-output-menu" role="menu" aria-label="Output device" hidden>
+        ${items}
       </div>
     </div>`;
 }
 
-let audioOutputLabelProbe = null;
-
-async function enumerateAudioOutputDevices() {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  return devices.filter((device) => device.kind === "audiooutput");
+function renderAudioModeMenu() {
+  const mode = state.audioOutputMode === "exclusive" ? "exclusive" : "shared";
+  const label = mode === "exclusive" ? "Exclusive" : "Shared";
+  const items = [
+    ["shared", "Shared"],
+    ["exclusive", "Exclusive"]
+  ].map(([id, text]) => {
+    const active = id === mode;
+    return `
+      <button class="songs-sort-item${active ? " active" : ""}" type="button" role="menuitemradio" aria-checked="${active ? "true" : "false"}" data-audio-output-mode="${id}">
+        <span>${text}</span>
+        ${active ? '<i class="bi bi-check2" aria-hidden="true"></i>' : ""}
+      </button>`;
+  }).join("");
+  return `
+    <div class="songs-sort-wrap settings-audio-mode-wrap">
+      <button id="settings-audio-mode-toggle" class="songs-sort-button" type="button" data-audio-output-mode-toggle aria-haspopup="menu" aria-expanded="false" aria-label="Output mode">
+        <span data-audio-output-mode-label>${label}</span>
+        <i class="bi bi-chevron-down" aria-hidden="true"></i>
+      </button>
+      <div class="songs-sort-menu settings-audio-mode-menu" role="menu" aria-label="Output mode" hidden>
+        ${items}
+      </div>
+    </div>`;
 }
 
-function audioOutputHasLabels(devices) {
-  return devices.some((device) => device.deviceId && String(device.label || "").trim());
+function audioOutputModeDescription(mode) {
+  if (mode === "exclusive") {
+    return "Exclusive mode takes sole control of the device for lower latency and bit-perfect playback. Other apps can’t play through this device while EMP is playing.";
+  }
+  return "Shared mode plays alongside other apps using Windows shared audio. Best for everyday listening.";
 }
 
-/**
- * Chromium withholds device labels until a media permission is granted.
- * Probe once with a short-lived audio capture stream (host auto-allows mic).
- */
-async function ensureAudioOutputLabels(devices) {
-  if (audioOutputHasLabels(devices)) {
-    return devices;
+function audioFallbackReasonText(reason) {
+  switch (String(reason || "").toLowerCase()) {
+    case "devicebusy":
+      return "Another app is using this device, so EMP switched to Shared mode.";
+    case "exclusivemoderestricted":
+      return "This device doesn’t allow Exclusive mode, so EMP is using Shared mode.";
+    case "unsupportedformat":
+      return "Exclusive mode couldn’t match a supported format, so EMP switched to Shared mode.";
+    case "initializationfailed":
+      return "Exclusive mode couldn’t start, so EMP switched to Shared mode.";
+    case "none":
+    case "":
+      return "";
+    default:
+      return "Exclusive mode wasn’t available, so EMP switched to Shared mode.";
   }
-  if (!navigator.mediaDevices?.getUserMedia) {
-    return devices;
+}
+
+function renderAudioOutputSettingRow() {
+  if (!window.EmpSonora?.available) {
+    return `
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Audio Output</span>
+          <span class="settings-desc">Native audio engine is unavailable.</span>
+        </div>
+      </div>`;
   }
-  if (!audioOutputLabelProbe) {
-    audioOutputLabelProbe = (async () => {
-      let stream = null;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: false
-        });
-      } catch {
-        return false;
-      } finally {
-        stream?.getTracks?.().forEach((track) => {
-          try {
-            track.stop();
-          } catch {
-            // Ignore stop failures after probing.
-          }
-        });
-      }
-      return true;
-    })().finally(() => {
-      // Allow a later retry if the first probe failed before permission was ready.
-      window.setTimeout(() => {
-        audioOutputLabelProbe = null;
-      }, 1500);
-    });
+  audioOutputSupported = true;
+  const requestedMode = state.audioOutputMode === "exclusive" ? "exclusive" : "shared";
+  const requested = requestedMode === "exclusive" ? "Exclusive" : "Shared";
+  const effectiveRaw = state.audioEffectiveMode || requestedMode;
+  const effective = effectiveRaw === "exclusive" ? "Exclusive" : "Shared";
+  const didFallback = requested === "Exclusive" && effective === "Shared";
+  const fallbackNote = didFallback
+    ? (audioFallbackReasonText(state.audioFallbackReason)
+      || "Exclusive mode wasn’t available, so EMP switched to Shared mode.")
+    : "";
+  const modeDesc = audioOutputModeDescription(requestedMode);
+  return `
+    <div class="settings-block settings-audio-output">
+      <div class="settings-copy">
+        <span class="settings-label">Audio Output</span>
+        <span class="settings-desc">Choose a WASAPI playback device and how EMP opens it.</span>
+      </div>
+      <div class="settings-audio-pair">
+        <div class="settings-audio-field">
+          <label for="settings-audio-device-toggle">Output Device</label>
+          ${renderAudioDeviceMenu()}
+        </div>
+        <div class="settings-audio-field">
+          <label for="settings-audio-mode-toggle">Output Mode</label>
+          ${renderAudioModeMenu()}
+        </div>
+      </div>
+      <p class="settings-audio-mode-desc">${escapeHtml(modeDesc)}</p>
+      <div class="settings-audio-status" role="status" aria-live="polite">
+        <span class="settings-audio-status-title">Output Status</span>
+        <dl class="settings-audio-status-grid">
+          <dt>Requested</dt>
+          <dd>${requested}</dd>
+          <dt>Effective</dt>
+          <dd class="${didFallback ? "is-fallback" : ""}">${effective}</dd>
+        </dl>
+        ${fallbackNote ? `<p class="settings-audio-status-note">${escapeHtml(fallbackNote)}</p>` : ""}
+      </div>
+    </div>`;
+}
+
+let audioOutputDevicesFingerprint = "";
+let settingsRenderDepth = 0;
+
+function audioDevicesFingerprint(devices) {
+  if (!Array.isArray(devices) || !devices.length) {
+    return "";
   }
-  await audioOutputLabelProbe;
-  return enumerateAudioOutputDevices();
+  return devices.map((device) => `${device.id || device.deviceId || ""}:${device.name || device.label || ""}`).join("|");
 }
 
 async function refreshAudioOutputDevices() {
-  audioOutputSupported = Boolean(window.AudioContext && "setSinkId" in window.AudioContext.prototype);
-  if (!audioOutputSupported || !navigator.mediaDevices?.enumerateDevices) {
-    audioOutputDevices = [];
+  if (window.EmpSonora?.available) {
+    // Ask host once; apply when the devices event arrives. Do not re-enter renderSettings here.
+    window.EmpSonora.listDevices?.();
+    refreshSonoraAudioOutputDevices({ requestList: false });
     return;
   }
-  try {
-    let devices = await enumerateAudioOutputDevices();
-    devices = await ensureAudioOutputLabels(devices);
-    audioOutputDevices = devices;
-    const labeledIds = new Set(
-      audioOutputDevices
-        .filter((device) => device.deviceId && String(device.label || "").trim())
-        .map((device) => device.deviceId)
-    );
-    if (state.audioOutputId
-      && state.audioOutputId !== ""
-      && !labeledIds.has(state.audioOutputId)
-      && !(typeof state.audioOutputLabel === "string" && state.audioOutputLabel.trim())) {
+  audioOutputDevices = [];
+  audioOutputSupported = false;
+  audioOutputDevicesFingerprint = "";
+  syncAudioSettingsUiIfOpen();
+}
+
+/**
+ * Chromium deviceIds are invalid for WASAPI. Prefer exact id match, else migrate once by label.
+ * Mirrors EMP.Hosting.Sonora.SonoraOutputDeviceMigration.
+ */
+function refreshSonoraAudioOutputDevices({ requestList = false } = {}) {
+  if (requestList) {
+    window.EmpSonora?.listDevices?.();
+  }
+  audioOutputSupported = true;
+  const devices = Array.isArray(window.EmpSonora?.devices) ? window.EmpSonora.devices : [];
+  const nextFingerprint = audioDevicesFingerprint(devices);
+  const savedId = typeof state.audioOutputId === "string" ? state.audioOutputId.trim() : "";
+  const savedLabel = typeof state.audioOutputLabel === "string" ? state.audioOutputLabel.trim() : "";
+  let selectionChanged = false;
+
+  audioOutputDevices = devices;
+
+  if (!savedId) {
+    applyAudioOutputDevice();
+    const devicesChanged = nextFingerprint !== audioOutputDevicesFingerprint;
+    audioOutputDevicesFingerprint = nextFingerprint;
+    if (devicesChanged) {
+      syncAudioSettingsUiIfOpen();
+    }
+    return;
+  }
+
+  const exact = devices.find((device) => device.id === savedId);
+  if (exact) {
+    if (exact.name && exact.name !== state.audioOutputLabel) {
+      state.audioOutputLabel = exact.name;
+      selectionChanged = true;
+    }
+  } else {
+    const byLabel = savedLabel
+      ? devices.find((device) => String(device.name || "").trim().toLowerCase() === savedLabel.toLowerCase())
+      : null;
+    if (byLabel?.id) {
+      state.audioOutputId = byLabel.id;
+      state.audioOutputLabel = byLabel.name || state.audioOutputLabel;
+      writeSession();
+      selectionChanged = true;
+    } else {
       state.audioOutputId = "";
       state.audioOutputLabel = "";
       writeSession();
-      applyAudioOutputDevice();
-    } else if (state.audioOutputId) {
-      const match = audioOutputDevices.find((device) => device.deviceId === state.audioOutputId);
-      const label = match && String(match.label || "").trim();
-      if (label) {
-        state.audioOutputLabel = label;
-      }
+      selectionChanged = true;
     }
-  } catch {
-    audioOutputDevices = [];
   }
-  if (state.view === "settings") {
-    renderSettings();
+  applyAudioOutputDevice();
+  const devicesChanged = nextFingerprint !== audioOutputDevicesFingerprint;
+  audioOutputDevicesFingerprint = nextFingerprint;
+  if (devicesChanged || selectionChanged) {
+    syncAudioSettingsUiIfOpen();
   }
 }
 
-async function pickAudioOutputDevice() {
-  if (typeof navigator.mediaDevices?.selectAudioOutput !== "function") {
+/** Update Audio settings UI without nesting refresh→render→refresh loops. */
+function syncAudioSettingsUiIfOpen() {
+  if (!(state.settingsOpen || state.view === "settings")) {
     return;
   }
-  try {
-    const device = await navigator.mediaDevices.selectAudioOutput();
-    if (!device || typeof device.deviceId !== "string") {
-      return;
-    }
-    state.audioOutputLabel = typeof device.label === "string" ? device.label.trim() : "";
-    setPlaybackSetting("audioOutputId", device.deviceId);
-    await refreshAudioOutputDevices();
-  } catch {
-    // User cancelled the system picker or the runtime denied it.
+  if (state.settingsSection !== "audio") {
+    return;
   }
+  if (settingsRenderDepth > 0) {
+    return;
+  }
+  renderSettings();
+}
+
+function settingsOverlayRoot() {
+  return document.getElementById("settingsOverlayRoot");
+}
+
+/** Settings UI lives in the overlay; fall back to viewArea only for legacy queries. */
+function settingsRoot() {
+  const root = settingsOverlayRoot();
+  if (root && !root.hidden) {
+    return root.querySelector("[data-settings-body]") || root;
+  }
+  return viewArea;
 }
 
 function closeAudioOutputMenu() {
-  viewArea.querySelectorAll(".settings-audio-output-wrap").forEach((wrap) => {
+  settingsRoot().querySelectorAll(".settings-audio-output-wrap, .settings-audio-mode-wrap").forEach((wrap) => {
     const menu = wrap.querySelector(".songs-sort-menu");
-    const button = wrap.querySelector("[data-audio-output-toggle]");
+    const button = wrap.querySelector("[data-audio-output-toggle], [data-audio-output-mode-toggle]");
     if (menu) {
       menu.hidden = true;
     }
     button?.setAttribute("aria-expanded", "false");
     wrap.classList.remove("is-open");
   });
+}
+
+function hideSettingsOverlayDom() {
+  const root = settingsOverlayRoot();
+  if (!root) {
+    return;
+  }
+  root.hidden = true;
+  root.classList.remove("is-open");
+}
+
+function renderSettingsNav() {
+  const api = window.EmpSettingsOverlay;
+  const nav = settingsOverlayRoot()?.querySelector("[data-settings-nav]");
+  if (!nav || !api) {
+    return;
+  }
+  const section = api.normalizeSettingsSection(state.settingsSection);
+  nav.innerHTML = `
+    <div class="settings-overlay-brand">
+      <i class="bi bi-gear-fill" aria-hidden="true"></i>
+      <span>Settings</span>
+    </div>
+    ${api.SECTIONS.map((group) => `
+      <div class="settings-nav-group">
+        <span class="settings-nav-group-label">${escapeHtml(group.group)}</span>
+        ${group.items.map((item) => `
+          <button class="settings-nav-item${item.id === section ? " is-active" : ""}" type="button" data-settings-section="${item.id}" aria-current="${item.id === section ? "page" : "false"}">
+            <i class="bi ${item.icon}" aria-hidden="true"></i>
+            <span>${escapeHtml(item.label)}</span>
+          </button>
+        `).join("")}
+      </div>
+    `).join("")}
+  `;
 }
 
 function settingSelect(name, value, options) {
@@ -6111,137 +6164,443 @@ function renderLibrarySettingsGroup() {
   `;
 }
 
-function renderSettings() {
+function renderGeneralSettingsSection() {
+  return `
+    <section class="settings-group">
+      <h2>General</h2>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Open EMP automatically after you log into the computer</span>
+        </div>
+        ${settingSelect("startup", state.startupOnLogin, [
+          ["minimized", "Minimized"],
+          ["yes", "Yes"],
+          ["no", "No"]
+        ])}
+      </div>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Close button should minimize the EMP window</span>
+        </div>
+        ${settingSwitch("closeMinimizes", state.closeMinimizes, "Close button should minimize the EMP window")}
+      </div>
+    </section>`;
+}
+
+function renderPlaybackSettingsSection() {
+  return `
+    <section class="settings-group">
+      <h2>Playback</h2>
+      <div class="settings-block">
+        <div class="settings-row">
+          <div class="settings-copy">
+            <span class="settings-label">Crossfade Songs</span>
+            <span class="settings-desc">Fade between the end of the current song and the next.</span>
+          </div>
+          ${settingSwitch("crossfade", state.crossfade, "Crossfade Songs")}
+        </div>
+        ${state.crossfade ? `
+        <div class="settings-nested" role="group" aria-label="Crossfade options">
+          <div class="settings-nested-row">
+            <span class="settings-nested-label">Duration</span>
+            <div class="settings-duration-control">
+              <input class="slider settings-duration-slider" type="range" min="1" max="12" step="1" value="${clampCrossfadeSeconds(state.crossfadeSeconds)}" aria-label="Crossfade duration" data-crossfade-seconds>
+              <span class="settings-duration-value" data-crossfade-seconds-label>${clampCrossfadeSeconds(state.crossfadeSeconds)} sec</span>
+            </div>
+          </div>
+        </div>` : ""}
+      </div>
+      <div class="settings-block">
+        <div class="settings-row">
+          <div class="settings-copy">
+            <span class="settings-label">Gapless</span>
+            <span class="settings-desc">Preload the next track for a seamless Sonora handoff with no timed crossfade. Cannot be used with Crossfade.</span>
+          </div>
+          ${settingSwitch("gapless", state.gapless, "Gapless")}
+        </div>
+      </div>
+      <div class="settings-block">
+        <div class="settings-row">
+          <div class="settings-copy">
+            <span class="settings-label">Normalize volume (ReplayGain)</span>
+            <span class="settings-desc">Applies ReplayGain tags when available. Songs without ReplayGain metadata play at their original level. Peak protection from ReplayGain tags is separate from the Limiter.</span>
+          </div>
+          ${settingSwitch("normalizeVolume", state.normalizeVolume, "Normalize volume")}
+        </div>
+        ${state.normalizeVolume ? `
+        <div class="settings-nested" role="group" aria-label="Normalization options">
+          <div class="settings-nested-row">
+            <span class="settings-nested-label">Mode</span>
+            <div class="settings-segmented" role="group" aria-label="Normalization mode">
+              <button type="button" class="settings-segment${state.normalizeMode === "track" ? " is-selected" : ""}" data-normalize-mode="track">Track</button>
+              <button type="button" class="settings-segment${state.normalizeMode === "album" ? " is-selected" : ""}" data-normalize-mode="album">Album</button>
+            </div>
+          </div>
+          <p class="settings-nested-desc">Album mode uses album tags when present; otherwise track tags. During crossfade, overlapping tracks share one post-mix ReplayGain value.</p>
+        </div>` : ""}
+      </div>
+    </section>`;
+}
+
+function renderPersonalizationSettingsSection() {
+  return `
+    <section class="settings-group">
+      <h2>Personalization</h2>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Personalized mixes</span>
+          <span class="settings-desc">Create music mixes from your library and listening habits.</span>
+        </div>
+        ${settingSwitch("personalizedMixes", state.personalizedMixes !== false, "Personalized mixes")}
+      </div>
+    </section>`;
+}
+
+function renderPreampControl() {
+  const preamp = window.EmpSonoraPreamp;
+  const min = preamp?.PREAMP_MIN_DB ?? -24;
+  const max = preamp?.PREAMP_MAX_DB ?? 24;
+  const step = preamp?.PREAMP_UI_STEP_DB ?? 0.5;
+  const value = preamp?.quantizePreampDb?.(state.userPreampDb)
+    ?? preamp?.clampPreampDb?.(state.userPreampDb)
+    ?? 0;
+  const label = preamp?.formatPreampDb?.(value) ?? "0.0 dB";
+  const atUnity = value === 0;
+  return `
+    <div class="settings-block settings-preamp">
+      <div class="settings-preamp-head">
+        <div class="settings-copy">
+          <span class="settings-label">Preamp</span>
+          <span class="settings-desc">Global gain before EQ and limiter (${min} dB to +${Math.abs(max)} dB). Combined with ReplayGain when Normalize is on.</span>
+        </div>
+        <div class="settings-preamp-meta">
+          <output class="settings-preamp-value${atUnity ? " is-unity" : ""}" aria-live="polite" data-user-preamp-display>${escapeHtml(label)}</output>
+          <button class="eq-reset settings-preamp-reset" type="button" data-user-preamp-reset${atUnity ? " disabled" : ""}>Reset</button>
+        </div>
+      </div>
+      <div class="settings-preamp-control" role="group" aria-label="Preamp">
+        <div class="settings-preamp-track">
+          <span class="settings-preamp-zero" aria-hidden="true"></span>
+          <input class="slider settings-preamp-slider" type="range" min="${min}" max="${max}" step="${step}" value="${value}" aria-valuemin="${min}" aria-valuemax="${max}" aria-valuenow="${value}" aria-valuetext="${escapeHtml(label)}" aria-label="Preamp" data-user-preamp>
+        </div>
+        <div class="settings-preamp-scale" aria-hidden="true">
+          <span>−24 dB</span>
+          <span class="settings-preamp-unity${atUnity ? " is-active" : ""}">0 dB (Unity)</span>
+          <span>+24 dB</span>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderEqualizerSettingsSection() {
   let equalizerMarkup = "";
   try {
     equalizerMarkup = renderEqualizerPanel();
   } catch {
     equalizerMarkup = "";
   }
+  return `
+    <section class="settings-group">
+      <h2>Equalizer</h2>
+      ${renderPreampControl()}
+      <div class="settings-block">
+        <div class="settings-row">
+          <div class="settings-copy">
+            <span class="settings-label">Equalizer</span>
+            <span class="settings-desc">Adjust frequencies to fit your listening preferences.</span>
+          </div>
+          ${settingSwitch("equalizerEnabled", state.equalizerEnabled, "Equalizer")}
+        </div>
+        ${equalizerMarkup}
+      </div>
+      <div class="settings-block">
+        <div class="settings-row">
+          <div class="settings-copy">
+            <span class="settings-label">Limiter</span>
+            <span class="settings-desc">Soft-limit post-mix peaks from EQ and preamp. This is not the same as ReplayGain peak protection used when Normalize volume is on.</span>
+          </div>
+          ${settingSwitch("preventClipping", state.preventClipping !== false, "Limiter")}
+        </div>
+      </div>
+      <div class="settings-row settings-folder-actions">
+        <button class="eq-reset" type="button" data-reset-audio-processing>Reset audio processing</button>
+      </div>
+    </section>`;
+}
 
-  viewArea.innerHTML = `
-    <div class="settings-page">
-      <h1>Settings</h1>
-      <section class="settings-group">
-        <h2>Startup and window behaviour</h2>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <span class="settings-label">Open EMP automatically after you log into the computer</span>
-          </div>
-          ${settingSelect("startup", state.startupOnLogin, [
-            ["minimized", "Minimized"],
-            ["yes", "Yes"],
-            ["no", "No"]
-          ])}
-        </div>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <span class="settings-label">Close button should minimize the EMP window</span>
-          </div>
-          ${settingSwitch("closeMinimizes", state.closeMinimizes, "Close button should minimize the EMP window")}
-        </div>
-      </section>
-      ${renderLibrarySettingsGroup()}
-      <section class="settings-group">
-        <h2>Personalization</h2>
-        <div class="settings-row">
-          <div class="settings-copy">
-            <span class="settings-label">Personalized mixes</span>
-            <span class="settings-desc">Create music mixes from your library and listening habits.</span>
-          </div>
-          ${settingSwitch("personalizedMixes", state.personalizedMixes !== false, "Personalized mixes")}
-        </div>
-      </section>
-      <section class="settings-group">
-        <h2>Playback</h2>
-        <div class="settings-block">
-          <div class="settings-row">
-            <div class="settings-copy">
-              <span class="settings-label">Crossfade Songs</span>
-            </div>
-            ${settingSwitch("crossfade", state.crossfade, "Crossfade Songs")}
-          </div>
-          ${state.crossfade ? `
-          <div class="settings-nested" role="group" aria-label="Crossfade options">
-            <div class="settings-nested-row">
-              <span class="settings-nested-label">Duration</span>
-              <div class="settings-duration-control">
-                <input class="slider settings-duration-slider" type="range" min="1" max="12" step="1" value="${clampCrossfadeSeconds(state.crossfadeSeconds)}" aria-label="Crossfade duration" data-crossfade-seconds>
-                <span class="settings-duration-value" data-crossfade-seconds-label>${clampCrossfadeSeconds(state.crossfadeSeconds)} sec</span>
-              </div>
-            </div>
-          </div>` : ""}
-        </div>
-        <div class="settings-block">
-          <div class="settings-row">
-            <div class="settings-copy">
-              <span class="settings-label">Gapless</span>
-              <span class="settings-desc">Start the next song with minimal silence. Cannot be used with Crossfade.</span>
-            </div>
-            ${settingSwitch("gapless", state.gapless, "Gapless")}
-          </div>
-        </div>
-        <div class="settings-block">
-          <div class="settings-row">
-            <div class="settings-copy">
-              <span class="settings-label">Normalize volume</span>
-              <span class="settings-desc">Applies ReplayGain tags when available. Songs without ReplayGain metadata play at their original level.</span>
-            </div>
-            ${settingSwitch("normalizeVolume", state.normalizeVolume, "Normalize volume")}
-          </div>
-          ${state.normalizeVolume ? `
-          <div class="settings-nested" role="group" aria-label="Normalization options">
-            <div class="settings-nested-row">
-              <span class="settings-nested-label">Mode</span>
-              <div class="settings-segmented" role="group" aria-label="Normalization mode">
-                <button type="button" class="settings-segment${state.normalizeMode === "track" ? " is-selected" : ""}" data-normalize-mode="track">Track</button>
-                <button type="button" class="settings-segment${state.normalizeMode === "album" ? " is-selected" : ""}" data-normalize-mode="album">Album</button>
-              </div>
-            </div>
-            <p class="settings-nested-desc">Album mode uses album tags when present; otherwise track tags.</p>
-          </div>` : ""}
-        </div>
-        <div class="settings-block">
-          <div class="settings-row">
-            <div class="settings-copy">
-              <span class="settings-label">Prevent Clipping</span>
-              <span class="settings-desc">Reduce distortion caused by volume normalization and audio enhancements.</span>
-            </div>
-            ${settingSwitch("preventClipping", state.preventClipping !== false, "Prevent Clipping")}
-          </div>
-        </div>
-        <div class="settings-block">
-          ${renderAudioOutputSettingRow()}
-        </div>
-        ${isRemotePlayback() || isConnectingPlayback() ? `
-        <div class="settings-block">
-          <div class="settings-row">
-            <div class="settings-copy">
-              <span class="settings-desc">Equalizer, ReplayGain, Prevent Clipping, and audio output apply to local playback only while casting.</span>
-            </div>
-          </div>
-        </div>` : ""}
-        <div class="settings-block">
-          <div class="settings-row">
-            <div class="settings-copy">
-              <span class="settings-label">Equalizer</span>
-            </div>
-            ${settingSwitch("equalizerEnabled", state.equalizerEnabled, "Equalizer")}
-          </div>
-          ${equalizerMarkup}
-        </div>
-      </section>
-      ${renderStorageSettingsGroup()}
-      ${renderUpdatesSettingsGroup()}
-    </div>
-  `;
-  try {
-    syncEqualizerUi();
-  } catch {
-    // Settings still render if the graph overlay cannot be drawn.
+function renderAudioSettingsSection() {
+  return `
+    <section class="settings-group">
+      <h2>Audio</h2>
+      ${renderAudioOutputSettingRow()}
+      ${isRemotePlayback() || isConnectingPlayback() ? `
+      <p class="settings-cast-note">Equalizer, ReplayGain, Limiter, and WASAPI output apply to local playback only while casting. Your saved preferences are kept.</p>
+      ` : ""}
+    </section>`;
+}
+
+function formatAboutVersionLabel(version) {
+  const raw = typeof version === "string" ? version.trim() : "";
+  if (!raw || raw === "…") {
+    return "…";
   }
-  window.chrome?.webview?.postMessage({ type: "storage" });
-  window.chrome?.webview?.postMessage({ type: "updates", action: "status" });
+  return /^v/i.test(raw) ? raw : `v${raw}`;
+}
+
+function renderAboutSettingsSection() {
+  const empVersion = escapeHtml(formatAboutVersionLabel(state.appVersion));
+  const sonoraVersion = escapeHtml(formatAboutVersionLabel(state.sonoraVersion));
+  return `
+    <section class="settings-group settings-about">
+      <h2>About</h2>
+      <div class="settings-row settings-about-row">
+        <div class="settings-about-main">
+          <img class="settings-about-logo" src="img/emp-icon-512.png" alt="" width="40" height="40">
+          <div class="settings-copy">
+            <div class="settings-about-title-row">
+              <span class="settings-label">EMP</span>
+              <span class="settings-about-version" data-emp-version>${empVersion}</span>
+            </div>
+            <span class="settings-desc">A modern Windows music player that brings a streaming-style experience to your local music library. No account required.</span>
+            <a class="settings-about-link" href="https://github.com/lazytitanz/EMP" data-open-url="https://github.com/lazytitanz/EMP">github.com/lazytitanz/EMP</a>
+          </div>
+        </div>
+      </div>
+      <div class="settings-row settings-about-row">
+        <div class="settings-about-main">
+          <img class="settings-about-logo" src="img/sonora-logo.png" alt="" width="40" height="40">
+          <div class="settings-copy">
+            <div class="settings-about-title-row">
+              <span class="settings-label">Sonora</span>
+              <span class="settings-about-version" data-sonora-version>${sonoraVersion}</span>
+            </div>
+            <span class="settings-desc">The open-source audio engine powering EMP's local playback, with native Windows audio output and real-time audio processing.</span>
+            <a class="settings-about-link" href="https://github.com/lazytitanz/Sonora" data-open-url="https://github.com/lazytitanz/Sonora">github.com/lazytitanz/Sonora</a>
+          </div>
+        </div>
+      </div>
+      <div class="settings-about-support" role="region" aria-labelledby="settings-about-support-heading">
+        <div class="settings-about-support-icon" aria-hidden="true">
+          <i class="bi bi-star-fill"></i>
+        </div>
+        <div class="settings-about-support-copy">
+          <h3 id="settings-about-support-heading" class="settings-about-support-title">Enjoying EMP?</h3>
+          <p class="settings-about-support-desc">If EMP has earned a place in your music routine, consider giving the project a star on GitHub. It helps others discover it!</p>
+          <a class="settings-about-support-btn"
+            href="https://github.com/lazytitanz/EMP"
+            data-open-url="https://github.com/lazytitanz/EMP">
+            <i class="bi bi-github" aria-hidden="true"></i>
+            <span>Star on GitHub</span>
+            <i class="bi bi-box-arrow-up-right" aria-hidden="true"></i>
+          </a>
+        </div>
+      </div>
+    </section>`;
+}
+
+function renderSettingsSectionContent(sectionId) {
+  const section = window.EmpSettingsOverlay?.normalizeSettingsSection?.(sectionId) || "general";
+  switch (section) {
+    case "general":
+      return renderGeneralSettingsSection();
+    case "library":
+      return renderLibrarySettingsGroup();
+    case "playback":
+      return renderPlaybackSettingsSection();
+    case "audio":
+      return renderAudioSettingsSection();
+    case "equalizer":
+      return renderEqualizerSettingsSection();
+    case "personalization":
+      return renderPersonalizationSettingsSection();
+    case "listeningInsights":
+      return renderListeningInsightsSection();
+    case "storage":
+      return renderStorageSettingsGroup();
+    case "updates":
+      return renderUpdatesSettingsGroup();
+    case "about":
+      return renderAboutSettingsSection();
+    default:
+      return renderPlaybackSettingsSection();
+  }
+}
+
+function insightsUiHelpers() {
+  return {
+    trackById,
+    albumById,
+    catalogArtists
+  };
+}
+
+function renderListeningInsightsSection() {
+  const insights = window.EmpListeningInsights;
+  if (!insights?.render) {
+    return `
+      <section class="settings-group settings-insights li-page">
+        <p class="li-coverage">Listening Insights are unavailable.</p>
+      </section>`;
+  }
+  return insights.render(insightsUiHelpers());
+}
+
+function requestListeningInsights(range) {
+  const insights = window.EmpListeningInsights;
+  if (!insights?.requestInsights) {
+    return;
+  }
+  insights.requestInsights(range || insights.getSelectedRange?.() || "last30");
+  if (state.settingsOpen && state.settingsSection === "listeningInsights") {
+    renderSettings();
+  }
+}
+
+function applyListeningInsights(detail) {
+  const insights = window.EmpListeningInsights;
+  if (!insights?.applyInsightsPayload) {
+    return;
+  }
+  const applied = insights.applyInsightsPayload(detail, {
+    settingsOpen: state.settingsOpen,
+    settingsSection: state.settingsSection
+  });
+  if (applied && state.settingsOpen && state.settingsSection === "listeningInsights") {
+    renderSettings();
+  }
+}
+
+function renderSettings() {
+  const root = settingsOverlayRoot();
+  const body = root?.querySelector("[data-settings-body]");
+  const title = root?.querySelector("[data-settings-title]");
+  const description = root?.querySelector("[data-settings-description]");
+  if (!root || !body) {
+    return;
+  }
+
+  settingsRenderDepth += 1;
+  try {
+    const section = window.EmpSettingsOverlay?.normalizeSettingsSection?.(state.settingsSection) || "general";
+    state.settingsSection = section;
+    const meta = window.EmpSettingsOverlay?.SECTION_META?.[section];
+    if (title) {
+      title.textContent = meta?.title || "Settings";
+    }
+    if (description) {
+      description.textContent = meta?.description || "";
+    }
+
+    renderSettingsNav();
+    body.innerHTML = renderSettingsSectionContent(section);
+
+    try {
+      syncEqualizerUi();
+    } catch {
+      // Settings still render if the graph overlay cannot be drawn.
+    }
+
+    const durationSlider = body.querySelector("[data-crossfade-seconds]");
+    if (durationSlider) {
+      updateSlider(durationSlider);
+    }
+    const preampSlider = body.querySelector("[data-user-preamp]");
+    if (preampSlider) {
+      updatePreampSlider(preampSlider);
+    }
+
+    if (section === "storage") {
+      window.chrome?.webview?.postMessage({ type: "storage" });
+    }
+    if (section === "updates" || section === "about") {
+      window.chrome?.webview?.postMessage({ type: "updates", action: "status" });
+    }
+    if (section !== "listeningInsights") {
+      window.EmpListeningInsights?.clearActiveRequests?.();
+    }
+    // Do not call refreshAudioOutputDevices() here — it used to re-enter renderSettings
+    // and freeze the UI. Device list is requested when entering the Audio section.
+  } finally {
+    settingsRenderDepth = Math.max(0, settingsRenderDepth - 1);
+  }
+}
+
+function requestAudioSettingsDevices() {
+  if (!window.EmpSonora?.available) {
+    return;
+  }
+  window.EmpSonora.listDevices?.();
+}
+
+function openSettingsOverlay(section, { fromHistory = false } = {}) {
+  const api = window.EmpSettingsOverlay;
+  // Fresh opens always land on General. History restore may keep a section if provided.
+  const nextSection = fromHistory
+    ? (api?.normalizeSettingsSection?.(section) || "general")
+    : "general";
+  state.settingsSection = nextSection;
+  state.settingsOpen = true;
+
+  const root = settingsOverlayRoot();
+  if (root) {
+    root.hidden = false;
+    root.classList.add("is-open");
+  }
+
+  document.querySelectorAll("[data-nav]").forEach((item) => {
+    item.classList.toggle("active", item.dataset.nav === "settings");
+  });
+  syncNavIcons({ view: "settings" });
+
+  renderSettings();
+  if (nextSection === "audio") {
+    requestAudioSettingsDevices();
+  }
+  if (nextSection === "listeningInsights") {
+    requestListeningInsights();
+  }
+
+  if (!fromHistory) {
+    const current = historyStack[historyIndex];
+    const entry = api?.settingsHistoryEntry?.(nextSection) || { view: "settings", section: nextSection };
+    if (api?.shouldPushSettingsHistory?.(current)) {
+      historyStack.splice(historyIndex + 1);
+      historyStack.push(entry);
+      historyIndex = historyStack.length - 1;
+    } else if (current?.view === "settings") {
+      historyStack[historyIndex] = entry;
+    }
+  }
+}
+
+function closeSettingsOverlay() {
+  if (!state.settingsOpen && historyStack[historyIndex]?.view !== "settings") {
+    hideSettingsOverlayDom();
+    return;
+  }
+  window.EmpListeningInsights?.clearActiveRequests?.();
+  hideSettingsOverlayDom();
+  state.settingsOpen = false;
+
+  if (historyStack[historyIndex]?.view === "settings") {
+    if (historyIndex > 0) {
+      historyIndex -= 1;
+      render(historyStack[historyIndex]);
+      return;
+    }
+    navigate({ view: "home" }, { push: false });
+    return;
+  }
+
+  const entry = historyStack[historyIndex] || { view: "home" };
+  document.querySelectorAll("[data-nav]").forEach((item) => {
+    const nav = item.dataset.nav;
+    const libraryViews = isLibraryView(entry.view);
+    const active = nav === entry.view
+      || (libraryViews && nav === "albums" && !item.classList.contains("chip"));
+    item.classList.toggle("active", active);
+  });
+  syncNavIcons(entry);
 }
 
 /** Format a byte count with SI (1000) units: B, KB, MB, GB, TB, PB. */
@@ -6419,21 +6778,66 @@ function shouldShowUpdateToast() {
   return true;
 }
 
-function syncUpdateToast() {
+function prefersReducedMotion() {
+  return Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+}
+
+function setUpdateToastVisible(show) {
   const toast = document.getElementById("updateToast");
   if (!toast) {
     return;
   }
-  const show = shouldShowUpdateToast();
-  toast.hidden = !show;
-  if (!show) {
+
+  if (show) {
+    const message = toast.querySelector("[data-update-toast-message]");
+    const version = state.updateStatus?.availableVersion;
+    if (message) {
+      message.textContent = version
+        ? `EMP v${version} is available.`
+        : "A new version of EMP is ready to download.";
+    }
+    if (!toast.hidden && toast.classList.contains("is-visible") && !updateToastHideTimer) {
+      return;
+    }
+    if (updateToastHideTimer) {
+      clearTimeout(updateToastHideTimer);
+      updateToastHideTimer = 0;
+    }
+    toast.hidden = false;
+    if (prefersReducedMotion()) {
+      toast.classList.add("is-visible");
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!toast.hidden) {
+          toast.classList.add("is-visible");
+        }
+      });
+    });
     return;
   }
-  const message = toast.querySelector("[data-update-toast-message]");
-  const version = state.updateStatus?.availableVersion;
-  if (message && version) {
-    message.textContent = `EMP v${version} is available`;
+
+  if (toast.hidden && !toast.classList.contains("is-visible")) {
+    return;
   }
+  if (updateToastHideTimer) {
+    clearTimeout(updateToastHideTimer);
+    updateToastHideTimer = 0;
+  }
+  toast.classList.remove("is-visible");
+  if (prefersReducedMotion()) {
+    toast.hidden = true;
+    return;
+  }
+  updateToastHideTimer = window.setTimeout(() => {
+    toast.hidden = true;
+    updateToastHideTimer = 0;
+  }, 200);
+}
+
+function syncUpdateToast() {
+  setUpdateToastVisible(shouldShowUpdateToast());
 }
 
 function dismissUpdateToast() {
@@ -6441,10 +6845,7 @@ function dismissUpdateToast() {
   if (version) {
     updateToastSessionDismissedVersion = version;
   }
-  const toast = document.getElementById("updateToast");
-  if (toast) {
-    toast.hidden = true;
-  }
+  setUpdateToastVisible(false);
   // Persist dismissal without clearing updateAvailable / Settings badge.
   postUpdateAction("dismissNotification");
 }
@@ -6454,10 +6855,10 @@ function applyStorageUsage(detail) {
     libraryBytes: Number(detail?.libraryBytes) || 0,
     cacheBytes: Number(detail?.cacheBytes) || 0
   };
-  if (state.view !== "settings") {
+  if (!state.settingsOpen && state.view !== "settings") {
     return;
   }
-  viewArea.querySelectorAll("[data-storage-value]").forEach((el) => {
+  settingsRoot().querySelectorAll("[data-storage-value]").forEach((el) => {
     el.textContent = storageValueText(el.dataset.storageValue);
   });
 }
@@ -7472,6 +7873,9 @@ function clamp(value, min, max) {
 }
 
 function userVolumeGain() {
+  if (window.EmpSonoraVolume?.userVolumeGain) {
+    return window.EmpSonoraVolume.userVolumeGain(state.volume, state.muted);
+  }
   if (state.muted) {
     return 0;
   }
@@ -7479,180 +7883,14 @@ function userVolumeGain() {
   return Math.pow(normalized, 2);
 }
 
-function trackByPlayer(player) {
-  return player?.trackId ? trackById(player.trackId) : null;
-}
-
-function computePlayerNormalizeGain(player) {
-  if (!state.normalizeVolume || !ReplayGain) {
-    return 1;
-  }
-  return ReplayGain.computeReplayGainLinear(trackByPlayer(player), {
-    enabled: true,
-    mode: state.normalizeMode
-  });
-}
-
-function playerOutputGain(player) {
-  return player.fade * (Number.isFinite(player.normalize) ? player.normalize : 1);
-}
-
-const EQ_RAMP_TIME = 0.018;
-const EQ_HEADROOM_POINTS = 48;
 let eqDragIndex = -1;
 
-function dbToLinear(db) {
-  return 10 ** (db / 20);
+function applyPeakProtection() {
+  applySonoraDspForTrack(currentTrack());
 }
 
-function eqBiquadCoeffs(kind, hz, db, sampleRate) {
-  const A = 10 ** (db / 40);
-  const w0 = 2 * Math.PI * hz / sampleRate;
-  const cos = Math.cos(w0);
-  const sin = Math.sin(w0);
-  if (kind === "peaking") {
-    const alpha = sin / 2;
-    return [1 + alpha * A, -2 * cos, 1 - alpha * A, 1 + alpha / A, -2 * cos, 1 - alpha / A];
-  }
-  const alpha = (sin / 2) * Math.SQRT2;
-  const twoSqrtAAlpha = 2 * Math.sqrt(A) * alpha;
-  if (kind === "lowshelf") {
-    return [
-      A * ((A + 1) - (A - 1) * cos + twoSqrtAAlpha),
-      2 * A * ((A - 1) - (A + 1) * cos),
-      A * ((A + 1) - (A - 1) * cos - twoSqrtAAlpha),
-      (A + 1) + (A - 1) * cos + twoSqrtAAlpha,
-      -2 * ((A - 1) + (A + 1) * cos),
-      (A + 1) + (A - 1) * cos - twoSqrtAAlpha
-    ];
-  }
-  return [
-    A * ((A + 1) + (A - 1) * cos + twoSqrtAAlpha),
-    -2 * A * ((A - 1) + (A + 1) * cos),
-    A * ((A + 1) + (A - 1) * cos - twoSqrtAAlpha),
-    (A + 1) - (A - 1) * cos + twoSqrtAAlpha,
-    2 * ((A - 1) - (A + 1) * cos),
-    (A + 1) - (A - 1) * cos - twoSqrtAAlpha
-  ];
-}
-
-function eqBiquadResponseDb(coeffs, hz, sampleRate) {
-  const [b0, b1, b2, a0, a1, a2] = coeffs;
-  const theta = -2 * Math.PI * hz / sampleRate;
-  const zr = Math.cos(theta);
-  const zi = Math.sin(theta);
-  const z2r = zr * zr - zi * zi;
-  const z2i = 2 * zr * zi;
-  const nr = b0 + b1 * zr + b2 * z2r;
-  const ni = b1 * zi + b2 * z2i;
-  const dr = a0 + a1 * zr + a2 * z2r;
-  const di = a1 * zi + a2 * z2i;
-  const mag2 = (nr * nr + ni * ni) / Math.max(1e-20, dr * dr + di * di);
-  return 10 * Math.log10(Math.max(1e-20, mag2));
-}
-
-function computeEqHeadroomDb(gains, sampleRate) {
-  const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 44100;
-  const filters = EQ_BANDS.map((band, index) => eqBiquadCoeffs(band.type, band.hz, gains[index], rate));
-  let peak = 0;
-  for (let i = 0; i < EQ_HEADROOM_POINTS; i += 1) {
-    const hz = 20 * (1000 ** (i / (EQ_HEADROOM_POINTS - 1)));
-    let sum = 0;
-    for (const coeffs of filters) {
-      sum += eqBiquadResponseDb(coeffs, hz, rate);
-    }
-    if (sum > peak) {
-      peak = sum;
-    }
-  }
-  return peak > 0 ? peak : 0;
-}
-
-function setAudioParam(param, value, immediate) {
-  if (!audioContext || !param) {
-    return;
-  }
-  const now = audioContext.currentTime;
-  param.cancelScheduledValues(now);
-  param.setValueAtTime(param.value, now);
-  if (immediate) {
-    param.setValueAtTime(value, now);
-    return;
-  }
-  param.setTargetAtTime(value, now, EQ_RAMP_TIME);
-}
-
-function createPeakProtectChain(eqOutput) {
-  peakCompressor = audioContext.createDynamicsCompressor();
-  PeakProtect?.applyCompressorParams?.(peakCompressor);
-  peakDryGain = audioContext.createGain();
-  peakWetGain = audioContext.createGain();
-  const mix = PeakProtect?.peakProtectMixGains?.(state.preventClipping !== false)
-    ?? { dry: 0, wet: 1 };
-  peakDryGain.gain.value = mix.dry;
-  peakWetGain.gain.value = mix.wet;
-  eqOutput.connect(peakDryGain);
-  eqOutput.connect(peakCompressor);
-  peakCompressor.connect(peakWetGain);
-  peakDryGain.connect(masterGain);
-  peakWetGain.connect(masterGain);
-}
-
-function applyPeakProtection({ immediate = false } = {}) {
-  if (!peakDryGain || !peakWetGain) {
-    return;
-  }
-  const mix = PeakProtect?.peakProtectMixGains?.(state.preventClipping !== false)
-    ?? { dry: state.preventClipping === false ? 1 : 0, wet: state.preventClipping === false ? 0 : 1 };
-  setAudioParam(peakDryGain.gain, mix.dry, immediate);
-  setAudioParam(peakWetGain.gain, mix.wet, immediate);
-}
-
-function createEqualizerChain() {
-  eqPreamp = audioContext.createGain();
-  eqPreamp.gain.value = 1;
-  let previous = eqPreamp;
-  eqFilters = EQ_BANDS.map((band) => {
-    const filter = audioContext.createBiquadFilter();
-    filter.type = band.type;
-    filter.frequency.value = band.hz;
-    filter.Q.value = band.q;
-    filter.gain.value = 0;
-    previous.connect(filter);
-    previous = filter;
-    return filter;
-  });
-  try {
-    createPeakProtectChain(previous);
-  } catch {
-    previous.connect(masterGain);
-    peakCompressor = null;
-    peakDryGain = null;
-    peakWetGain = null;
-  }
-  eqReady = true;
-  return eqPreamp;
-}
-
-function applyEqualizer({ immediate = false } = {}) {
-  if (!eqReady || !eqPreamp || eqFilters.length !== 6) {
-    return;
-  }
-
-  const enabled = state.equalizerEnabled === true;
-  const source = sanitizeEqGains(state.equalizerGains);
-  const gains = enabled ? source : cloneEqGains(EQ_FLAT_GAINS);
-  try {
-    const headroom = enabled ? computeEqHeadroomDb(source, audioContext?.sampleRate) : 0;
-    cachedEqHeadroomDb = Number.isFinite(headroom) && headroom > 0 ? headroom : 0;
-  } catch {
-    cachedEqHeadroomDb = 0;
-  }
-
-  eqFilters.forEach((filter, index) => {
-    setAudioParam(filter.gain, Number.isFinite(gains[index]) ? gains[index] : 0, immediate);
-  });
-  setAudioParam(eqPreamp.gain, dbToLinear(-cachedEqHeadroomDb), immediate);
+function applyEqualizer() {
+  applySonoraDspForTrack(currentTrack());
 }
 
 function eqGainToOffset(gain) {
@@ -7686,7 +7924,7 @@ function eqCurveCommands(gains, width, height) {
 }
 
 function closeEqPresetMenu() {
-  viewArea.querySelectorAll(".eq-preset-wrap").forEach((wrap) => {
+  settingsRoot().querySelectorAll(".eq-preset-wrap").forEach((wrap) => {
     const menu = wrap.querySelector(".eq-preset-menu");
     const button = wrap.querySelector("[data-eq-preset-toggle], [data-startup-toggle]");
     if (menu) {
@@ -7698,16 +7936,17 @@ function closeEqPresetMenu() {
 }
 
 function syncEqualizerUi() {
-  if (state.view !== "settings") {
+  if (!state.settingsOpen && state.view !== "settings") {
     return;
   }
 
-  const label = viewArea.querySelector("[data-eq-preset-label]");
+  const root = settingsRoot();
+  const label = root.querySelector("[data-eq-preset-label]");
   if (label) {
     label.textContent = eqPresetLabel(state.equalizerPreset);
   }
 
-  viewArea.querySelectorAll("[data-eq-preset]").forEach((item) => {
+  root.querySelectorAll("[data-eq-preset]").forEach((item) => {
     const selected = item.dataset.eqPreset === state.equalizerPreset;
     item.classList.toggle("is-selected", selected);
     item.setAttribute("aria-selected", selected ? "true" : "false");
@@ -7716,9 +7955,9 @@ function syncEqualizerUi() {
   const width = 600;
   const height = 220;
   const curve = eqCurveCommands(state.equalizerGains, width, height);
-  const line = viewArea.querySelector("[data-eq-line]");
-  const fill = viewArea.querySelector("[data-eq-fill]");
-  const grid = viewArea.querySelector("[data-eq-grid]");
+  const line = root.querySelector("[data-eq-line]");
+  const fill = root.querySelector("[data-eq-fill]");
+  const grid = root.querySelector("[data-eq-grid]");
   if (line) {
     line.setAttribute("d", curve.line);
   }
@@ -7738,8 +7977,8 @@ function syncEqualizerUi() {
   }
 
   state.equalizerGains.forEach((gain, index) => {
-    const input = viewArea.querySelector(`[data-eq-band-input="${index}"]`);
-    const handle = viewArea.querySelector(`[data-eq-handle="${index}"]`);
+    const input = root.querySelector(`[data-eq-band-input="${index}"]`);
+    const handle = root.querySelector(`[data-eq-handle="${index}"]`);
     if (input && input !== document.activeElement) {
       input.value = String(gain);
     }
@@ -7787,284 +8026,46 @@ function eqClientYToGain(clientY, graph) {
   return Math.max(EQ_MIN_DB, Math.min(EQ_MAX_DB, EQ_MAX_DB - t * (EQ_MAX_DB - EQ_MIN_DB)));
 }
 
-function resumeAudioContext() {
-  if (!audioContext || audioContext.state === "closed") {
-    return Promise.resolve();
-  }
-  if (audioContext.state === "running") {
-    return Promise.resolve();
-  }
-  if (audioContextResumePromise) {
-    return audioContextResumePromise;
-  }
-  audioContextResumePromise = Promise.resolve(audioContext.resume?.())
-    .catch(() => {})
-    .finally(() => {
-      audioContextResumePromise = null;
-    });
-  return audioContextResumePromise;
-}
-
-function wirePlayerIntoGraph(player, mixTarget) {
-  if (player.source) {
-    return;
-  }
-  player.source = audioContext.createMediaElementSource(player.el);
-  player.gain = audioContext.createGain();
-  player.analyser = audioContext.createAnalyser();
-  player.analyser.fftSize = 2048;
-  player.source.connect(player.analyser);
-  player.source.connect(player.gain);
-  player.gain.connect(mixTarget);
-  player.el.volume = 1;
-}
+let lastSonoraOutputDeviceSent = null;
 
 function applyAudioOutputDevice() {
-  if (!audioContext || typeof audioContext.setSinkId !== "function") {
-    return Promise.resolve();
-  }
   if (isRemotePlayback() || isConnectingPlayback()) {
     return Promise.resolve();
   }
-  const sinkId = typeof state.audioOutputId === "string" ? state.audioOutputId : "";
-  return Promise.resolve(audioContext.setSinkId(sinkId)).catch(() => {
-    if (sinkId) {
-      state.audioOutputId = "";
-      writeSession();
-      return audioContext.setSinkId("");
-    }
-    return undefined;
-  });
-}
-
-function ensureAudioGraph() {
-  if (audioGraphReady && audioContext && audioContext.state !== "closed") {
-    resumeAudioContext();
-    return;
+  if (!window.EmpSonora?.available) {
+    return Promise.resolve();
   }
-
-  if (audioGraphReady && audioContext?.state === "closed") {
-    rebuildAudioGraphFromClosedContext();
-    return;
+  const next = typeof state.audioOutputId === "string" ? state.audioOutputId : "";
+  // Avoid setOutputDevice → devices/outputDeviceChanged → refresh → setOutputDevice loops.
+  if (lastSonoraOutputDeviceSent === next) {
+    return Promise.resolve();
   }
-
-  const Context = window.AudioContext || window.webkitAudioContext;
-  if (!Context) {
-    return;
-  }
-
-  try {
-    audioOutputSupported = "setSinkId" in Context.prototype;
-    audioContext = new Context();
-    audioContext.addEventListener("statechange", () => {
-      if (audioContext?.state === "suspended" && state.playing && !isRemotePlayback()) {
-        resumeAudioContext();
-      }
-    });
-    masterGain = audioContext.createGain();
-    masterGain.connect(audioContext.destination);
-
-    let mixTarget = masterGain;
-    try {
-      mixTarget = createEqualizerChain() ?? masterGain;
-    } catch {
-      eqReady = false;
-      eqPreamp = null;
-      eqFilters = [];
-      peakCompressor = null;
-      peakDryGain = null;
-      peakWetGain = null;
-      mixTarget = masterGain;
-    }
-
-    players.forEach((player) => {
-      wirePlayerIntoGraph(player, mixTarget);
-    });
-    audioGraphReady = true;
-    try {
-      applyEqualizer({ immediate: true });
-      applyPeakProtection({ immediate: true });
-    } catch {
-      // Playback continues without EQ/peak protect if apply fails.
-    }
-    applyAudioOutputDevice();
-    resumeAudioContext();
-  } catch {
-    audioGraphReady = false;
-  }
-}
-
-function rebuildAudioGraphFromClosedContext() {
-  const snapshot = GraphRecovery?.capturePlaybackSnapshot?.({
-    trackId: currentTrack()?.id ?? null,
-    position: playbackPosition(),
-    playing: state.playing,
-    queue: state.queue,
-    shuffleBag: state.shuffleBag,
-    index: state.index,
-    shuffle: state.shuffle,
-    repeat: state.repeat,
-    incomingTrackId: incomingPlayer().trackId,
-    nextId: peekNextId({ wrap: state.repeat === "all" }),
-    lyricsTrackId: currentTrack()?.id ?? null,
-    listenOccurrenceIds: players
-      .map((player) => player.listenOccurrence && !player.listenOccurrence.finalized
-        ? player.trackId
-        : null)
-      .filter(Boolean)
-  }) ?? null;
-
-  audioGraphReady = false;
-  audioContext = null;
-  masterGain = null;
-  eqPreamp = null;
-  eqFilters = [];
-  eqReady = false;
-  peakCompressor = null;
-  peakDryGain = null;
-  peakWetGain = null;
-
-  const saved = players.map((player) => ({
-    trackId: player.trackId,
-    fade: player.fade,
-    normalize: player.normalize,
-    listenOccurrence: player.listenOccurrence,
-    currentTime: player.el.currentTime,
-    src: player.el.getAttribute("src")
-  }));
-
-  // Replace elements so MediaElementSources can be created again; preserve listen occurrences.
-  players.forEach((_, index) => {
-    const replacement = createAudioPlayer();
-    replacement.fade = saved[index].fade;
-    replacement.normalize = saved[index].normalize;
-    replacement.trackId = saved[index].trackId;
-    replacement.listenOccurrence = saved[index].listenOccurrence;
-    players[index] = replacement;
-  });
-
-  playbackElementBindGeneration = GraphRecovery?.nextBindGeneration?.(playbackElementBindGeneration)
-    ?? (playbackElementBindGeneration + 1);
-  ensureAudioGraph();
-  players.forEach(bindPlaybackElement);
-
-  saved.forEach((entry, index) => {
-    const player = players[index];
-    if (!entry.src || !entry.trackId) {
-      return;
-    }
-    const track = trackById(entry.trackId);
-    if (!track) {
-      return;
-    }
-    player.el.src = track.url;
-    player.trackId = track.id;
-    player.fade = entry.fade;
-    applyReplayGain(player);
-    const seekTo = snapshot && index === currentPlayerIndex
-      ? snapshot.position
-      : entry.currentTime;
-    if (Number.isFinite(seekTo) && seekTo > 0) {
-      try {
-        player.el.currentTime = seekTo;
-      } catch {
-        // Ignore seek failures during recovery.
-      }
-    }
-    if (snapshot?.playing && index === currentPlayerIndex && !isRemotePlayback()) {
-      player.el.play().catch(() => {});
-    }
-  });
-
-  const incomingId = GraphRecovery?.resolveIncomingAfterRebuild?.(snapshot);
-  if (incomingId && incomingPlayer().trackId !== incomingId) {
-    const next = trackById(incomingId);
-    if (next && (state.crossfade || state.gapless)) {
-      ensureIncomingLoaded(next);
-    }
-  }
-
-  applyVolume();
-  updateNowPlaying();
-  syncLyricsRequests();
+  lastSonoraOutputDeviceSent = next;
+  window.EmpSonora.setOutputDevice?.(next);
+  return Promise.resolve();
 }
 
 function applyVolume() {
   const master = userVolumeGain();
-  if (audioGraphReady && masterGain) {
-    // Direct assignment keeps crossfade rAF fades responsive.
-    masterGain.gain.value = master;
-    players.forEach((player) => {
-      if (player.gain) {
-        player.gain.gain.value = playerOutputGain(player);
-      }
-      player.el.volume = 1;
-    });
+  if (isRemotePlayback()) {
     return;
   }
-
-  players.forEach((player) => {
-    player.el.volume = clamp(master * playerOutputGain(player), 0, 1);
-  });
-}
-
-function applyReplayGain(player) {
-  if (!player) {
-    return;
-  }
-  if (!player.trackId || !state.normalizeVolume) {
-    player.normalize = 1;
-    return;
-  }
-  player.normalize = computePlayerNormalizeGain(player);
-}
-
-function applyCachedNormalize(player) {
-  applyReplayGain(player);
-}
-
-function stopPlayer(player) {
-  finalizePlayerListen(player);
-  player.el.pause();
-  player.el.removeAttribute("src");
-  player.el.load();
-  player.trackId = null;
-  player.fade = 0;
-  player.normalize = 1;
-  postNowPlaying();
-}
-
-function finishIncoming() {
-  playbackTransitioning = false;
-  if (fadeRaf) {
-    cancelAnimationFrame(fadeRaf);
-    fadeRaf = 0;
-  }
-  stopPlayer(incomingPlayer());
-  currentPlayer().fade = 1;
-  applyVolume();
+  // Always post to the host — do not wait for EmpSonora.available. The host stashes
+  // volume before Attach/Initialize so slider restore is audible on first Play.
+  window.EmpSonora?.volume?.(master);
 }
 
 function cancelTransition() {
+  // Phase 6b: Sonora owns crossfade/gapless; EMP only bumps generations used for preload cancel.
   transitionGeneration += 1;
   if (fadeRaf) {
     cancelAnimationFrame(fadeRaf);
     fadeRaf = 0;
   }
   playbackTransitioning = false;
-  stopPlayer(incomingPlayer());
   currentPlayer().fade = 1;
-  applyVolume();
-}
-
-function loadPlayer(player, track, { fade = 1 } = {}) {
-  beginPlayerListen(player, track);
-  player.el.src = track.url;
-  player.trackId = track.id;
-  player.fade = fade;
-  applyCachedNormalize(player);
-  applyVolume();
-  postNowPlaying();
+  incomingPlayer().fade = 0;
+  incomingPlayer().trackId = null;
 }
 
 function peekNextId({ wrap = true } = {}) {
@@ -8086,58 +8087,9 @@ function advanceQueueTo(trackId) {
   }
 }
 
-function ensureIncomingLoaded(track) {
-  const incoming = incomingPlayer();
-  if (incoming.trackId === track.id && incoming.el.src) {
-    applyReplayGain(incoming);
-    return;
-  }
-  loadPlayer(incoming, track, { fade: 0 });
-}
-
 function invalidateIncomingPreload() {
   preloadGeneration += 1;
-  if (playbackTransitioning) {
-    return;
-  }
-  const nextId = (state.crossfade || state.gapless) && state.repeat !== "one"
-    ? peekNextId({ wrap: state.repeat === "all" })
-    : null;
-  const incoming = incomingPlayer();
-  if (!Transitions?.isIncomingPreloadValid?.(incoming.trackId, nextId)) {
-    if (incoming.trackId) {
-      stopPlayer(incoming);
-    }
-  }
-  if (nextId && (state.crossfade || state.gapless)) {
-    maybePreloadNext();
-  }
-}
-
-function maybePreloadNext() {
-  const el = currentAudio();
-  const duration = el.duration || currentTrack()?.duration || 0;
-  const remaining = duration ? duration - el.currentTime : Number.POSITIVE_INFINITY;
-  const allowed = Transitions?.shouldPreloadNext?.({
-    remote: isRemotePlayback(),
-    connecting: isConnectingPlayback(),
-    transitioning: playbackTransitioning,
-    repeatOne: state.repeat === "one",
-    crossfade: state.crossfade,
-    gapless: state.gapless,
-    remainingSeconds: remaining,
-    crossfadeSeconds: state.crossfadeSeconds
-  });
-  if (!allowed) {
-    return;
-  }
-  const generation = preloadGeneration;
-  const nextId = peekNextId({ wrap: state.repeat === "all" });
-  const next = trackById(nextId);
-  if (!next || generation !== preloadGeneration) {
-    return;
-  }
-  ensureIncomingLoaded(next);
+  maybePreloadSonoraNext();
 }
 
 function recordCurrentRecent() {
@@ -8149,215 +8101,18 @@ function recordCurrentRecent() {
   recordRecentTrack(track.id);
 }
 
-function incomingReadyForTransition(player) {
-  // HAVE_CURRENT_DATA === 2
-  return Boolean(player?.el?.src) && player.el.readyState >= 2;
-}
-
-async function startCrossfade(nextId) {
-  if (playbackTransitioning) {
-    return;
-  }
-  const next = trackById(nextId);
-  if (!next) {
-    return;
-  }
-
-  const generation = ++transitionGeneration;
-  playbackTransitioning = true;
-  ensureAudioGraph();
-  const incoming = incomingPlayer();
-  ensureIncomingLoaded(next);
-  incoming.fade = 0;
-  applyVolume();
-
-  if (!incomingReadyForTransition(incoming)) {
-    try {
-      await new Promise((resolve, reject) => {
-        const onReady = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = () => {
-          cleanup();
-          reject(new Error("incoming load failed"));
-        };
-        const cleanup = () => {
-          incoming.el.removeEventListener("canplay", onReady);
-          incoming.el.removeEventListener("error", onError);
-        };
-        incoming.el.addEventListener("canplay", onReady, { once: true });
-        incoming.el.addEventListener("error", onError, { once: true });
-      });
-    } catch {
-      if (generation !== transitionGeneration) {
-        return;
-      }
-      playbackTransitioning = false;
-      playTrack(nextId, null, { keepBag: true });
-      return;
-    }
-  }
-
-  try {
-    await incoming.el.play();
-  } catch {
-    if (generation !== transitionGeneration) {
-      return;
-    }
-    playbackTransitioning = false;
-    playTrack(nextId, null, { keepBag: true });
-    return;
-  }
-
-  if (generation !== transitionGeneration || !playbackTransitioning) {
-    return;
-  }
-
-  const remaining = (currentAudio().duration || state.crossfadeSeconds) - currentAudio().currentTime;
-  fadeDurationMs = Transitions?.crossfadeDurationMs?.(state.crossfadeSeconds, remaining)
-    ?? Math.min(state.crossfadeSeconds, Math.max(0.5, remaining)) * 1000;
-  advanceQueueTo(nextId);
-  swapPlayers();
-  recordCurrentRecent();
-  updateNowPlaying();
-  writeSession();
-
-  fadeStartedAt = performance.now();
-  let fadeElapsed = 0;
-  let lastTick = fadeStartedAt;
-  currentPlayer().fade = 0;
-  incomingPlayer().fade = 1;
-  applyVolume();
-
-  const step = (now) => {
-    if (generation !== transitionGeneration) {
-      return;
-    }
-    if (state.playing) {
-      fadeElapsed += now - lastTick;
-    }
-    lastTick = now;
-    const t = Math.min(1, fadeElapsed / fadeDurationMs);
-    currentPlayer().fade = t;
-    incomingPlayer().fade = 1 - t;
-    applyVolume();
-    if (t < 1 && playbackTransitioning) {
-      fadeRaf = requestAnimationFrame(step);
-      return;
-    }
-    if (playbackTransitioning && generation === transitionGeneration) {
-      finishIncoming();
-    }
-  };
-  fadeRaf = requestAnimationFrame(step);
-}
-
-async function startGapless(nextId) {
-  if (playbackTransitioning) {
-    return;
-  }
-  const next = trackById(nextId);
-  if (!next) {
-    return;
-  }
-
-  const generation = ++transitionGeneration;
-  playbackTransitioning = true;
-  ensureAudioGraph();
-  const incoming = incomingPlayer();
-  ensureIncomingLoaded(next);
-  incoming.fade = 1;
-  applyVolume();
-
-  if (!incomingReadyForTransition(incoming)) {
-    try {
-      await new Promise((resolve, reject) => {
-        const onReady = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = () => {
-          cleanup();
-          reject(new Error("incoming load failed"));
-        };
-        const cleanup = () => {
-          incoming.el.removeEventListener("canplay", onReady);
-          incoming.el.removeEventListener("error", onError);
-        };
-        incoming.el.addEventListener("canplay", onReady, { once: true });
-        incoming.el.addEventListener("error", onError, { once: true });
-      });
-    } catch {
-      if (generation !== transitionGeneration) {
-        return;
-      }
-      playbackTransitioning = false;
-      playTrack(nextId, null, { keepBag: true });
-      return;
-    }
-  }
-
-  try {
-    await incoming.el.play();
-  } catch {
-    if (generation !== transitionGeneration) {
-      return;
-    }
-    playbackTransitioning = false;
-    playTrack(nextId, null, { keepBag: true });
-    return;
-  }
-
-  if (generation !== transitionGeneration || !playbackTransitioning) {
-    return;
-  }
-
-  currentPlayer().el.pause();
-  advanceQueueTo(nextId);
-  swapPlayers();
-  currentPlayer().fade = 1;
-  recordCurrentRecent();
-  finishIncoming();
-  updateNowPlaying();
-  writeSession();
-}
-
-function maybeStartAutoAdvance() {
-  if (isRemotePlayback() || isConnectingPlayback() || !state.playing || playbackTransitioning || state.repeat === "one" || state.seeking) {
-    return;
-  }
-  const el = currentAudio();
-  const duration = el.duration || currentTrack()?.duration || 0;
-  if (!duration) {
-    return;
-  }
-  const remaining = duration - el.currentTime;
-  const nextId = peekNextId({ wrap: state.repeat === "all" });
-  if (!nextId) {
-    return;
-  }
-  if (state.crossfade && Transitions?.shouldStartCrossfade?.(remaining, state.crossfadeSeconds)) {
-    startCrossfade(nextId);
-    return;
-  }
-  if (state.gapless && Transitions?.shouldStartGapless?.(remaining, GAPLESS_LEAD_SECONDS)) {
-    startGapless(nextId);
-  }
-}
-
 function applyPlaybackSettings() {
-  applyReplayGain(currentPlayer());
-  applyReplayGain(incomingPlayer());
-  applyPeakProtection();
+  applySonoraDspForTrack(currentTrack());
   applyVolume();
-
-  if (!state.crossfade && !state.gapless && !playbackTransitioning) {
-    stopPlayer(incomingPlayer());
+  if (!window.EmpSonora?.available || isRemotePlayback()) {
     return;
   }
-  invalidateIncomingPreload();
-  maybePreloadNext();
+  if (state.crossfade) {
+    window.EmpSonora.crossfade(state.crossfadeSeconds);
+  } else {
+    window.EmpSonora.crossfade(0);
+  }
+  maybePreloadSonoraNext();
 }
 
 function postAppSettings() {
@@ -8370,22 +8125,23 @@ function postAppSettings() {
 }
 
 function syncStartupSettingsUi() {
-  if (state.view !== "settings") {
+  if (!state.settingsOpen && state.view !== "settings") {
     return;
   }
 
-  const label = viewArea.querySelector("[data-startup-label]");
+  const root = settingsRoot();
+  const label = root.querySelector("[data-startup-label]");
   if (label) {
     label.textContent = startupOnLoginLabel(state.startupOnLogin);
   }
 
-  viewArea.querySelectorAll("[data-startup]").forEach((item) => {
+  root.querySelectorAll("[data-startup]").forEach((item) => {
     const selected = item.dataset.startup === state.startupOnLogin;
     item.classList.toggle("is-selected", selected);
     item.setAttribute("aria-selected", selected ? "true" : "false");
   });
 
-  const toggle = viewArea.querySelector('[data-setting="closeMinimizes"]');
+  const toggle = root.querySelector('[data-setting="closeMinimizes"]');
   toggle?.setAttribute("aria-checked", state.closeMinimizes ? "true" : "false");
 }
 
@@ -8406,9 +8162,13 @@ function applyHostAppSettings(detail) {
   if (typeof detail.currentVersion === "string" && detail.currentVersion) {
     state.appVersion = detail.currentVersion;
   }
+  if (typeof detail.sonoraVersion === "string" && detail.sonoraVersion) {
+    state.sonoraVersion = detail.sonoraVersion;
+  }
   writeSession();
   syncStartupSettingsUi();
   syncUpdatesSettingsUi();
+  syncAboutVersionsUi();
 }
 
 function setAutomaticUpdateChecks(value) {
@@ -8419,24 +8179,42 @@ function setAutomaticUpdateChecks(value) {
   syncUpdatesSettingsUi();
 }
 
+function syncAboutVersionsUi() {
+  if (!state.settingsOpen && state.view !== "settings") {
+    return;
+  }
+
+  const root = settingsRoot();
+  const empEl = root.querySelector("[data-emp-version]");
+  if (empEl) {
+    empEl.textContent = formatAboutVersionLabel(state.appVersion);
+  }
+  const sonoraEl = root.querySelector("[data-sonora-version]");
+  if (sonoraEl) {
+    sonoraEl.textContent = formatAboutVersionLabel(state.sonoraVersion);
+  }
+}
+
 function syncUpdatesSettingsUi() {
-  if (state.view !== "settings") {
+  if (!state.settingsOpen && state.view !== "settings") {
     updateSettingsNavBadge();
     return;
   }
 
-  const versionEl = viewArea.querySelector("[data-update-version]");
+  const root = settingsRoot();
+  const versionEl = root.querySelector("[data-update-version]");
   if (versionEl) {
     versionEl.textContent = state.appVersion || "…";
   }
-  const statusEl = viewArea.querySelector("[data-update-status]");
+  syncAboutVersionsUi();
+  const statusEl = root.querySelector("[data-update-status]");
   if (statusEl) {
     statusEl.textContent = updateStatusCopy();
   }
-  const autoToggle = viewArea.querySelector('[data-setting="automaticUpdateChecks"]');
+  const autoToggle = root.querySelector('[data-setting="automaticUpdateChecks"]');
   autoToggle?.setAttribute("aria-checked", state.automaticUpdateChecks !== false ? "true" : "false");
 
-  const actionsRow = viewArea.querySelector("[data-update-actions]");
+  const actionsRow = root.querySelector("[data-update-actions]");
   if (actionsRow) {
     const status = state.updateStatus || {};
     const actions = [];
@@ -8488,10 +8266,15 @@ function setPlaybackSetting(key, value) {
     if (!state.audioOutputId) {
       state.audioOutputLabel = "";
     } else if (!state.audioOutputLabel) {
-      const match = audioOutputDevices.find((device) => device.deviceId === state.audioOutputId);
-      state.audioOutputLabel = match && String(match.label || "").trim() ? match.label.trim() : "";
+      const match = audioOutputDevices.find((device) =>
+        device.deviceId === state.audioOutputId || device.id === state.audioOutputId);
+      const label = match && String(match.label || match.name || "").trim();
+      state.audioOutputLabel = label || "";
     }
     applyAudioOutputDevice();
+  } else if (key === "audioOutputMode") {
+    state.audioOutputMode = value === "exclusive" ? "exclusive" : "shared";
+    applyAudioOutputMode();
   } else {
     state[key] = Boolean(value);
   }
@@ -8501,28 +8284,111 @@ function setPlaybackSetting(key, value) {
     applyEqualizer();
   } else if (key === "preventClipping") {
     applyPeakProtection();
-  } else if (key !== "audioOutputId") {
+  } else if (key !== "audioOutputId" && key !== "audioOutputMode") {
     applyPlaybackSettings();
   }
 
-  if (state.view === "settings") {
-    if (needsSettingsRerender) {
+  if (state.settingsOpen || state.view === "settings") {
+    const root = settingsRoot();
+    if (needsSettingsRerender || key === "audioOutputMode") {
       renderSettings();
-      const durationSlider = viewArea.querySelector("[data-crossfade-seconds]");
+      const durationSlider = root.querySelector("[data-crossfade-seconds]");
       if (durationSlider) {
         updateSlider(durationSlider);
       }
     } else if (key === "crossfadeSeconds") {
-      const label = viewArea.querySelector("[data-crossfade-seconds-label]");
+      const label = root.querySelector("[data-crossfade-seconds-label]");
       if (label) {
         label.textContent = `${state.crossfadeSeconds} sec`;
       }
     } else {
-      const toggle = viewArea.querySelector(`[data-setting="${key}"]`);
+      const toggle = root.querySelector(`[data-setting="${key}"]`);
       if (toggle) {
         toggle.setAttribute("aria-checked", state[key] ? "true" : "false");
       }
     }
+  }
+}
+
+function applyAudioOutputMode() {
+  if (!window.EmpSonora?.available || isRemotePlayback() || isConnectingPlayback()) {
+    return;
+  }
+  window.EmpSonora.configureOutput?.({
+    mode: state.audioOutputMode === "exclusive" ? "exclusive" : "shared",
+    exclusiveFallback: "shared"
+  });
+}
+
+function updatePreampSlider(el) {
+  if (!el) {
+    return;
+  }
+  const pct = Math.max(0, Math.min(100, sliderPercent(el)));
+  const zero = 50;
+  const lo = Math.min(zero, pct);
+  const hi = Math.max(zero, pct);
+  el.style.setProperty("--preamp-lo", `${lo}%`);
+  el.style.setProperty("--preamp-hi", `${hi}%`);
+  el.style.setProperty("--fill", `${pct}%`);
+  el.classList.toggle("is-unity", Number(el.value) === 0);
+}
+
+function syncPreampControlUi() {
+  if (!state.settingsOpen) {
+    return;
+  }
+  const root = settingsRoot();
+  const slider = root.querySelector("[data-user-preamp]");
+  const display = root.querySelector("[data-user-preamp-display]");
+  const reset = root.querySelector("[data-user-preamp-reset]");
+  const unity = root.querySelector(".settings-preamp-unity");
+  const label = window.EmpSonoraPreamp?.formatPreampDb?.(state.userPreampDb) || "0.0 dB";
+  const atUnity = state.userPreampDb === 0;
+  if (slider) {
+    if (slider !== document.activeElement) {
+      slider.value = String(state.userPreampDb);
+    } else if (Number(slider.value) !== state.userPreampDb) {
+      slider.value = String(state.userPreampDb);
+    }
+    slider.setAttribute("aria-valuenow", String(state.userPreampDb));
+    slider.setAttribute("aria-valuetext", label);
+    updatePreampSlider(slider);
+  }
+  if (display) {
+    display.textContent = label;
+    display.classList.toggle("is-unity", atUnity);
+  }
+  if (reset) {
+    reset.disabled = atUnity;
+  }
+  if (unity) {
+    unity.classList.toggle("is-active", atUnity);
+  }
+}
+
+function setUserPreampDb(value, { persist = true } = {}) {
+  const quantize = window.EmpSonoraPreamp?.quantizePreampDb;
+  state.userPreampDb = typeof quantize === "function"
+    ? quantize(value)
+    : (window.EmpSonoraPreamp?.clampPreampDb?.(value) ?? 0);
+  applySonoraDspForTrack(currentTrack());
+  if (persist) {
+    writeSession();
+  }
+  syncPreampControlUi();
+}
+
+function resetAudioProcessing() {
+  state.userPreampDb = 0;
+  state.equalizerEnabled = false;
+  state.equalizerGains = cloneEqGains(EQ_FLAT_GAINS);
+  state.equalizerPreset = "flat";
+  state.preventClipping = true;
+  writeSession();
+  applySonoraDspForTrack(currentTrack());
+  if (state.settingsOpen) {
+    renderSettings();
   }
 }
 
@@ -8712,57 +8578,176 @@ async function playTrack(id, queueIds, options = {}) {
   }
 
   finalizeRemoteListen();
-  ensureAudioGraph();
-  loadPlayer(currentPlayer(), track, { fade: 1 });
+
+  if (!requireSonoraLocal()) {
+    updateNowPlaying();
+    writeSession();
+    return;
+  }
+
+  beginLocalListen(track);
+  state.sonoraPosition = position;
+  state.sonoraDuration = Number(track.duration) || 0;
   lastAudioTime = position;
-
-  if (position > 0) {
-    await seekWhenReady(position, track.duration);
+  // Optimistic now-playing chrome only — Sonora snapshots are authoritative for playing.
+  state.playing = false;
+  sonoraPendingPlay = Boolean(autoplay);
+  sonoraPendingTrackId = track.id;
+  if (sonoraLoadedTrackId !== track.id) {
+    sonoraLoadedTrackId = null;
   }
-
-  if (autoplay) {
-    try {
-      await currentAudio().play();
-      state.playing = true;
-    } catch (error) {
-      state.playing = false;
-      nowArtist.textContent = "Unable to play this file";
-    }
+  applySonoraDspForTrack(track);
+  applyAudioOutputDevice();
+  if (state.crossfade) {
+    window.EmpSonora.crossfade(state.crossfadeSeconds);
   } else {
-    state.playing = false;
+    window.EmpSonora.crossfade(0);
   }
-
+  // Single host pipeline: LoadAsync then seek/play. Volume rides with load so gain is
+  // applied under the engine gate before any audible Play (not only a separate volume post).
+  pendingSonoraPreloadAfterLoad = true;
+  window.EmpSonora.load(track.id, {
+    play: autoplay,
+    position,
+    volume: userVolumeGain()
+  });
   updateNowPlaying();
   writeSession();
 }
 
-function seekWhenReady(position, fallbackDuration) {
-  const el = currentAudio();
-  return new Promise((resolve) => {
-    const apply = () => {
-      const duration = Number.isFinite(el.duration) && el.duration > 0
-        ? el.duration
-        : fallbackDuration || 0;
-      el.currentTime = duration > 0 ? Math.min(position, Math.max(0, duration - 0.25)) : position;
-      resolve();
-    };
+function ensureSonoraToastHost() {
+  if (sonoraToastHost) {
+    return sonoraToastHost;
+  }
+  sonoraToastHost = document.createElement("div");
+  sonoraToastHost.className = "meta-toast-host";
+  sonoraToastHost.setAttribute("aria-live", "polite");
+  document.body.appendChild(sonoraToastHost);
+  return sonoraToastHost;
+}
 
-    if (el.readyState >= 1) {
-      apply();
-      return;
-    }
+function showSonoraPlaybackToast(title, message) {
+  const host = ensureSonoraToastHost();
+  const toast = document.createElement("div");
+  toast.className = "meta-toast meta-toast-error";
+  toast.innerHTML = `
+    <i class="bi bi-exclamation-triangle-fill" aria-hidden="true"></i>
+    <div class="meta-toast-body">
+      <div class="meta-toast-title">${escapeHtml(title || "Couldn't play track")}</div>
+      ${message ? `<div class="meta-toast-msg">${escapeHtml(message)}</div>` : ""}
+    </div>`;
+  host.appendChild(toast);
+  window.clearTimeout(sonoraToastTimer);
+  sonoraToastTimer = window.setTimeout(() => {
+    toast.remove();
+  }, 5200);
+}
 
-    const onMeta = () => {
-      el.removeEventListener("loadedmetadata", onMeta);
-      apply();
-    };
+function clearSonoraPendingPlay(trackId) {
+  if (trackId && sonoraPendingTrackId && trackId !== sonoraPendingTrackId) {
+    return;
+  }
+  sonoraPendingPlay = false;
+  sonoraPendingTrackId = null;
+}
 
-    el.addEventListener("loadedmetadata", onMeta);
-    window.setTimeout(() => {
-      el.removeEventListener("loadedmetadata", onMeta);
-      apply();
-    }, 1500);
+function handleSonoraPlaybackError(detail) {
+  const Errors = globalThis.EmpSonoraPlaybackErrors;
+  const generation = Number(detail.generation) || 0;
+  const currentGeneration = Number(window.EmpSonora?.generation) || 0;
+  const operation = typeof detail.operation === "string" ? detail.operation : "";
+  const stale = Errors?.isStale?.(generation, currentGeneration)
+    ?? (generation > 0 && generation < currentGeneration);
+  const affects = detail.affectsTransport !== false
+    && (Errors?.affectsTransport?.(operation) ?? true);
+
+  if (stale) {
+    return;
+  }
+
+  const title = detail.title
+    || Errors?.titleFor?.(operation)
+    || "Couldn't play track";
+  const message = Errors?.sanitizeMessage?.(detail.message) || detail.message || "";
+  showSonoraPlaybackToast(title, message);
+
+  if (!affects) {
+    // Failed preload / device change — keep current transport.
+    return;
+  }
+
+  const errorTrackId = typeof detail.trackId === "string" ? detail.trackId : null;
+  if (errorTrackId && sonoraPendingTrackId && errorTrackId !== sonoraPendingTrackId) {
+    return;
+  }
+
+  clearSonoraPendingPlay(errorTrackId);
+  state.playing = false;
+  pendingSonoraPreloadAfterLoad = false;
+  if (errorTrackId && sonoraLoadedTrackId === errorTrackId) {
+    sonoraLoadedTrackId = null;
+  } else if (!errorTrackId && affects) {
+    sonoraLoadedTrackId = null;
+  }
+  updateNowPlaying();
+  writeSession();
+}
+
+function maybePreloadSonoraNext() {
+  if (!window.EmpSonora?.available || isRemotePlayback()) {
+    return;
+  }
+  const nextId = peekNextId({ wrap: state.repeat === "all" });
+  const shouldPreload = state.repeat !== "one"
+    && (state.gapless || state.crossfade)
+    && Boolean(nextId);
+  if (!shouldPreload) {
+    window.EmpSonora.clearNext();
+    return;
+  }
+  window.EmpSonora.preloadNext(nextId);
+}
+
+/**
+ * Sonora DSP rack is post-mix. User preamp + per-track ReplayGain share one preamp slot
+ * (updated on load / TrackTransitioned / settings changes). Overlapping crossfade legs
+ * therefore share one composed RG+user value — not dual-deck per-track normalize.
+ */
+function replayGainPreampDbForTrack(track) {
+  const linear = ReplayGain?.computeReplayGainLinear?.(track, {
+    enabled: state.normalizeVolume,
+    mode: state.normalizeMode
+  }) ?? 1;
+  if (!(linear > 0) || !Number.isFinite(linear)) {
+    return 0;
+  }
+  return 20 * Math.log10(linear);
+}
+
+function applySonoraDspForTrack(track) {
+  if (!window.EmpSonora?.available || isRemotePlayback()) {
+    return;
+  }
+  const compose = window.EmpSonoraPreamp?.composePreampDb;
+  const userDb = window.EmpSonoraPreamp?.clampPreampDb?.(state.userPreampDb) ?? 0;
+  const rgDb = replayGainPreampDbForTrack(track);
+  const preampDb = typeof compose === "function" ? compose(userDb, rgDb) : userDb + rgDb;
+  window.EmpSonora.dsp({
+    preampDb,
+    equalizerEnabled: Boolean(state.equalizerEnabled),
+    equalizerGains: cloneEqGains(state.equalizerGains),
+    limiterEnabled: state.preventClipping !== false
   });
+}
+
+function seekWhenReady(position, fallbackDuration) {
+  const duration = playbackDuration() || fallbackDuration || 0;
+  const next = duration > 0 ? Math.min(position, Math.max(0, duration - 0.25)) : position;
+  if (window.EmpSonora?.available && !isRemotePlayback()) {
+    state.sonoraPosition = next;
+    window.EmpSonora.seek(next);
+  }
+  return Promise.resolve();
 }
 
 function seekTo(position) {
@@ -8777,8 +8762,9 @@ function seekTo(position) {
     postCastCommand("seek", { position: next });
     state.remotePosition = next;
     state.remoteStatusAt = performance.now();
-  } else {
-    currentAudio().currentTime = next;
+  } else if (requireSonoraLocal()) {
+    state.sonoraPosition = next;
+    window.EmpSonora.seek(next);
   }
   lastAudioTime = next;
   setListenSeeking(false);
@@ -9051,23 +9037,29 @@ function togglePlay() {
     return;
   }
 
-  const el = currentAudio();
-  if (state.playing) {
-    el.pause();
-    incomingPlayer().el.pause();
+  if (!requireSonoraLocal()) {
+    return;
+  }
+  if (state.playing || sonoraPendingPlay) {
+    window.EmpSonora.pause();
     state.playing = false;
+    clearSonoraPendingPlay();
   } else {
     state.holdEnded = false;
-    ensureAudioGraph();
-    if (el.ended || (el.duration > 0 && el.currentTime >= el.duration - 0.05)) {
-      el.currentTime = 0;
-      lastAudioTime = 0;
+    sonoraPendingPlay = true;
+    sonoraPendingTrackId = track.id;
+    applyVolume();
+    // Cold start / session restore: bottom-bar Play often beats the in-flight LoadAsync.
+    // Only call bare play() when Sonora has already confirmed this track is loaded.
+    if (sonoraLoadedTrackId === track.id) {
+      window.EmpSonora.play();
+    } else {
+      window.EmpSonora.load(track.id, {
+        play: true,
+        position: playbackPosition(),
+        volume: userVolumeGain()
+      });
     }
-    el.play();
-    if (playbackTransitioning) {
-      incomingPlayer().el.play();
-    }
-    state.playing = true;
   }
   tickListenStats();
   updateNowPlaying();
@@ -9080,12 +9072,161 @@ function stopAtEndOfQueue() {
   cancelTransition();
   if (isRemotePlayback()) {
     postCastCommand("pause");
-  } else {
-    currentAudio().pause();
+  } else if (window.EmpSonora?.available) {
+    window.EmpSonora.pause();
   }
   updateNowPlaying();
   writeSession();
 }
+
+function handleSonoraHostEvent(detail) {
+  if (!detail) {
+    return;
+  }
+
+  if (detail.kind === "available") {
+    if (detail.available) {
+      // Visual slider restore can race availability; push authoritative gain now.
+      applyVolume();
+      applyAudioOutputMode();
+      applySonoraDspForTrack(currentTrack());
+      // Host already posts the device list with availability / hello — do not listDevices here.
+      if (state.settingsOpen || state.view === "settings") {
+        renderSettings();
+      }
+      updateNowPlaying();
+    }
+    return;
+  }
+
+  if (detail.kind === "error") {
+    handleSonoraPlaybackError(detail);
+    return;
+  }
+
+  if (detail.kind === "devices" || detail.kind === "outputDeviceChanged") {
+    let modeUiChanged = false;
+    if (typeof detail.effectiveOutputMode === "string") {
+      const nextEffective = detail.effectiveOutputMode === "exclusive" ? "exclusive" : "shared";
+      if (state.audioEffectiveMode !== nextEffective) {
+        state.audioEffectiveMode = nextEffective;
+        modeUiChanged = true;
+      }
+    }
+    if (typeof detail.outputFallbackReason === "string"
+      && state.audioFallbackReason !== detail.outputFallbackReason) {
+      state.audioFallbackReason = detail.outputFallbackReason;
+      modeUiChanged = true;
+    }
+    if (isRemotePlayback()) {
+      return;
+    }
+    refreshSonoraAudioOutputDevices();
+    if (modeUiChanged) {
+      syncAudioSettingsUiIfOpen();
+    }
+    return;
+  }
+
+  if (isRemotePlayback() || isConnectingPlayback()) {
+    return;
+  }
+
+  if (detail.kind === "snapshot") {
+    const generation = Number(detail.generation) || 0;
+    if (generation < (window.EmpSonora?.generation || 0) && generation !== window.EmpSonora?.generation) {
+      // EmpSonora already filters; keep a soft guard.
+    }
+    const wasPlaying = state.playing;
+    state.sonoraPosition = Number(detail.position) || 0;
+    if (detail.hasKnownDuration) {
+      state.sonoraDuration = Number(detail.duration) || state.sonoraDuration;
+    }
+    if (typeof detail.trackId === "string" && detail.trackId) {
+      // Any non-empty track id on a snapshot means Load committed a primary source.
+      sonoraLoadedTrackId = detail.trackId;
+    } else if (detail.state === "Idle" || detail.state === "None") {
+      sonoraLoadedTrackId = null;
+    }
+    if (typeof detail.playing === "boolean" && !isRemotePlayback()) {
+      if (detail.playing) {
+        if (sonoraPendingPlay
+          && sonoraPendingTrackId
+          && detail.trackId
+          && detail.trackId !== sonoraPendingTrackId) {
+          // Snapshot for a different track while a newer load is pending.
+        } else {
+          clearSonoraPendingPlay(detail.trackId);
+          state.playing = true;
+        }
+      } else if (!sonoraPendingPlay) {
+        state.playing = false;
+      }
+      // While sonoraPendingPlay, keep playing=false until Sonora confirms Playing.
+    }
+    lastAudioTime = state.sonoraPosition;
+
+    if (pendingSonoraPreloadAfterLoad) {
+      const currentId = currentTrack()?.id;
+      if (currentId && detail.trackId === currentId) {
+        pendingSonoraPreloadAfterLoad = false;
+        maybePreloadSonoraNext();
+      }
+    }
+
+    if (state.seeking) {
+      return;
+    }
+    // Position ticks are ~5 Hz — only refresh transport chrome, not full now-playing/DOM.
+    if (wasPlaying === state.playing) {
+      const duration = playbackDuration() || currentTrack()?.duration || 0;
+      elapsedEl.textContent = formatTime(Math.min(state.sonoraPosition, duration || state.sonoraPosition));
+      if (duration > 0) {
+        seekBar.value = String(Math.round((state.sonoraPosition / duration) * 1000));
+        updateSlider(seekBar);
+      }
+      syncLyricsPosition();
+      return;
+    }
+    updateNowPlaying();
+    return;
+  }
+
+  if (detail.kind === "transitioned") {
+    // Sonora already owns the PCM handoff — advance EMP queue identity without LoadAsync.
+    const nextId = detail.nextTrackId;
+    const nextTrackInfo = nextId ? trackById(nextId) : null;
+    if (nextTrackInfo) {
+      advanceQueueTo(nextId);
+      state.sonoraPosition = 0;
+      state.playing = true;
+      beginLocalListen(nextTrackInfo);
+      applySonoraDspForTrack(nextTrackInfo);
+      maybePreloadSonoraNext();
+      updateNowPlaying();
+      writeSession();
+    }
+    return;
+  }
+
+  if (detail.kind === "completed") {
+    if (state.holdEnded) {
+      return;
+    }
+    if (state.repeat === "one") {
+      window.EmpSonora.seek(0);
+      window.EmpSonora.play();
+      return;
+    }
+    if (hasNextTrack() || state.repeat === "all") {
+      nextTrack({ wrap: state.repeat === "all" });
+      return;
+    }
+    stopAtEndOfQueue();
+  }
+}
+
+window.addEventListener("emp-sonora", (event) => handleSonoraHostEvent(event.detail));
 
 function hasNextTrack() {
   return state.index + 1 < activeOrder().length;
@@ -9125,8 +9266,9 @@ function previousTrack() {
       postCastCommand("seek", { position: 0 });
       state.remotePosition = 0;
       state.remoteStatusAt = performance.now();
-    } else {
-      currentAudio().currentTime = 0;
+    } else if (requireSonoraLocal()) {
+      state.sonoraPosition = 0;
+      window.EmpSonora.seek(0);
     }
     lastAudioTime = 0;
     updateNowPlaying();
@@ -9160,7 +9302,7 @@ function cycleRepeat() {
 }
 
 function rescanButton() {
-  return viewArea.querySelector("[data-rescan-library]");
+  return settingsRoot().querySelector("[data-rescan-library]");
 }
 
 function prefersReducedMotion() {
@@ -10233,11 +10375,20 @@ document.body.addEventListener("click", (event) => {
     return;
   }
 
-  const audioOutputPick = event.target.closest("[data-audio-output-pick]");
-  if (audioOutputPick) {
+  const audioOutputModeToggle = event.target.closest("[data-audio-output-mode-toggle]");
+  if (audioOutputModeToggle) {
     event.preventDefault();
+    const wrap = audioOutputModeToggle.closest(".settings-audio-mode-wrap");
+    const menu = wrap?.querySelector(".songs-sort-menu");
+    const open = menu && menu.hidden;
     closeAudioOutputMenu();
-    pickAudioOutputDevice();
+    closeEqPresetMenu();
+    closeSongsSortMenu();
+    if (open && menu) {
+      menu.hidden = false;
+      audioOutputModeToggle.setAttribute("aria-expanded", "true");
+      wrap.classList.add("is-open");
+    }
     return;
   }
 
@@ -10249,13 +10400,98 @@ document.body.addEventListener("click", (event) => {
     state.audioOutputLabel = deviceId ? label : "";
     setPlaybackSetting("audioOutputId", deviceId);
     closeAudioOutputMenu();
-    if (state.view === "settings") {
+    if (state.settingsOpen || state.view === "settings") {
       renderSettings();
     }
     return;
   }
 
-  if (!event.target.closest(".settings-audio-output-wrap")) {
+  const audioOutputModeItem = event.target.closest("[data-audio-output-mode]");
+  if (audioOutputModeItem && audioOutputModeItem.closest(".settings-audio-mode-wrap")) {
+    event.preventDefault();
+    setPlaybackSetting("audioOutputMode", audioOutputModeItem.dataset.audioOutputMode);
+    closeAudioOutputMenu();
+    return;
+  }
+
+  const openUrlLink = event.target.closest("[data-open-url]");
+  if (openUrlLink) {
+    event.preventDefault();
+    const url = openUrlLink.getAttribute("data-open-url") || openUrlLink.href;
+    if (url) {
+      window.chrome?.webview?.postMessage({ type: "openUrl", url });
+    }
+    return;
+  }
+
+  const settingsClose = event.target.closest("[data-settings-close]");
+  if (settingsClose) {
+    event.preventDefault();
+    closeSettingsOverlay();
+    return;
+  }
+
+  const settingsSectionBtn = event.target.closest("[data-settings-section]");
+  if (settingsSectionBtn) {
+    event.preventDefault();
+    const next = settingsSectionBtn.dataset.settingsSection;
+    state.settingsSection = window.EmpSettingsOverlay?.normalizeSettingsSection?.(next) || "general";
+    if (historyStack[historyIndex]?.view === "settings") {
+      historyStack[historyIndex] = window.EmpSettingsOverlay.settingsHistoryEntry(state.settingsSection);
+    }
+    renderSettings();
+    if (state.settingsSection === "audio") {
+      requestAudioSettingsDevices();
+    }
+    if (state.settingsSection === "listeningInsights") {
+      requestListeningInsights();
+    }
+    return;
+  }
+
+  const insightsRangeBtn = event.target.closest("[data-insights-range]");
+  if (insightsRangeBtn) {
+    event.preventDefault();
+    requestListeningInsights(insightsRangeBtn.dataset.insightsRange);
+    return;
+  }
+
+  const insightsPlayBtn = event.target.closest("[data-insights-play]");
+  if (insightsPlayBtn) {
+    event.preventDefault();
+    const trackId = insightsPlayBtn.dataset.insightsPlay;
+    const insights = window.EmpListeningInsights;
+    const queue = insights?.playableQueue?.(insights.getActivePayload?.(), trackById) || [];
+    if (!trackId || !trackById(trackId) || !queue.includes(trackId)) {
+      return;
+    }
+    playTrack(trackId, queue, { source: { kind: "insights" } });
+    return;
+  }
+
+  const insightsBrowse = event.target.closest("[data-insights-browse-library]");
+  if (insightsBrowse) {
+    event.preventDefault();
+    closeSettingsOverlay();
+    navigate({ view: "songs" });
+    return;
+  }
+
+  const resetPreampBtn = event.target.closest("[data-user-preamp-reset]");
+  if (resetPreampBtn) {
+    event.preventDefault();
+    setUserPreampDb(0);
+    return;
+  }
+
+  const resetAudioProcessingBtn = event.target.closest("[data-reset-audio-processing]");
+  if (resetAudioProcessingBtn) {
+    event.preventDefault();
+    resetAudioProcessing();
+    return;
+  }
+
+  if (!event.target.closest(".settings-audio-output-wrap") && !event.target.closest(".settings-audio-mode-wrap")) {
     closeAudioOutputMenu();
   }
 
@@ -10281,10 +10517,7 @@ document.body.addEventListener("click", (event) => {
     if (action === "dismiss") {
       dismissUpdateToast();
     } else if (action === "download") {
-      const toast = document.getElementById("updateToast");
-      if (toast) {
-        toast.hidden = true;
-      }
+      setUpdateToastVisible(false);
       postUpdateAction("download");
     }
     return;
@@ -10577,6 +10810,10 @@ document.body.addEventListener("click", (event) => {
     if (navButton.classList.contains("library-title-btn") && state.sidebarCollapsed) {
       setSidebarCollapsed(false);
     }
+    if (navButton.dataset.nav === "settings") {
+      openSettingsOverlay();
+      return;
+    }
     const entry = { view: navButton.dataset.nav };
     if (navButton.dataset.filter) {
       entry.filter = navButton.dataset.filter;
@@ -10826,11 +11063,16 @@ function mountTopCollection() {
   }
 }
 
-viewArea.addEventListener("input", (event) => {
+document.addEventListener("input", (event) => {
   const crossfadeSeconds = event.target.closest("[data-crossfade-seconds]");
   if (crossfadeSeconds) {
     setPlaybackSetting("crossfadeSeconds", crossfadeSeconds.value);
     updateSlider(crossfadeSeconds);
+    return;
+  }
+  const preamp = event.target.closest("[data-user-preamp]");
+  if (preamp) {
+    setUserPreampDb(preamp.value, { persist: false });
     return;
   }
   const input = event.target.closest("[data-eq-band-input]");
@@ -10840,18 +11082,18 @@ viewArea.addEventListener("input", (event) => {
   setEqualizerBand(Number(input.dataset.eqBandInput), input.value, { persist: false });
 });
 
-viewArea.addEventListener("change", (event) => {
-  if (event.target.closest("[data-eq-band-input]")) {
+document.addEventListener("change", (event) => {
+  if (event.target.closest("[data-eq-band-input]") || event.target.closest("[data-user-preamp]")) {
     writeSession();
   }
 });
 
-viewArea.addEventListener("pointerdown", (event) => {
+document.addEventListener("pointerdown", (event) => {
   const band = event.target.closest("[data-eq-band]");
   if (!band || event.target.closest(".eq-band-label") || event.target.closest("[data-eq-band-input]")) {
     return;
   }
-  const graph = viewArea.querySelector("[data-eq-graph]");
+  const graph = settingsRoot().querySelector("[data-eq-graph]");
   const index = Number(band.dataset.eqBand);
   if (!graph || !Number.isInteger(index)) {
     return;
@@ -10866,7 +11108,7 @@ document.addEventListener("pointermove", (event) => {
   if (eqDragIndex < 0) {
     return;
   }
-  const graph = viewArea.querySelector("[data-eq-graph]");
+  const graph = settingsRoot().querySelector("[data-eq-graph]");
   if (!graph) {
     return;
   }
@@ -11158,8 +11400,9 @@ seekBar.addEventListener("change", () => {
     postCastCommand("seek", { position });
     state.remotePosition = position;
     state.remoteStatusAt = performance.now();
-  } else {
-    currentAudio().currentTime = position;
+  } else if (requireSonoraLocal()) {
+    state.sonoraPosition = position;
+    window.EmpSonora.seek(position);
   }
   lastAudioTime = position;
   state.seeking = false;
@@ -11210,123 +11453,6 @@ muteBtn.addEventListener("click", () => {
   writeSession();
 });
 
-function bindPlaybackElement(player) {
-  const el = player.el;
-  const bindGeneration = playbackElementBindGeneration;
-  el.addEventListener("timeupdate", () => {
-    if (bindGeneration !== playbackElementBindGeneration) {
-      return;
-    }
-    if (el !== currentAudio() || isRemotePlayback() || isConnectingPlayback()) {
-      return;
-    }
-
-    if (state.seeking) {
-      lastAudioTime = el.currentTime;
-      return;
-    }
-
-    const duration = el.duration || currentTrack()?.duration || 1;
-    if (
-      state.repeat === "off"
-      && state.playing
-      && !playbackTransitioning
-      && duration > 1
-      && lastAudioTime >= duration * 0.9
-      && el.currentTime < 0.4
-    ) {
-      stopAtEndOfQueue();
-      lastAudioTime = 0;
-      return;
-    }
-
-    lastAudioTime = el.currentTime;
-    elapsedEl.textContent = formatTime(el.currentTime);
-    seekBar.value = String(Math.round((el.currentTime / duration) * 1000));
-    updateSlider(seekBar);
-    syncLyricsPosition();
-    writeSessionThrottled();
-    maybePreloadNext();
-    maybeStartAutoAdvance();
-  });
-
-  el.addEventListener("loadedmetadata", () => {
-    const occ = player.listenOccurrence;
-    if (occ && !occ.finalized && Number.isFinite(el.duration) && el.duration > 0) {
-      occ.durationSec = el.duration;
-    }
-    if (el !== currentAudio()) {
-      return;
-    }
-    durationEl.textContent = formatTime(el.duration);
-  });
-
-  el.addEventListener("ended", () => {
-    if (bindGeneration !== playbackElementBindGeneration) {
-      return;
-    }
-    if (el !== currentAudio() || playbackTransitioning || isRemotePlayback() || isConnectingPlayback()) {
-      return;
-    }
-    if (state.repeat === "one") {
-      state.holdEnded = false;
-      const track = currentTrack();
-      finalizePlayerListen(player);
-      el.currentTime = 0;
-      if (track) {
-        beginPlayerListen(player, track);
-      }
-      el.play();
-      return;
-    }
-    nextTrack({ wrap: state.repeat === "all" });
-  });
-
-  el.addEventListener("play", () => {
-    setPlayerListenStalled(player, false);
-    if (el !== currentAudio() || isRemotePlayback() || isConnectingPlayback()) {
-      return;
-    }
-    if (state.holdEnded && state.repeat !== "one") {
-      el.pause();
-      state.playing = false;
-      return;
-    }
-    state.holdEnded = false;
-    state.playing = true;
-    updateNowPlaying();
-    writeSession();
-  });
-
-  el.addEventListener("playing", () => {
-    setPlayerListenStalled(player, false);
-  });
-
-  el.addEventListener("waiting", () => {
-    setPlayerListenStalled(player, true);
-  });
-
-  el.addEventListener("stalled", () => {
-    setPlayerListenStalled(player, true);
-  });
-
-  el.addEventListener("pause", () => {
-    if (bindGeneration !== playbackElementBindGeneration) {
-      return;
-    }
-    if (el !== currentAudio() || playbackTransitioning || isRemotePlayback() || isConnectingPlayback()) {
-      return;
-    }
-    if (!el.ended) {
-      state.playing = false;
-      updateNowPlaying();
-      writeSession();
-    }
-  });
-}
-
-players.forEach((player) => bindPlaybackElement(player));
-
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     tickListenStats();
@@ -11334,15 +11460,20 @@ document.addEventListener("visibilitychange", () => {
     writeSession();
     return;
   }
-  if (state.playing && !isRemotePlayback()) {
-    ensureAudioGraph();
-    resumeAudioContext();
+  if (state.playing && !isRemotePlayback() && window.EmpSonora?.available) {
+    window.EmpSonora.requestSnapshot?.();
+    window.EmpSonora.listDevices?.();
   }
 });
 
 window.addEventListener("pagehide", () => {
   teardownListenStatsForUnload();
   writeSession();
+  // Best-effort: stop Sonora before the WebView tears down (FormClosed also disposes).
+  if (window.EmpSonora?.available) {
+    window.EmpSonora.stop?.();
+    window.EmpSonora.clearNext?.();
+  }
 });
 
 document.addEventListener("keydown", (event) => {
@@ -11387,10 +11518,16 @@ document.addEventListener("keydown", (event) => {
       closeContextMenu();
       return;
     }
-    const openMenu = [...viewArea.querySelectorAll(".eq-preset-menu")].find((menu) => !menu.hidden);
+    const openMenu = [...settingsRoot().querySelectorAll(".eq-preset-menu, .songs-sort-menu")].find((menu) => !menu.hidden);
     if (openMenu) {
       event.preventDefault();
       closeEqPresetMenu();
+      closeAudioOutputMenu();
+      return;
+    }
+    if (state.settingsOpen) {
+      event.preventDefault();
+      closeSettingsOverlay();
       return;
     }
   }
@@ -11568,6 +11705,7 @@ window.addEventListener("emp-update-status", (event) => applyUpdateStatus(event.
 window.addEventListener("emp-window-state", (event) => applyHostWindowState(event.detail));
 window.addEventListener("emp-cast", (event) => handleCastMessage(event.detail));
 window.addEventListener("emp-listen-stats", (event) => applyListenStats(event.detail));
+window.addEventListener("emp-listen-insights", (event) => applyListeningInsights(event.detail));
 
 document.addEventListener("input", (event) => {
   if (event.target?.id !== "songsFilterInput") {
@@ -11660,9 +11798,4 @@ updateSlider(volumeBar);
 updateSlider(seekBar);
 updateDeviceButton();
 refreshAudioOutputDevices();
-if (navigator.mediaDevices?.addEventListener) {
-  navigator.mediaDevices.addEventListener("devicechange", () => {
-    refreshAudioOutputDevices();
-  });
-}
 

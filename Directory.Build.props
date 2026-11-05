@@ -1,8 +1,12 @@
 <Project>
   <PropertyGroup>
-    <Version>0.3.2</Version>
+    <Version>0.4.0</Version>
     <InformationalVersion>$(Version)</InformationalVersion>
     <Company>EMP</Company>
     <Product>EMP</Product>
   </PropertyGroup>
+
+  <!-- Optional local overrides (gitignored). Use for Sonora ProjectReference during development. -->
+  <Import Project="$(MSBuildThisFileDirectory)Directory.Build.props.user"
+          Condition="Exists('$(MSBuildThisFileDirectory)Directory.Build.props.user')" />
 </Project>

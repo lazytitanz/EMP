@@ -1,4 +1,4 @@
-<p align="center">
+ <p align="center">
   <img src="EMP/www/img/emp-icon-512.png" alt="EMP" width="72" height="72">
 </p>
 
@@ -6,7 +6,7 @@
 
 <p align="center">
   A modern Windows music player built around the music you already own.<br>
-  Streaming-style experience. Local files. No account required.
+  Streaming-style experience. Native audio playback. No account required.
 </p>
 
 <p align="center">
@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#download">Download</a> ·
   <a href="#features">Features</a> ·
+  <a href="#audio-powered-by-sonora">Audio</a> ·
   <a href="#screenshots">Screenshots</a> ·
   <a href="#why-emp">Why EMP?</a> ·
   <a href="#build-from-source">Build</a>
@@ -28,40 +29,48 @@
   <img src="EMP/www/img/image.png" alt="EMP screenshot">
 </p>
 
-EMP turns your personal music folders into a polished desktop listening app — library, playlists, smart playlists, personalized mixes, lyrics, metadata editing, and Cast/DLNA — without a streaming subscription or sign-in.
+EMP turns your personal music folders into a polished desktop listening experience — complete with playlists, smart playlists, personalized mixes, lyrics, metadata editing, and Cast/DLNA.
+
+Local playback is powered by [Sonora](https://github.com/lazytitanz/Sonora), an open-source .NET audio engine built for native Windows audio output and real-time audio processing.
+
+No streaming subscription. No account. Just your music.
 
 ## Download
 
 **[Download the latest release →](https://github.com/lazytitanz/EMP/releases/latest)**
 
-1. Download the Windows release archive
-2. Extract it anywhere
-3. Run **EMP.exe** — no installer required
+1. Download the Windows release archive.
+2. Extract it anywhere.
+3. Run **EMP.exe** — no installer required.
 
 ### Quick start
 
-1. Add one or more music folders when prompted (or later in **Settings**)
-2. Wait for EMP to scan and organize your library
-3. Play from Home, Search, or your library — then build playlists and mixes as you go
+1. Add one or more music folders when prompted (or later in **Settings**).
+2. Wait for EMP to scan and organize your library.
+3. Play from Home, Search, or your library — then build playlists and mixes as you go.
 
 > [!NOTE]
-> EMP is in early development and improving quickly. You may hit rough edges — bug reports via [Issues](https://github.com/lazytitanz/EMP/issues) are welcome.
+> EMP is in early development and improving quickly. You may encounter rough edges. Bug reports through [GitHub Issues](https://github.com/lazytitanz/EMP/issues) are welcome.
 
 ## Features
 
 | | What you get |
 |---|---|
-| **Your library** | Albums, artists, singles, playlists, Liked Songs — scanned from your folders and kept up to date as files change |
+| **Your library** | Albums, artists, singles, playlists, and Liked Songs — scanned from your folders and kept up to date |
 | **Smart playlists** | Rule-based playlists with live preview, templates, sorting, and limits |
-| **Your Mixes** | Heavy Rotation, Rediscover, Library Discovery, and artist mixes from your listening history — no recommendation service |
-| **Search** | Dedicated search with top result, ranked matches, and browse shortcuts |
-| **Playback** | Queue, shuffle/repeat, crossfade or gapless, ReplayGain, equalizer, output device, Windows media & taskbar controls |
+| **Your Mixes** | Heavy Rotation, Rediscover, Library Discovery, and artist mixes based on your listening history |
+| **Search** | Dedicated search with ranked results, top matches, and browse shortcuts |
+| **Native playback** | Sonora-powered audio with WASAPI output, Shared/Exclusive modes, and output-device selection |
+| **Audio processing** | Six-band equalizer, presets, preamp, limiter, ReplayGain, crossfade, and gapless playback |
+| **Playback controls** | Queue, shuffle, repeat, session restore, Windows media controls, and taskbar integration |
 | **Lyrics** | Synced lyrics with active-line highlighting, plain lyrics fallback, and local caching |
 | **Metadata** | Edit tags and artwork in-app, including batch edits with preview |
-| **Connect** | Google Cast and DLNA/UPnP — original files streamed from your PC on the local network |
-| **Updates** | Optional checks from GitHub Releases; you choose when to install |
+| **Connect** | Google Cast and DLNA/UPnP — original files streamed from your PC over the local network |
+| **Updates** | Optional checks through GitHub Releases; you decide when to install |
 
-Supported formats: **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, ALAC, WebM** (audio-only).
+**Supported audio formats:** MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, ALAC, and WebM (audio-only).
+
+Format compatibility can depend on the codec and container used by an individual file.
 
 <details>
 <summary><strong>Library details</strong></summary>
@@ -71,6 +80,7 @@ Supported formats: **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, ALAC, WebM*
 - Create, edit, and delete regular playlists
 - Optional artist information from MusicBrainz
 - Artwork-driven colors throughout the interface
+
 </details>
 
 <details>
@@ -81,51 +91,71 @@ Supported formats: **MP3, M4A, AAC, FLAC, WAV, OGG, Opus, WMA, AIFF, ALAC, WebM*
 - Conditions for metadata, play count, last played, never played, date added, favorites, and more
 - Templates such as Recently Added, Never Played, Most Played, Forgotten Favorites, and Recently Played
 - Edit rules, refresh matches, duplicate, convert to a regular playlist, or delete
+
 </details>
 
-<details>
-<summary><strong>Playback & audio details</strong></summary>
+## Audio powered by Sonora
 
-- Session restore for queue, track, and position
-- ReplayGain Track or Album mode when tags are available
-- Prevent clipping to reduce distortion from normalization and enhancements
-- Equalizer with presets
-</details>
+EMP uses [Sonora](https://github.com/lazytitanz/Sonora), an independently developed, open-source .NET audio engine, for local music playback.
 
-<details>
-<summary><strong>Casting notes</strong></summary>
+Rather than relying on Chromium's audio playback pipeline, EMP uses Sonora to decode and process audio and deliver it to Windows audio devices through WASAPI.
 
-Open **Connect to a device** from the player bar. When casting, EMP serves the original audio file from your PC — nothing is uploaded or transcoded.
+### Native Windows audio
 
-Audio processing (equalizer, ReplayGain, prevent clipping, crossfade, gapless) applies on this computer and is not applied when sending the original file to another device.
-</details>
+- **WASAPI Shared mode** — plays alongside audio from other applications.
+- **WASAPI Exclusive mode** — requests dedicated access to a supported output device.
+- **Output device selection** — choose where your music plays.
+- **Device handling** — respond to output-device changes and disconnections.
+
+### Audio processing
+
+- **Six-band equalizer** — adjust frequencies using an interactive EQ graph and built-in presets.
+- **Preamp** — control gain before output.
+- **Limiter** — reduce peaks that could cause clipping.
+- **ReplayGain** — normalize playback levels using embedded Track or Album gain metadata.
+- **Crossfade** — blend transitions between songs.
+- **Gapless playback** — reduce interruptions between consecutive tracks through Sonora's preloaded track transitions.
+
+These settings are available through EMP's dedicated Playback, Audio, and Equalizer settings pages.
+
+### Local playback, separate from casting
+
+Sonora handles playback on your Windows PC.
+
+When using Google Cast or DLNA/UPnP, EMP serves the original audio file from your computer over the local network. Files are not uploaded to a cloud service or transcoded by EMP.
+
+Local audio processing — including EQ, ReplayGain, limiter, preamp, crossfade, and gapless transitions — is not applied to the original file sent to a casting device.
+
+Sonora is also available as a standalone open-source project for developers building .NET audio applications.
+
+**[Explore Sonora on GitHub →](https://github.com/lazytitanz/Sonora)**
 
 ## Screenshots
 
 <p align="center">
   <img src="EMP/www/img/image2.png" alt="All Songs page">
 </p>
-<p align="center"><em>All Songs — jump right in to listening to every song in your library.</em></p>
+<p align="center"><em>All Songs — jump right into your music library.</em></p>
 
 <p align="center">
   <img src="EMP/www/img/image3.png" alt="Search page">
 </p>
-<p align="center"><em>Search page.</em></p>
+<p align="center"><em>Search — find tracks, albums, artists, and playlists.</em></p>
 
 <p align="center">
-  <img src="EMP/www/img/image4.png" alt="Settings page">
+  <img src="EMP/www/img/image4.png" alt="Settings overlay">
 </p>
-<p align="center"><em>Settings page.</em></p>
+<p align="center"><em>Settings — customize playback, audio output, equalizer, and more.</em></p>
 
 <p align="center">
   <img src="EMP/www/img/image5.png" alt="Artists page and discography">
 </p>
-<p align="center"><em>Artists page and discography sections.</em></p>
+<p align="center"><em>Artists — explore your library and discographies.</em></p>
 
 <p align="center">
-  <img src="EMP/www/img/image6.png" alt="Lyrics panel">
+  <img src="EMP/www/img/image6.png" alt="Lyrics page">
 </p>
-<p align="center"><em>Lyrics panel.</em></p>
+<p align="center"><em>Lyrics — follow along with synced or plain lyrics.</em></p>
 
 ## Why EMP?
 
@@ -133,11 +163,13 @@ EMP is for people who keep their own music collection but still want a modern de
 
 There's no streaming catalog to subscribe to and no account required to listen. Choose your music folders and EMP builds the experience around your collection.
 
+With Sonora powering local playback, EMP combines a modern music-library interface with a native Windows audio engine and configurable audio processing.
+
 **The goal is simple: make a local music library feel as polished and convenient as a modern streaming app.**
 
 ## Build from source
 
-Requires [.NET 10 SDK](https://dotnet.microsoft.com/download) on Windows 10 or later.
+Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download) on Windows 10 or later.
 
 ```bash
 git clone https://github.com/lazytitanz/EMP.git
@@ -145,9 +177,13 @@ cd EMP
 dotnet run --project EMP
 ```
 
+If building from a development branch that references Sonora as a local project, the corresponding Sonora source checkout may also be required.
+
 ## Contributing
 
-Ideas, bugs, and pull requests are welcome.
+Ideas, bug reports, and pull requests are welcome.
 
 - [Open an issue](https://github.com/lazytitanz/EMP/issues)
 - [Start a discussion](https://github.com/lazytitanz/EMP/discussions)
+
+For issues specifically involving Sonora's audio engine, see the [Sonora repository](https://github.com/lazytitanz/Sonora).

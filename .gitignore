@@ -8,6 +8,10 @@
 *.userosscache
 *.sln.docstates
 *.userprefs
+Directory.Build.props.user
+
+# Local Sonora nupkg feed (PackageReference ship path); do not commit packages
+.sonora-packages/
 
 # Visual Studio / Rider / VS Code / Cursor
 .vs/

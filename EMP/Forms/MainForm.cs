@@ -1,4 +1,5 @@
 using EMP.Hosting;
+using EMP.Hosting.Sonora;
 
 namespace EMP.Forms
 {
@@ -11,6 +12,7 @@ namespace EMP.Forms
         private ContextMenuStrip? trayMenu;
         private CustomWindowChrome? windowChrome;
         private FormWindowState lastReportedWindowState;
+        private SonoraPlaybackService? sonoraPlayback;
 
         public MainForm()
         {
@@ -84,7 +86,12 @@ namespace EMP.Forms
             windowChrome?.SyncFrameChrome();
             try
             {
+                // Phase 6b: Sonora Shared-mode host is the only local PCM backend.
+                sonoraPlayback = new SonoraPlaybackService(SynchronizationContext.Current);
+                sonoraPlayback.Initialize();
+
                 await WebUiHost.InitializeAsync(webView);
+                WebUiHost.AttachSonoraPlayback(sonoraPlayback);
                 UpdateCoordinator.Initialize(webView, RequestRestartForUpdate);
                 PostWindowState();
                 _ = ScheduleBackgroundUpdateCheckAsync();
@@ -327,6 +334,13 @@ namespace EMP.Forms
 
         private void MainForm_FormClosed(object? sender, FormClosedEventArgs e)
         {
+            WebUiHost.AttachSonoraPlayback(null);
+            SonoraPlaybackService? playback = Interlocked.Exchange(ref sonoraPlayback, null);
+            if (playback is not null)
+            {
+                playback.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+
             AppSettingsStore.Changed -= OnAppSettingsChanged;
             WebUiHost.PlayingChanged -= OnPlayingChanged;
             WebUiHost.WindowActionRequested -= OnWindowActionRequested;

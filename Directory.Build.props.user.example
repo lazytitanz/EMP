@@ -1,0 +1,10 @@
+<!--
+  Copy to Directory.Build.props.user (gitignored) for local Sonora ProjectReference development.
+  Shipping / CI must use PackageReference (default when this file is absent).
+-->
+<Project>
+  <PropertyGroup>
+    <SonoraIntegrationMode>Project</SonoraIntegrationMode>
+    <SonoraAudioWindowsProject>C:\projects\Sonora\src\Sonora.Audio.Windows\Sonora.Audio.Windows.csproj</SonoraAudioWindowsProject>
+  </PropertyGroup>
+</Project>

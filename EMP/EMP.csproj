@@ -16,8 +16,23 @@
     <InternalsVisibleTo Include="EMP.Tests" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <!-- Package = ship/CI default (pinned). Project = local override via Directory.Build.props.user. -->
+    <SonoraIntegrationMode Condition="'$(SonoraIntegrationMode)' == ''">Package</SonoraIntegrationMode>
+    <SonoraPackageVersion Condition="'$(SonoraPackageVersion)' == ''">1.0.0-rc.1</SonoraPackageVersion>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\EMP.UpdateCore\EMP.UpdateCore.csproj" />
+  </ItemGroup>
+
+  <!-- Dev-only: absolute path must live in gitignored Directory.Build.props.user, never as the ship default. -->
+  <ItemGroup Condition="'$(SonoraIntegrationMode)' == 'Project' And '$(SonoraAudioWindowsProject)' != ''">
+    <ProjectReference Include="$(SonoraAudioWindowsProject)" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SonoraIntegrationMode)' != 'Project'">
+    <PackageReference Include="Sonora.Audio.Windows" Version="$(SonoraPackageVersion)" />
   </ItemGroup>
 
   <ItemGroup>
