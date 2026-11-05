@@ -43,6 +43,8 @@ No streaming subscription. No account. Just your music.
 2. Extract it anywhere.
 3. Run **EMP.exe** — no installer required.
 
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for version-specific changes (including the 0.4.2 playlist integrity fix).
+
 ### Quick start
 
 1. Add one or more music folders when prompted (or later in **Settings**).

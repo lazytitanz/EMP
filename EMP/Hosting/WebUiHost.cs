@@ -174,6 +174,7 @@ namespace EMP.Hosting
                     pageLoaded = true;
                     RefreshLibrary();
                     PostAppSettings();
+                    PostPlaylistsBackup();
                     UpdateCoordinator.PostStatus();
                     PostWindowState(IsWindowMaximized?.Invoke() ?? false);
                     // EmpSonora may have missed Attach's first availability post (race with Navigate).
@@ -231,6 +232,10 @@ namespace EMP.Hosting
                     else if (kind == "appSettings")
                     {
                         HandleAppSettings(document.RootElement);
+                    }
+                    else if (kind == "playlistsBackup")
+                    {
+                        HandlePlaylistsBackup(document.RootElement);
                     }
                     else if (kind == "castDiscovery")
                     {
@@ -897,6 +902,15 @@ namespace EMP.Hosting
                       window.dispatchEvent(new CustomEvent('emp-app-settings', { detail: message }));
                       return;
                     }
+                    if (message.type === 'playlistsBackup') {
+                      window.__emp = window.__emp || {};
+                      window.__emp.playlistsBackup = {
+                        revision: Number(message.revision) || 0,
+                        playlists: Array.isArray(message.playlists) ? message.playlists : []
+                      };
+                      window.dispatchEvent(new CustomEvent('emp-playlists-backup', { detail: message }));
+                      return;
+                    }
                     if (message.type === 'castDevices' || message.type === 'castStatus' || message.type === 'castError') {
                       window.dispatchEvent(new CustomEvent('emp-cast', { detail: message }));
                       return;
@@ -933,9 +947,10 @@ namespace EMP.Hosting
                 }
                 """;
 
+            string playlistsBootstrap = PlaylistStore.DocumentCreatedAssignment();
             if (startupCache is null)
             {
-                return bridge;
+                return bridge + playlistsBootstrap;
             }
 
             LibraryMessage hydrate = ToLibraryMessage(
@@ -943,7 +958,7 @@ namespace EMP.Hosting
                 startupCache.ContentFingerprint,
                 requestId: null);
             string json = JsonSerializer.Serialize(hydrate, JsonOptions);
-            return bridge + "window.__emp.library = " + json + ";";
+            return bridge + playlistsBootstrap + "window.__emp.library = " + json + ";";
         }
 
         private sealed class LibraryScanResult
@@ -978,6 +993,54 @@ namespace EMP.Hosting
             };
 
             hostView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, JsonOptions));
+        }
+
+        private static void PostPlaylistsBackup()
+        {
+            if (hostView?.CoreWebView2 is null)
+            {
+                return;
+            }
+
+            try
+            {
+                hostView.CoreWebView2.PostWebMessageAsJson(PlaylistStore.BuildPostMessageJson());
+            }
+            catch (Exception)
+            {
+                // Backup delivery is best-effort; localStorage remains a compatibility mirror.
+            }
+        }
+
+        private static void HandlePlaylistsBackup(JsonElement message)
+        {
+            if (!message.TryGetProperty("playlists", out JsonElement playlists)
+                || playlists.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+
+            long revision = 0;
+            if (message.TryGetProperty("revision", out JsonElement revisionElement)
+                && revisionElement.TryGetInt64(out long parsedRevision))
+            {
+                revision = Math.Max(0, parsedRevision);
+            }
+
+            bool force = message.TryGetProperty("force", out JsonElement forceElement)
+                && forceElement.ValueKind == JsonValueKind.True;
+
+            if (revision <= 0)
+            {
+                // Legacy posts without revision: only seed empty host, never clobber.
+                if (PlaylistStore.CurrentRevision == 0)
+                {
+                    PlaylistStore.SavePlaylistsJson(playlists.GetRawText(), 1, force: false);
+                }
+                return;
+            }
+
+            PlaylistStore.SavePlaylistsJson(playlists.GetRawText(), revision, force);
         }
 
         private static void HandleAddMusicFolder()

@@ -23,6 +23,7 @@ namespace EMP.Forms
             windowChrome = new CustomWindowChrome(this);
             windowChrome.Apply();
             AppSettingsStore.Load();
+            PlaylistStore.Load();
             StartupRegistration.Apply(AppSettingsStore.Current.StartupOnLogin);
             CreateTrayIcon();
             thumbnailToolbar = new TaskbarThumbnailToolbar(this, webView);

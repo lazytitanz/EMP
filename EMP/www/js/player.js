@@ -340,6 +340,10 @@ let searchIndex = null;
 let searchDebounceTimer = 0;
 let searchRequestId = 0;
 let lastSessionWrite = 0;
+/** True after boot hydrate (or first playlist commit) has established durable playlist truth. */
+let playlistsHydrated = false;
+/** Monotonic playlist store revision; mirrored in emp.playback and host playlists.json. */
+let playlistRevision = 0;
 let trackVirtual = null;
 let collectionVirtual = null;
 let collectionResizeRaf = 0;
@@ -1186,6 +1190,142 @@ function normalizePlaylists(value) {
     });
 }
 
+function playlistPersistenceApi() {
+  return window.EmpPlaylistPersistence || null;
+}
+
+function hostPlaylistSnapshot() {
+  const api = playlistPersistenceApi();
+  const raw = window.__emp?.playlistsBackup;
+  if (api?.normalizeHostBackup) {
+    const normalized = api.normalizeHostBackup(raw);
+    return {
+      revision: normalized.revision,
+      playlists: normalizePlaylists(normalized.playlists)
+    };
+  }
+  if (Array.isArray(raw)) {
+    const playlists = normalizePlaylists(raw);
+    return { revision: playlists.length ? 1 : 0, playlists };
+  }
+  return {
+    revision: Number(raw?.revision) || 0,
+    playlists: normalizePlaylists(raw?.playlists)
+  };
+}
+
+function sessionPlaylistRevision(session) {
+  if (Number.isFinite(Number(session?.playlistRevision))) {
+    return Math.max(0, Number(session.playlistRevision));
+  }
+  const playlists = normalizePlaylists(session?.playlists);
+  return playlists.length ? 1 : 0;
+}
+
+function hydratePlaylistsAtBoot() {
+  const host = hostPlaylistSnapshot();
+  const session = readSession();
+  const storedPlaylists = normalizePlaylists(session?.playlists);
+  const storedRevision = sessionPlaylistRevision(session);
+  const api = playlistPersistenceApi();
+  const chosen = api?.chooseAuthoritativePlaylists
+    ? api.chooseAuthoritativePlaylists({
+      memoryPlaylists: state.playlists,
+      memoryRevision: playlistRevision,
+      storedPlaylists,
+      storedRevision,
+      hostPlaylists: host.playlists,
+      hostRevision: host.revision
+    })
+    : {
+      playlists: storedPlaylists.length ? storedPlaylists : host.playlists,
+      revision: Math.max(storedRevision, host.revision, playlistRevision)
+    };
+
+  state.playlists = normalizePlaylists(chosen.playlists);
+  playlistRevision = Math.max(0, Number(chosen.revision) || 0);
+  playlistsHydrated = true;
+  syncLikedFromPlaylist();
+  invalidateSearchIndex();
+
+  // Stage 3 migration: seed host from localStorage when host is empty.
+  if (host.revision === 0 && state.playlists.length) {
+    playlistRevision = Math.max(playlistRevision, 1);
+    postPlaylistsBackup(state.playlists, { force: false });
+    try {
+      const existing = readSession();
+      if (existing && typeof existing === "object") {
+        existing.playlists = state.playlists;
+        existing.playlistRevision = playlistRevision;
+        localStorage.setItem(SESSION_KEY, JSON.stringify(existing));
+      }
+    } catch {
+      // Mirror is best-effort; host post remains the durable seed.
+    }
+  }
+
+  return true;
+}
+
+function softHydratePlaylistsIfEmpty() {
+  if (playlistsHydrated || state.playlists.length) {
+    return false;
+  }
+  return hydratePlaylistsAtBoot();
+}
+
+function protectPlaylistsForPersist(outgoing, { playlistCommit = false } = {}) {
+  const api = playlistPersistenceApi();
+  const stored = normalizePlaylists(readSession()?.playlists);
+  const host = hostPlaylistSnapshot().playlists;
+  if (api?.protectPlaylistsForSessionWrite) {
+    return normalizePlaylists(api.protectPlaylistsForSessionWrite({
+      outgoingPlaylists: outgoing,
+      storedPlaylists: stored,
+      hostPlaylists: host,
+      playlistsHydrated,
+      allowPlaylistCommit: playlistCommit
+    }));
+  }
+  const next = normalizePlaylists(outgoing);
+  if (playlistCommit) {
+    return next;
+  }
+  if (!playlistsHydrated && (stored.length || host.length)) {
+    return stored.length >= host.length ? stored : host;
+  }
+  if (!next.length && (stored.length || host.length)) {
+    return stored.length ? stored : host;
+  }
+  return next;
+}
+
+function postPlaylistsBackup(playlists = state.playlists, { force = false } = {}) {
+  const normalized = normalizePlaylists(playlists);
+  window.__emp = window.__emp || {};
+  window.__emp.playlistsBackup = { revision: playlistRevision, playlists: normalized };
+  if (!window.chrome?.webview?.postMessage) {
+    return;
+  }
+  try {
+    window.chrome.webview.postMessage({
+      type: "playlistsBackup",
+      revision: playlistRevision,
+      force: Boolean(force),
+      playlists: normalized
+    });
+  } catch (error) {
+    console.error("EMP playlist backup post failed.", error);
+  }
+}
+
+/** Explicit playlist transaction — bumps revision and syncs host + session mirror. */
+function commitPlaylists() {
+  playlistsHydrated = true;
+  playlistRevision = Math.max(0, Number(playlistRevision) || 0) + 1;
+  writeSession({ playlistCommit: true });
+}
+
 function isLikedPlaylist(playlist) {
   return playlist?.kind === "liked" || playlist?.id === LIKED_PLAYLIST_ID;
 }
@@ -1380,6 +1520,7 @@ function buildSessionPayload({ compactQueue = false } = {}) {
     recentHome: state.recentHome,
     recentsFilter: state.recentsFilter,
     playlists: state.playlists,
+    playlistRevision: Number(playlistRevision) || 0,
     personalizedMixes: state.personalizedMixes !== false,
     crossfade: state.crossfade,
     gapless: state.gapless,
@@ -1401,19 +1542,30 @@ function buildSessionPayload({ compactQueue = false } = {}) {
   };
 }
 
-function persistSessionPayload(payload) {
+function persistSessionPayload(payload, { playlistCommit = false } = {}) {
+  const protectedPlaylists = protectPlaylistsForPersist(payload.playlists, { playlistCommit });
+  payload.playlists = protectedPlaylists;
+  payload.playlistRevision = Number(playlistRevision) || 0;
+  state.playlists = protectedPlaylists;
+  syncLikedFromPlaylist();
   localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
   lastSessionWrite = Date.now();
   sessionSaveFailed = false;
+  if (playlistCommit) {
+    postPlaylistsBackup(protectedPlaylists);
+  }
 }
 
-function writeSession() {
+function writeSession({ playlistCommit = false } = {}) {
   try {
-    persistSessionPayload(buildSessionPayload());
+    if (!playlistCommit) {
+      softHydratePlaylistsIfEmpty();
+    }
+    persistSessionPayload(buildSessionPayload(), { playlistCommit });
   } catch (error) {
     if (isStorageQuotaError(error) && canCompactSessionQueue()) {
       try {
-        persistSessionPayload(buildSessionPayload({ compactQueue: true }));
+        persistSessionPayload(buildSessionPayload({ compactQueue: true }), { playlistCommit });
         return;
       } catch (compactError) {
         sessionSaveFailed = true;
@@ -1457,6 +1609,7 @@ function restoreEqualizerState(session) {
       () => appearancePrefs(),
       () => applyAppearanceFromState({ refreshStage: true, refreshDensity: false, persist: false })
     );
+    hydratePlaylistsAtBoot();
     return;
   }
 
@@ -1475,6 +1628,8 @@ function restoreEqualizerState(session) {
   state.sidebarWidth = normalizeSidebarWidth(session.sidebarWidth);
   state.sidebarCollapsed = Boolean(session.sidebarCollapsed);
   state.playlists = normalizePlaylists(session.playlists);
+  playlistRevision = sessionPlaylistRevision(session);
+  hydratePlaylistsAtBoot();
   invalidateSearchIndex();
   if (Array.isArray(session.recentAlbumIds)) {
     state.recentAlbumIds = session.recentAlbumIds.filter((id) => typeof id === "string");
@@ -3007,10 +3162,10 @@ function createPlaylist(name, trackId) {
     trackIds: trackId ? [trackId] : [],
     createdAt: Date.now()
   };
-  state.playlists = [...state.playlists, playlist];
+    state.playlists = [...state.playlists, playlist];
   invalidateSearchIndex();
   recordRecentPlaylist(playlist.id);
-  writeSession();
+  commitPlaylists();
   if (state.view === "playlists" || state.view === "search") {
     if (state.view === "search") {
       focusSearchOnRender = false;
@@ -3049,11 +3204,11 @@ function createSmartPlaylist({ name, description, smart }) {
     schemaVersion: 1,
     smart: window.EmpSmartPlaylists.normalizeSmartDefinition(smart)
   };
-  state.playlists = [...state.playlists, playlist];
+    state.playlists = [...state.playlists, playlist];
   smartMatchCache.delete(playlist.id);
   invalidateSearchIndex();
   recordRecentPlaylist(playlist.id);
-  writeSession();
+  commitPlaylists();
   return playlist;
 }
 
@@ -3062,13 +3217,13 @@ function updateSmartPlaylist(playlistId, { name, description, smart }) {
   if (!playlist || !isSmartPlaylist(playlist)) {
     return null;
   }
-  playlist.name = String(name ?? "").trim() || playlist.name;
+    playlist.name = String(name ?? "").trim() || playlist.name;
   playlist.description = String(description ?? "").trim();
   playlist.smart = window.EmpSmartPlaylists.normalizeSmartDefinition(smart);
   playlist.updatedAt = Date.now();
   smartMatchCache.delete(playlist.id);
   invalidateSearchIndex();
-  writeSession();
+  commitPlaylists();
   refreshAfterPlaylistChange(playlist.id);
   return playlist;
 }
@@ -3094,10 +3249,10 @@ function reshuffleSmartPlaylist(playlistId) {
   if (!playlist || !isSmartPlaylist(playlist) || playlist.smart?.sort?.field !== "random") {
     return;
   }
-  playlist.smart.randomSeed = window.EmpSmartPlaylists.newRandomSeed(playlist.name);
+    playlist.smart.randomSeed = window.EmpSmartPlaylists.newRandomSeed(playlist.name);
   playlist.updatedAt = Date.now();
   smartMatchCache.delete(playlist.id);
-  writeSession();
+  commitPlaylists();
   refreshAfterPlaylistChange(playlist.id);
 }
 
@@ -3114,10 +3269,10 @@ function convertSmartPlaylistToRegular(playlistId) {
     trackIds,
     createdAt: Date.now()
   };
-  state.playlists = [...state.playlists, playlist];
+    state.playlists = [...state.playlists, playlist];
   invalidateSearchIndex();
   recordRecentPlaylist(playlist.id);
-  writeSession();
+  commitPlaylists();
   return playlist;
 }
 
@@ -3127,7 +3282,7 @@ function addTrackToPlaylist(playlistId, trackId) {
     return false;
   }
 
-  if (!playlist.trackIds.includes(trackId)) {
+    if (!playlist.trackIds.includes(trackId)) {
     playlist.trackIds = [...playlist.trackIds, trackId];
   }
 
@@ -3137,7 +3292,7 @@ function addTrackToPlaylist(playlistId, trackId) {
   }
 
   recordRecentPlaylist(playlist.id);
-  writeSession();
+  commitPlaylists();
   refreshAfterPlaylistChange(playlist.id);
   return true;
 }
@@ -3147,6 +3302,7 @@ function likeTrack(trackId) {
     return;
   }
 
+  softHydratePlaylistsIfEmpty();
   state.liked.add(trackId);
   let playlist = likedPlaylist();
   if (!playlist) {
@@ -3160,7 +3316,7 @@ function likeTrack(trackId) {
     };
     state.playlists = [...state.playlists, playlist];
     recordRecentPlaylist(playlist.id);
-    writeSession();
+    commitPlaylists();
     refreshAfterPlaylistChange(playlist.id);
     scheduleSmartReevaluation({ liked: true });
     return;
@@ -3178,13 +3334,13 @@ function unlikeTrack(trackId) {
   state.liked.delete(trackId);
   const playlist = likedPlaylist();
   if (!playlist) {
-    writeSession();
+    commitPlaylists();
     scheduleSmartReevaluation({ liked: true });
     return;
   }
 
   playlist.trackIds = playlist.trackIds.filter((id) => id !== trackId);
-  writeSession();
+  commitPlaylists();
   refreshAfterPlaylistChange(playlist.id);
   scheduleSmartReevaluation({ liked: true });
 }
@@ -3201,7 +3357,7 @@ function removeTrackFromPlaylist(playlistId, trackId) {
   }
 
   playlist.trackIds = playlist.trackIds.filter((id) => id !== trackId);
-  writeSession();
+  commitPlaylists();
   refreshAfterPlaylistChange(playlist.id);
 }
 
@@ -9997,14 +10153,14 @@ function updatePlaylistDetails(playlistId, name, description) {
     return;
   }
 
-  if (!isLikedPlaylist(playlist)) {
+    if (!isLikedPlaylist(playlist)) {
     const trimmed = String(name ?? "").trim();
     if (trimmed) {
       playlist.name = trimmed;
     }
   }
   playlist.description = String(description ?? "").trim();
-  writeSession();
+  commitPlaylists();
   refreshAfterPlaylistChange(playlist.id);
 }
 
@@ -10976,9 +11132,9 @@ function closeDeleteModal() {
 
 function deletePlaylist(playlistId) {
   smartMatchCache.delete(playlistId);
-  state.playlists = state.playlists.filter((p) => p.id !== playlistId);
+    state.playlists = state.playlists.filter((p) => p.id !== playlistId);
   invalidateSearchIndex();
-  writeSession();
+  commitPlaylists();
   renderLibraryList();
   if (state.view === "playlists" || state.view === "playlist") {
     navigate({ view: "playlists" });
@@ -12237,7 +12393,7 @@ document.addEventListener("visibilitychange", () => {
       const playlist = createSmartPlaylist({ name, description, smart });
       state.recentsFilter = "playlists";
       syncRecentsChips();
-      writeSession();
+      writeSession(); // persist recentsFilter mirror; playlists already committed
       navigate({ view: "playlist", playlistId: playlist.id });
     },
     confirmDiscard: (proceed) => {
@@ -13325,6 +13481,28 @@ window.addEventListener("emp-artist-info", (event) => applyArtistInfo(event.deta
 window.addEventListener("emp-lyrics", (event) => applyLyricsResult(event.detail));
 window.addEventListener("emp-storage", (event) => applyStorageUsage(event.detail));
 window.addEventListener("emp-app-settings", (event) => applyHostAppSettings(event.detail));
+window.addEventListener("emp-playlists-backup", (event) => {
+  const api = playlistPersistenceApi();
+  const snapshot = api?.normalizeHostBackup
+    ? api.normalizeHostBackup(event.detail)
+    : {
+      revision: Number(event.detail?.revision) || 0,
+      playlists: normalizePlaylists(event.detail?.playlists)
+    };
+  window.__emp = window.__emp || {};
+  window.__emp.playlistsBackup = {
+    revision: snapshot.revision,
+    playlists: normalizePlaylists(snapshot.playlists)
+  };
+  // Only re-hydrate when boot truth is missing or host revision is newer.
+  if (!playlistsHydrated || snapshot.revision > playlistRevision) {
+    hydratePlaylistsAtBoot();
+    renderLibraryList();
+    if (state.view === "playlists" || state.view === "playlist" || state.view === "search") {
+      render(historyStack[historyIndex]);
+    }
+  }
+});
 window.addEventListener("emp-update-status", (event) => applyUpdateStatus(event.detail));
 window.addEventListener("emp-window-state", (event) => applyHostWindowState(event.detail));
 window.addEventListener("emp-cast", (event) => handleCastMessage(event.detail));
