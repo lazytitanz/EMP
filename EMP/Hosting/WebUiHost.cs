@@ -101,6 +101,14 @@ namespace EMP.Hosting
                 WwwRootPath,
                 CoreWebView2HostResourceAccessKind.Allow);
 
+            // Artist hero photos: dedicated host remapped on every startup so
+            // restarts always reattach AppData images (never music-root paths).
+            ArtistImageCache.EnsureRoot();
+            webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                ArtistImageCache.HostName,
+                ArtistImageCache.Root,
+                CoreWebView2HostResourceAccessKind.Allow);
+
             artworkRoot = Path.Combine(WwwRootPath, "artwork");
             Directory.CreateDirectory(artworkRoot);
             hostView = webView;
@@ -214,7 +222,32 @@ namespace EMP.Hosting
                         string? name = ReadString(document.RootElement, "name");
                         if (!string.IsNullOrWhiteSpace(name))
                         {
-                            _ = SendArtistInfoAsync(webView, name);
+                            bool refresh = document.RootElement.TryGetProperty("refresh", out JsonElement refreshEl)
+                                && refreshEl.ValueKind == JsonValueKind.True;
+                            int? requestId = null;
+                            if (document.RootElement.TryGetProperty("requestId", out JsonElement requestEl)
+                                && requestEl.TryGetInt32(out int requestValue))
+                            {
+                                requestId = requestValue;
+                            }
+
+                            _ = SendArtistInfoAsync(webView, name, refresh, requestId);
+                        }
+                    }
+                    else if (kind == "artistImagePick")
+                    {
+                        string? name = ReadString(document.RootElement, "name");
+                        if (!string.IsNullOrWhiteSpace(name))
+                        {
+                            HandleArtistImagePick(webView, name);
+                        }
+                    }
+                    else if (kind == "artistImageClear")
+                    {
+                        string? name = ReadString(document.RootElement, "name");
+                        if (!string.IsNullOrWhiteSpace(name))
+                        {
+                            HandleArtistImageClear(webView, name);
                         }
                     }
                     else if (kind == "lyrics")
@@ -890,6 +923,10 @@ namespace EMP.Hosting
                       window.dispatchEvent(new CustomEvent('emp-artist-info', { detail: message }));
                       return;
                     }
+                    if (message.type === 'artistImageResult') {
+                      window.dispatchEvent(new CustomEvent('emp-artist-image-result', { detail: message }));
+                      return;
+                    }
                     if (message.type === 'lyrics') {
                       window.dispatchEvent(new CustomEvent('emp-lyrics', { detail: message }));
                       return;
@@ -1204,35 +1241,168 @@ namespace EMP.Hosting
             folderWatchers?.Sync(folders.Where(Directory.Exists));
         }
 
-        private static async Task SendArtistInfoAsync(WebView2 webView, string name)
+        private static async Task SendArtistInfoAsync(
+            WebView2 webView,
+            string name,
+            bool refresh = false,
+            int? requestId = null)
         {
-            MusicBrainzClient.ArtistProfile profile;
+            if (refresh)
+            {
+                MusicBrainzClient.ForceRefreshArtist(name);
+            }
+
+            // Capture after optional ForceRefresh so this call owns the new generation.
+            int generation = MusicBrainzClient.GetLookupGeneration(name);
+            MusicBrainzClient.ArtistLookupResult lookup;
             try
             {
-                profile = await MusicBrainzClient.GetArtistProfileAsync(name);
+                lookup = await MusicBrainzClient.GetArtistLookupAsync(name);
             }
             catch (Exception)
             {
-                // Leave the UI retryable: JS timeout clears the skeleton without
-                // session-caching an empty result. Message shape unchanged.
+                // Tell the UI to clear the skeleton and stay retryable.
+                PostArtistInfo(
+                    webView,
+                    new MusicBrainzClient.ArtistProfile { Name = name },
+                    MusicBrainzClient.ArtistLookupStatus.Transient,
+                    requestId);
                 return;
             }
 
-            PostArtistInfo(webView, profile);
+            // A newer Refresh bumped generation while we were in flight — drop this reply.
+            if (MusicBrainzClient.GetLookupGeneration(name) != generation)
+            {
+                return;
+            }
+
+            // Always post, including Transient, so the WebView can clear loading state promptly.
+            PostArtistInfo(webView, lookup.Profile, lookup.Status, requestId);
         }
 
-        private static void PostArtistInfo(WebView2 webView, MusicBrainzClient.ArtistProfile profile)
+        private static void HandleArtistImagePick(WebView2 webView, string name)
+        {
+            if (hostView is null)
+            {
+                return;
+            }
+
+            using OpenFileDialog dialog = new()
+            {
+                Title = "Choose artist photo",
+                Filter = "Images (*.jpg;*.jpeg;*.png)|*.jpg;*.jpeg;*.png|JPEG (*.jpg;*.jpeg)|*.jpg;*.jpeg|PNG (*.png)|*.png",
+                CheckFileExists = true,
+                Multiselect = false
+            };
+
+            Form? owner = hostView.FindForm();
+            if (dialog.ShowDialog(owner) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
+            {
+                return;
+            }
+
+            MusicBrainzClient.ArtistImageInfo? image = ArtistCustomImageStore.SetFromFile(name, dialog.FileName);
+            if (image is null)
+            {
+                PostArtistImageResult(webView, name, ok: false, "That image could not be used. Choose a JPEG or PNG at least 200px on the shortest side.");
+                return;
+            }
+
+            MusicBrainzClient.InvalidateMemory(name);
+            PostArtistImageResult(webView, name, ok: true, null);
+            _ = SendArtistInfoAsync(webView, name);
+        }
+
+        private static void HandleArtistImageClear(WebView2 webView, string name)
+        {
+            ArtistCustomImageStore.Clear(name);
+            MusicBrainzClient.InvalidateMemory(name);
+            PostArtistImageResult(webView, name, ok: true, null);
+            _ = SendArtistInfoAsync(webView, name);
+        }
+
+        private static void PostArtistImageResult(WebView2 webView, string name, bool ok, string? error)
         {
             try
             {
+                string json = JsonSerializer.Serialize(new
+                {
+                    type = "artistImageResult",
+                    name,
+                    ok,
+                    error
+                }, JsonOptions);
+
+                void Post()
+                {
+                    webView.CoreWebView2?.PostWebMessageAsJson(json);
+                }
+
+                if (webView.IsDisposed)
+                {
+                    return;
+                }
+
+                if (webView.InvokeRequired)
+                {
+                    webView.BeginInvoke(Post);
+                }
+                else
+                {
+                    Post();
+                }
+            }
+            catch (Exception)
+            {
+                // Optional UI feedback only.
+            }
+        }
+
+        private static void PostArtistInfo(
+            WebView2 webView,
+            MusicBrainzClient.ArtistProfile profile,
+            MusicBrainzClient.ArtistLookupStatus status = MusicBrainzClient.ArtistLookupStatus.Found,
+            int? requestId = null)
+        {
+            try
+            {
+                ArtistInfoImageMessage? image = null;
+                if (profile.Image is not null
+                    && !string.IsNullOrWhiteSpace(profile.Image.Url)
+                    && ArtistImageCache.TryResolveExistingFile(profile.Image.FileName ?? profile.Image.Url, out _))
+                {
+                    image = new ArtistInfoImageMessage
+                    {
+                        Url = profile.Image.Url,
+                        Attribution = profile.Image.Attribution,
+                        Author = profile.Image.Author,
+                        Credit = profile.Image.Credit,
+                        License = profile.Image.License,
+                        LicenseUrl = profile.Image.LicenseUrl,
+                        SourceUrl = profile.Image.SourceUrl,
+                        Presentation = profile.Image.Presentation,
+                        IsCustom = profile.Image.IsCustom
+                    };
+                }
+
                 string json = JsonSerializer.Serialize(new ArtistInfoMessage
                 {
                     Type = "artistInfo",
                     Name = profile.Name,
+                    Status = MusicBrainzClient.WireStatus(status),
+                    RequestId = requestId,
+                    MusicBrainzId = profile.MusicBrainzId,
+                    WikidataId = profile.WikidataId,
+                    TypeDetail = profile.Type,
                     Genres = profile.Genres,
                     OriginLabel = profile.OriginLabel,
                     BeginYear = profile.BeginYear,
-                    Area = profile.Area
+                    EndYear = profile.EndYear,
+                    Area = profile.Area,
+                    Biography = profile.Biography,
+                    WikipediaUrl = profile.WikipediaUrl,
+                    WikipediaTitle = profile.WikipediaTitle,
+                    Image = image
                 }, JsonOptions);
 
                 void Post()
@@ -2031,13 +2201,57 @@ namespace EMP.Hosting
 
             public required string Name { get; init; }
 
+            /// <summary>"ok", "empty" (confirmed miss), or "transient" (retryable; clear loading).</summary>
+            public string Status { get; init; } = "ok";
+
+            public int? RequestId { get; init; }
+
+            public string? MusicBrainzId { get; init; }
+
+            public string? WikidataId { get; init; }
+
+            /// <summary>Person/Group/etc. Serialized as artistType to avoid clashing with message type.</summary>
+            [JsonPropertyName("artistType")]
+            public string? TypeDetail { get; init; }
+
             public IReadOnlyList<string> Genres { get; init; } = [];
 
             public string? OriginLabel { get; init; }
 
             public string? BeginYear { get; init; }
 
+            public string? EndYear { get; init; }
+
             public string? Area { get; init; }
+
+            public string? Biography { get; init; }
+
+            public string? WikipediaUrl { get; init; }
+
+            public string? WikipediaTitle { get; init; }
+
+            public ArtistInfoImageMessage? Image { get; init; }
+        }
+
+        private sealed class ArtistInfoImageMessage
+        {
+            public string? Url { get; init; }
+
+            public string? Attribution { get; init; }
+
+            public string? Author { get; init; }
+
+            public string? Credit { get; init; }
+
+            public string? License { get; init; }
+
+            public string? LicenseUrl { get; init; }
+
+            public string? SourceUrl { get; init; }
+
+            public string? Presentation { get; init; }
+
+            public bool IsCustom { get; init; }
         }
 
         private sealed class StorageMessage

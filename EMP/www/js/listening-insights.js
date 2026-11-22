@@ -80,8 +80,8 @@
       <svg class="li-empty-art" viewBox="0 0 280 180" aria-hidden="true" focusable="false">
         <ellipse cx="140" cy="148" rx="78" ry="10" fill="rgba(255,255,255,0.04)"/>
         <rect x="78" y="48" width="124" height="88" rx="18" fill="#151515" stroke="rgba(255,255,255,0.08)"/>
-        <circle cx="140" cy="92" r="28" fill="none" stroke="rgba(167,139,250,0.55)" stroke-width="4"/>
-        <circle cx="140" cy="92" r="10" fill="rgba(167,139,250,0.85)"/>
+        <circle cx="140" cy="92" r="28" fill="none" stroke="rgba(29,185,84,0.55)" stroke-width="4"/>
+        <circle cx="140" cy="92" r="10" fill="rgba(29,185,84,0.85)"/>
         <path d="M178 68 v42 c0 10 8 16 18 13" fill="none" stroke="rgba(255,255,255,0.28)" stroke-width="4" stroke-linecap="round"/>
         <path d="M52 96 c18 -28 36 28 54 -8" fill="none" stroke="rgba(46,204,113,0.35)" stroke-width="3" stroke-linecap="round"/>
         <path d="M210 108 c16 -22 28 18 42 -6" fill="none" stroke="rgba(251,191,36,0.35)" stroke-width="3" stroke-linecap="round"/>
@@ -102,7 +102,7 @@
   }
 
   function artPlaceholder(kind) {
-    const accent = kind === "artist" ? "#a78bfa" : "#fbbf24";
+    const accent = kind === "artist" ? "#1db954" : "#fbbf24";
     return `
       <div class="li-art-fallback" aria-hidden="true">
         <svg viewBox="0 0 80 80" focusable="false">
@@ -153,14 +153,6 @@
     return artPlaceholder("artist");
   }
 
-  function renderIntro() {
-    return `
-      <header class="li-intro">
-        <h2 class="li-intro-title">Your music tells a story.</h2>
-        <p class="li-intro-lead">Explore the artists, tracks, and moments that shaped your listening.</p>
-      </header>`;
-  }
-
   function renderRangeControl(payload) {
     const coverage = renderCoverageNote(payload);
     return `
@@ -202,7 +194,7 @@
           <div class="li-skeleton li-skeleton-card"></div>
           <div class="li-skeleton li-skeleton-card"></div>
         </div>
-        <p class="li-coverage">Loading your listening story…</p>
+        <p class="li-coverage">Loading listening data…</p>
       </div>`;
   }
 
@@ -210,9 +202,9 @@
     return `
       <div class="li-empty">
         ${emptyStateSvg()}
-        <h3>Your listening story starts here.</h3>
-        <p>Play some music and EMP will start building your listening insights.</p>
-        <button class="li-cta" type="button" data-insights-browse-library>Browse library</button>
+        <h3>No listening data yet</h3>
+        <p>Play music in EMP to start collecting private listening stats on this computer.</p>
+        <button class="eq-reset" type="button" data-insights-browse-library>Browse library</button>
       </div>`;
   }
 
@@ -225,7 +217,7 @@
     return `
       <section class="li-summary" aria-label="Listening summary">
         <div class="li-summary-main">
-          <p class="li-eyebrow">Time spent listening</p>
+          <p class="li-eyebrow">Listening time</p>
           <p class="li-display">${escapeHtml(time.display)}</p>
           <div class="li-summary-stats">
             <div class="li-metric">
@@ -254,8 +246,7 @@
       return `
         <section class="li-section li-section-artists">
           <div class="li-section-head">
-            <p class="li-eyebrow">Top artists</p>
-            <h3>Who you kept coming back to</h3>
+            <h3>Top artists</h3>
           </div>
           <p class="li-coverage">Not enough artist metadata to rank artists for this period.</p>
         </section>`;
@@ -264,8 +255,7 @@
     return `
       <section class="li-section li-section-artists">
         <div class="li-section-head">
-          <p class="li-eyebrow">Top artists</p>
-          <h3>Who you kept coming back to</h3>
+          <h3>Top artists</h3>
         </div>
         <article class="li-artist-hero">
           <div class="li-artist-hero-art">${artistCover(first.artistName, first.sampleTrackIds, helpers, "li-cover")}</div>
@@ -297,8 +287,7 @@
       return `
         <section class="li-section li-section-tracks">
           <div class="li-section-head">
-            <p class="li-eyebrow">Top tracks</p>
-            <h3>Songs that defined the period</h3>
+            <h3>Top tracks</h3>
           </div>
           <p class="li-coverage">No track rankings for this period yet.</p>
         </section>`;
@@ -309,8 +298,7 @@
     return `
       <section class="li-section li-section-tracks">
         <div class="li-section-head">
-          <p class="li-eyebrow">Top tracks</p>
-          <h3>Songs that defined the period</h3>
+          <h3>Top tracks</h3>
         </div>
         <article class="li-track-hero${firstPlayable ? " is-playable" : ""}">
           <div class="li-track-hero-art">${coverMarkup(firstUrl, "li-cover", "track")}</div>
@@ -355,8 +343,7 @@
       return `
         <section class="li-section li-section-activity">
           <div class="li-section-head">
-            <p class="li-eyebrow">Listening activity</p>
-            <h3>How your listening moved</h3>
+            <h3>Activity</h3>
           </div>
           <p class="li-coverage">${payload.range === "all" && payload.hasLifetimeData
             ? "Daily activity charts appear once EMP has collected daily listening history."
@@ -397,8 +384,7 @@
     return `
       <section class="li-section li-section-activity">
         <div class="li-section-head">
-          <p class="li-eyebrow">Listening activity</p>
-          <h3>How your listening moved</h3>
+          <h3>Activity</h3>
         </div>
         ${payload.activityScopeLabel ? `<p class="li-coverage">${escapeHtml(payload.activityScopeLabel)}</p>` : ""}
         <div class="li-chart-wrap" role="img" aria-label="${escapeHtml(summary)}">
@@ -485,8 +471,7 @@
     return `
       <section class="li-section li-section-habits">
         <div class="li-section-head">
-          <p class="li-eyebrow">Your listening habits</p>
-          <h3>Moments worth noticing</h3>
+          <h3>Habits</h3>
         </div>
         <div class="li-habits">
           ${habits.map((habit) => habitCard(habit, helpers, payload)).join("")}
@@ -499,8 +484,8 @@
       <footer class="li-privacy">
         <i class="bi bi-shield-lock" aria-hidden="true"></i>
         <div>
-          <strong>Private by design</strong>
-          <p>Your listening history stays on this computer. No account, cloud analytics, or scrobbling service required.</p>
+          <strong>Private on this computer</strong>
+          <p>Listening history stays local. No account, cloud analytics, or scrobbling required.</p>
         </div>
       </footer>`;
   }
@@ -509,7 +494,6 @@
     if (payload?.showGenericEmpty) {
       return `
         <section class="settings-group settings-insights li-page">
-          ${renderIntro()}
           ${renderRangeControl(payload)}
           ${renderEmpty()}
           ${privacyNote()}
@@ -521,7 +505,6 @@
 
     return `
       <section class="settings-group settings-insights li-page">
-        ${renderIntro()}
         ${renderRangeControl(payload)}
         ${!payload ? renderLoading() : ""}
         ${hasContent ? renderSummary(payload) : ""}
@@ -530,7 +513,7 @@
         ${hasContent ? renderActivity(payload) : ""}
         ${hasContent ? renderHabits(payload, helpers) : ""}
         ${payload && !hasContent && !payload.showGenericEmpty
-          ? `<p class="li-coverage">No listening in this period yet. Keep playing — or try All time.</p>`
+          ? `<p class="li-coverage">No listening in this period yet. Keep playing, or try All time.</p>`
           : ""}
         ${privacyNote()}
       </section>`;

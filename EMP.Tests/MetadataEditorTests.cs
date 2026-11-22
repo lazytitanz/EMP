@@ -4,6 +4,12 @@ using Xunit;
 
 namespace EMP.Tests
 {
+    [CollectionDefinition("LibraryMediaIndex")]
+    public sealed class LibraryMediaIndexCollection
+    {
+    }
+
+    [Collection("LibraryMediaIndex")]
     public sealed class MetadataEditorTests : IDisposable
     {
         private readonly string root;

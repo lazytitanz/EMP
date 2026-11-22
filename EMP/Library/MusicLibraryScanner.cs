@@ -25,8 +25,9 @@ namespace EMP.Library
             "Thumbs.db", "desktop.ini", ".DS_Store"
         };
 
+        // "01. Title", "01 - Title", "01) Title", and space-separated "01 Title".
         private static readonly Regex TrackNumberPrefix = new(
-            @"^\s*(\d+)\s*[\.\-–)]\s*(.+)$",
+            @"^\s*(\d+)(?:\s*[\.\-–)]\s*|\s+)(.+)$",
             RegexOptions.Compiled);
 
         public static string DefaultMusicPath =>
@@ -157,7 +158,11 @@ namespace EMP.Library
 
             foreach (IGrouping<string, AudioFileInfo> group in albumGroups)
             {
-                List<AudioFileInfo> albumFiles = group
+                // DirectoryPath is EMP's album grouping key. Apply title fallback on that
+                // group first (cluster stats use original EmbeddedTitle only), then sort.
+                List<AudioFileInfo> albumFiles = group.ToList();
+                ApplySuspiciousTitleFallback(albumFiles);
+                albumFiles = albumFiles
                     .OrderBy(file => file.TrackNumber)
                     .ThenBy(file => file.Title, StringComparer.OrdinalIgnoreCase)
                     .ToList();
@@ -311,7 +316,7 @@ namespace EMP.Library
             string artistHint = GetArtistHint(musicRoot, directory);
             (int parsedNumber, string parsedTitle) = ParseFileName(Path.GetFileName(path));
 
-            string title = parsedTitle;
+            string? embeddedTitle = null;
             string artist = artistHint;
             string album = albumHint;
             string? albumArtist = null;
@@ -335,7 +340,7 @@ namespace EMP.Library
 
                 if (!string.IsNullOrWhiteSpace(file.Tag.Title))
                 {
-                    title = file.Tag.Title.Trim();
+                    embeddedTitle = file.Tag.Title.Trim();
                 }
 
                 if (!string.IsNullOrWhiteSpace(file.Tag.FirstAlbumArtist))
@@ -388,12 +393,17 @@ namespace EMP.Library
                 // Filename hints are enough when a tag cannot be read.
             }
 
+            string title = embeddedTitle ?? parsedTitle;
+
             return new AudioFileInfo
             {
                 FullPath = path,
                 RootPath = musicRoot,
                 DirectoryPath = directory,
                 RelativePath = Path.GetRelativePath(musicRoot, path),
+                EmbeddedTitle = embeddedTitle,
+                FilenameTitle = parsedTitle,
+                FilenameTrackNumber = parsedNumber,
                 Title = title,
                 Artist = artist,
                 Album = album,
@@ -411,6 +421,29 @@ namespace EMP.Library
                 ReplayGainAlbumGain = replayGain.AlbumGainDb,
                 ReplayGainAlbumPeak = replayGain.AlbumPeak
             };
+        }
+
+        private static void ApplySuspiciousTitleFallback(List<AudioFileInfo> albumFiles)
+        {
+            if (albumFiles.Count == 0)
+            {
+                return;
+            }
+
+            SuspiciousTitleFallback.Candidate[] candidates = albumFiles
+                .Select(file => new SuspiciousTitleFallback.Candidate(
+                    file.EmbeddedTitle,
+                    file.FilenameTitle,
+                    file.FilenameTrackNumber,
+                    file.Artist,
+                    file.Album))
+                .ToArray();
+
+            IReadOnlyList<string> resolved = SuspiciousTitleFallback.ResolveTitles(candidates);
+            for (int i = 0; i < albumFiles.Count; i++)
+            {
+                albumFiles[i].Title = resolved[i];
+            }
         }
 
         internal static bool IsWebmExtension(string? extensionOrFormat)
@@ -569,7 +602,15 @@ namespace EMP.Library
 
             public required string RelativePath { get; init; }
 
-            public required string Title { get; init; }
+            /// <summary>Raw TagLib title when present; null when the file had no usable title tag.</summary>
+            public string? EmbeddedTitle { get; init; }
+
+            public required string FilenameTitle { get; init; }
+
+            public required int FilenameTrackNumber { get; init; }
+
+            /// <summary>Display title after optional suspicious-title fallback.</summary>
+            public required string Title { get; set; }
 
             public required string Artist { get; init; }
 

@@ -8,8 +8,7 @@
         Object.freeze({ id: "appearance", label: "Appearance", icon: "bi-palette" }),
         Object.freeze({ id: "playback", label: "Playback", icon: "bi-play-fill" }),
         Object.freeze({ id: "audio", label: "Audio", icon: "bi-speaker" }),
-        Object.freeze({ id: "equalizer", label: "Equalizer", icon: "bi-sliders" }),
-        Object.freeze({ id: "personalization", label: "Personalization", icon: "bi-stars" })
+        Object.freeze({ id: "equalizer", label: "Equalizer", icon: "bi-sliders" })
       ])
     }),
     Object.freeze({
@@ -34,26 +33,34 @@
   ]);
 
   const SECTION_META = Object.freeze({
-    general: Object.freeze({ title: "General", description: "Startup and window behaviour." }),
+    general: Object.freeze({ title: "General", description: "Startup, window behaviour, and home mixes." }),
     library: Object.freeze({ title: "Library", description: "Music folders EMP scans for your collection." }),
     appearance: Object.freeze({ title: "Appearance", description: "Customize how EMP looks and feels." }),
     playback: Object.freeze({ title: "Playback", description: "Control how EMP plays your music." }),
     audio: Object.freeze({ title: "Audio", description: "Choose a WASAPI playback device and how EMP opens it." }),
     equalizer: Object.freeze({ title: "Equalizer", description: "Adjust frequencies to fit your listening preferences." }),
-    personalization: Object.freeze({ title: "Personalization", description: "Home mixes and personal recommendations." }),
-    listeningInsights: Object.freeze({ title: "Listening Insights", description: "A private retrospective of the music you play in EMP." }),
+    listeningInsights: Object.freeze({ title: "Listening Insights", description: "Private listening stats for the music you play in EMP." }),
     storage: Object.freeze({ title: "Storage", description: "How much space EMP uses on this computer." }),
     updates: Object.freeze({ title: "Updates", description: "Keep EMP up to date." }),
     about: Object.freeze({ title: "About", description: "EMP and the Sonora audio engine that powers local playback." })
   });
 
   const DEFAULT_SECTION = "general";
+  const LEGACY_SECTION_MAP = Object.freeze({
+    personalization: "general"
+  });
 
   function isSettingsSection(id) {
     return Boolean(SECTION_META[id]);
   }
 
   function normalizeSettingsSection(id) {
+    if (typeof id !== "string" || !id) {
+      return DEFAULT_SECTION;
+    }
+    if (LEGACY_SECTION_MAP[id]) {
+      return LEGACY_SECTION_MAP[id];
+    }
     return isSettingsSection(id) ? id : DEFAULT_SECTION;
   }
 
@@ -66,6 +73,20 @@
     return { view: "settings", section: normalizeSettingsSection(section) };
   }
 
+  /**
+   * Resolve which pane to show when opening Settings.
+   * fromHistory → history section; explicit section → that pane; else remembered.
+   */
+  function resolveOpenSettingsSection(section, { fromHistory = false, remembered } = {}) {
+    if (fromHistory) {
+      return normalizeSettingsSection(section);
+    }
+    if (typeof section === "string" && section.length) {
+      return normalizeSettingsSection(section);
+    }
+    return normalizeSettingsSection(remembered);
+  }
+
   const api = {
     SECTIONS,
     SECTION_META,
@@ -73,7 +94,8 @@
     isSettingsSection,
     normalizeSettingsSection,
     shouldPushSettingsHistory,
-    settingsHistoryEntry
+    settingsHistoryEntry,
+    resolveOpenSettingsSection
   };
 
   if (typeof module !== "undefined" && module.exports) {

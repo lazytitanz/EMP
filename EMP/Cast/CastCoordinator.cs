@@ -54,14 +54,43 @@ namespace EMP.Cast
                 // The UI may have reloaded and lost the device list it already had,
                 // so let the next post through even if nothing changed here.
                 Interlocked.Exchange(ref lastDevices, string.Empty);
-                broker.Start();
+                // Always restart so opening the drawer / Rescan kicks a fresh probe.
+                // Start() alone is a no-op while discovery is already running, which
+                // made the first scan look empty until a second Rescan cycled it.
+                PostDevices();
+                _ = RestartDiscoveryAsync();
+                return;
             }
-            else if (release)
+
+            if (release)
             {
                 // This runs on the UI thread, so never wait for discovery to unwind.
                 _ = broker.StopAsync();
             }
 
+            PostDevices();
+        }
+
+        private async Task RestartDiscoveryAsync()
+        {
+            try
+            {
+                await broker.StopAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"EMP cast discovery restart: {ex.Message}");
+            }
+
+            lock (gate)
+            {
+                if (disposed || !discoveryHeld)
+                {
+                    return;
+                }
+            }
+
+            broker.Start();
             PostDevices();
         }
 

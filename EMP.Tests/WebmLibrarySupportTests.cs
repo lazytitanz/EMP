@@ -5,6 +5,7 @@ using Xunit;
 
 namespace EMP.Tests
 {
+    [Collection("LibraryMediaIndex")]
     public sealed class WebmLibrarySupportTests : IDisposable
     {
         private readonly string root;

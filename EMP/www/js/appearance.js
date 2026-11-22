@@ -20,7 +20,7 @@
   });
 
   const DEFAULTS = Object.freeze({
-    theme: "dark",
+    theme: "system",
     accent: "emp",
     accentCustom: "#20c77a",
     density: "comfortable",

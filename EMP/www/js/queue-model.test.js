@@ -183,6 +183,60 @@ describe("session persistence", () => {
     Q.clearUpcoming(state);
     assert.equal(Q.canCompactSessionQueue(state, { queueMatchesFullLibrary: () => true }), false);
   });
+
+  it("restores queue order without reshuffling and drops missing tracks", () => {
+    const state = freshState(["a", "b", "c", "d"], "b");
+    Q.playNextTracks(state, ["x"]);
+    const payload = Q.serializeQueueSession(state);
+    assert.deepEqual(Q.trackIdsFromEntries(payload.entries), ["a", "b", "x", "c", "d"]);
+
+    const restored = {
+      entries: [],
+      queue: [],
+      shuffleBag: [],
+      index: -1,
+      orderRevision: 0,
+      playNextCount: 0,
+      queueDirty: false,
+      preloadGeneration: 0,
+      shuffle: true,
+      queueSource: null
+    };
+    Q.restoreQueueSession(
+      restored,
+      { ...payload, trackId: "b", shuffle: true },
+      { trackExists: (id) => id !== "x" && id !== "c" }
+    );
+
+    assert.deepEqual(Q.trackIdsFromEntries(restored.entries), ["a", "b", "d"]);
+    assert.equal(restored.index, 1);
+    assert.equal(restored.shuffle, true);
+    assert.deepEqual(restored.shuffleBag, []);
+    assert.deepEqual(restored.queue, ["a", "b", "d"]);
+  });
+
+  it("resolves index from trackId when saved index is out of range", () => {
+    const payload = Q.serializeQueueSession(freshState(["a", "b", "c"], "c"));
+    const restored = {
+      entries: [],
+      queue: [],
+      shuffleBag: [],
+      index: -1,
+      orderRevision: 0,
+      playNextCount: 0,
+      queueDirty: false,
+      preloadGeneration: 0,
+      shuffle: false,
+      queueSource: null
+    };
+    Q.restoreQueueSession(
+      restored,
+      { ...payload, index: 99, trackId: "b" },
+      { trackExists: () => true }
+    );
+    assert.equal(restored.index, 1);
+    assert.equal(restored.entries[restored.index].trackId, "b");
+  });
 });
 
 describe("stale Sonora preload plans", () => {

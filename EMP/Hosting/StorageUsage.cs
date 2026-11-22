@@ -41,7 +41,9 @@ namespace EMP.Hosting
                 Path.Combine(WebUiHost.WwwRootPath, "artwork"),
                 MusicLibraryScanner.ArtworkCachePath,
                 LyricsCache.DefaultRoot,
-                MusicBrainzClient.CacheRoot
+                MusicBrainzClient.CacheRoot,
+                ArtistImageCache.DefaultRoot,
+                MusicBrainzClient.ArtistMetadataRoot
             ];
 
             long total = folders

@@ -13,7 +13,14 @@ namespace EMP.Tests
             return root;
         }
 
-        public static string WriteSilentWav(string directory, string fileName, string? title = null)
+        public static string WriteSilentWav(
+            string directory,
+            string fileName,
+            string? title = null,
+            string? artist = null,
+            string? album = null,
+            uint trackNumber = 1,
+            bool writeTitleTag = true)
         {
             Directory.CreateDirectory(directory);
             string path = Path.Combine(directory, fileName);
@@ -44,15 +51,15 @@ namespace EMP.Tests
 
             using (TagLib.File file = TagLib.File.Create(path))
             {
-                if (!string.IsNullOrWhiteSpace(title))
+                if (writeTitleTag && !string.IsNullOrWhiteSpace(title))
                 {
                     file.Tag.Title = title;
                 }
 
-                file.Tag.Performers = ["Fixture Artist"];
-                file.Tag.AlbumArtists = ["Fixture Album Artist"];
-                file.Tag.Album = "Fixture Album";
-                file.Tag.Track = 1;
+                file.Tag.Performers = [string.IsNullOrWhiteSpace(artist) ? "Fixture Artist" : artist];
+                file.Tag.AlbumArtists = [string.IsNullOrWhiteSpace(artist) ? "Fixture Album Artist" : artist];
+                file.Tag.Album = string.IsNullOrWhiteSpace(album) ? "Fixture Album" : album;
+                file.Tag.Track = trackNumber;
                 file.Tag.Disc = 1;
                 file.Tag.Genres = ["Fixture"];
                 file.Tag.Year = 2024;

@@ -5,9 +5,9 @@ const assert = require("node:assert/strict");
 const Appearance = require("./appearance.js");
 
 describe("appearance defaults and normalization", () => {
-  it("exposes dark-first defaults", () => {
+  it("exposes system-first defaults", () => {
     assert.deepEqual(Appearance.cloneDefaults(), {
-      theme: "dark",
+      theme: "system",
       accent: "emp",
       accentCustom: "#20c77a",
       density: "comfortable",
@@ -24,7 +24,7 @@ describe("appearance defaults and normalization", () => {
       density: "cozy",
       artworkAccents: "yes"
     }), {
-      theme: "dark",
+      theme: "system",
       accent: "emp",
       accentCustom: "#20c77a",
       density: "comfortable",

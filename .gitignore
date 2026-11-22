@@ -124,3 +124,14 @@ $RECYCLE.BIN/
 *.pfx
 *.snk
 *.publishsettings
+
+# Local agent skills and notes (installed / machine-specific)
+.agents/
+skills-lock.json
+
+# Taste Skill working files (draw/brand sheets, before/after screenshots, Chrome profiles)
+.taste-skill/
+
+# Local Taste Skill preview fixtures
+EMP/www/.taste-*.html
+**/www/.taste-*.html

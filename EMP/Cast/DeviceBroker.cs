@@ -91,6 +91,18 @@ namespace EMP.Cast
             dlna.Start();
         }
 
+        /// <summary>
+        /// Tears down and restarts both discovery loops so a fresh M-SEARCH / Cast
+        /// probe runs immediately. Used when the drawer opens or the user rescans —
+        /// a lone <see cref="Start"/> is a no-op while already running, which left
+        /// the first UI scan empty until a manual restart.
+        /// </summary>
+        public async Task RestartAsync()
+        {
+            await StopAsync().ConfigureAwait(false);
+            Start();
+        }
+
         public Task StopAsync()
         {
             lock (gate)

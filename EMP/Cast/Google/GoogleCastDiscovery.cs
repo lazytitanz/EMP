@@ -125,62 +125,129 @@ namespace EMP.Cast.Google
 
         private async Task RunAsync(CancellationToken cancellationToken)
         {
-            ChromecastLocator locator = new();
-            while (!cancellationToken.IsCancellationRequested)
+            // Sharpcaster 3.x: FindReceiversAsync(TimeSpan) only sets the *quick*
+            // progressive stage. Passing 5s there left medium/full at 800ms/2s and
+            // made the first open look empty; Rescan "fixed" it by warming mDNS.
+            using ChromecastLocator locator = new();
+            EventHandler<ChromecastReceiverEventArgs>? foundHandler = (_, args) =>
             {
-                try
+                if (args.Receiver is not null)
                 {
-                    // FindReceiversAsync takes no token, so abandon it on cancellation
-                    // instead of letting the loop outlive Stop by a full scan window.
-                    IEnumerable<ChromecastReceiver> found = await locator
-                        .FindReceiversAsync(TimeSpan.FromSeconds(5))
-                        .WaitAsync(cancellationToken);
-                    DateTime now = DateTime.UtcNow;
-                    bool changed = false;
-                    lock (gate)
-                    {
-                        foreach (ChromecastReceiver receiver in found)
-                        {
-                            PlaybackDevice device = ToDevice(receiver);
-                            if (string.IsNullOrWhiteSpace(device.Id))
-                            {
-                                continue;
-                            }
-
-                            if (!devices.TryGetValue(device.Id, out CachedReceiver? existing)
-                                || existing.Device.Name != device.Name)
-                            {
-                                changed = true;
-                            }
-
-                            devices[device.Id] = new CachedReceiver(device, receiver, now);
-                        }
-
-                        changed |= PruneLocked(now);
-                    }
-
-                    if (changed)
-                    {
-                        Changed?.Invoke();
-                    }
+                    UpsertReceivers([args.Receiver]);
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            };
+
+            locator.ChromecastReceiverFound += foundHandler;
+            try
+            {
+                // Continuous discovery raises events as receivers appear (5s scans).
+                locator.StartContinuousDiscovery(TimeSpan.FromSeconds(5));
+
+                // Parallel progressive probe with a long final stage so the drawer
+                // usually fills on the first open instead of only after Rescan.
+                await ProbeOnceAsync(
+                        locator,
+                        quick: TimeSpan.FromMilliseconds(500),
+                        medium: TimeSpan.FromSeconds(2),
+                        full: TimeSpan.FromSeconds(6),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!cancellationToken.IsCancellationRequested && !HasDevices())
                 {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"EMP Cast discovery: {ex.Message}");
+                    await ProbeOnceAsync(
+                            locator,
+                            quick: TimeSpan.FromSeconds(1),
+                            medium: TimeSpan.FromSeconds(3),
+                            full: TimeSpan.FromSeconds(8),
+                            cancellationToken)
+                        .ConfigureAwait(false);
                 }
 
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(4), cancellationToken);
+                    await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
-                    return;
                 }
+            }
+            finally
+            {
+                locator.ChromecastReceiverFound -= foundHandler;
+                try
+                {
+                    locator.StopContinuousDiscovery();
+                }
+                catch (Exception)
+                {
+                    // Ignore shutdown races inside Sharpcaster.
+                }
+            }
+        }
+
+        private bool HasDevices()
+        {
+            lock (gate)
+            {
+                return devices.Count > 0;
+            }
+        }
+
+        private async Task ProbeOnceAsync(
+            ChromecastLocator locator,
+            TimeSpan quick,
+            TimeSpan medium,
+            TimeSpan full,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                IEnumerable<ChromecastReceiver> found = await locator
+                    .FindReceiversAsync(quick, medium, full)
+                    .WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                UpsertReceivers(found);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"EMP Cast discovery: {ex.Message}");
+            }
+        }
+
+        private void UpsertReceivers(IEnumerable<ChromecastReceiver> found)
+        {
+            DateTime now = DateTime.UtcNow;
+            bool changed = false;
+            lock (gate)
+            {
+                foreach (ChromecastReceiver receiver in found)
+                {
+                    PlaybackDevice device = ToDevice(receiver);
+                    if (string.IsNullOrWhiteSpace(device.Id))
+                    {
+                        continue;
+                    }
+
+                    if (!devices.TryGetValue(device.Id, out CachedReceiver? existing)
+                        || existing.Device.Name != device.Name
+                        || !existing.Device.Available)
+                    {
+                        changed = true;
+                    }
+
+                    devices[device.Id] = new CachedReceiver(device, receiver, now);
+                }
+
+                changed |= PruneLocked(now);
+            }
+
+            if (changed)
+            {
+                Changed?.Invoke();
             }
         }
 

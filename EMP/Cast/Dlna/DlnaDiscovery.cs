@@ -85,16 +85,26 @@ namespace EMP.Cast.Dlna
                 Task previous = drain;
                 // The NOTIFY listener owns UDP port 1900. Waiting for the previous
                 // run to release it keeps a restart from stacking up listeners that
-                // each re-broadcast every packet as a device change.
-                loop = Task.Run(async () =>
-                {
-                    await previous.ConfigureAwait(false);
-                    await RunAsync(token).ConfigureAwait(false);
-                });
+                // each re-broadcast every packet as a device change. Start the
+                // listener before M-SEARCH so responses aren't missed on the first scan.
                 notifyLoop = Task.Run(async () =>
                 {
                     await previous.ConfigureAwait(false);
                     await ListenNotifyAsync(token).ConfigureAwait(false);
+                });
+                loop = Task.Run(async () =>
+                {
+                    await previous.ConfigureAwait(false);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(150), token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+
+                    await RunAsync(token).ConfigureAwait(false);
                 });
             }
         }
@@ -163,11 +173,13 @@ namespace EMP.Cast.Dlna
 
         private async Task RunAsync(CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            // Burst two M-SEARCH rounds on start — the first often only warms
+            // multicast membership, matching the Cast discovery cold-start gap.
+            for (int burst = 0; burst < 2 && !cancellationToken.IsCancellationRequested; burst++)
             {
                 try
                 {
-                    await SearchOnceAsync(cancellationToken);
+                    await SearchOnceAsync(cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -178,13 +190,41 @@ namespace EMP.Cast.Dlna
                     DlnaLog.Write($"discovery: {ex.Message}");
                 }
 
+                if (burst == 0)
+                {
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(300), cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                }
+            }
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(8), cancellationToken);
+                    await Task.Delay(TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
                     return;
+                }
+
+                try
+                {
+                    await SearchOnceAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    DlnaLog.Write($"discovery: {ex.Message}");
                 }
             }
         }
