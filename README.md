@@ -150,14 +150,24 @@ Sonora is also available as a standalone open-source project for developers buil
 <p align="center"><em>Settings — customize playback, audio output, equalizer, and more.</em></p>
 
 <p align="center">
-  <img src="EMP/www/img/image5.png" alt="Artists page and discography">
+  <img src="EMP/www/img/image5.png?v=0.4.3" alt="Artist profile page">
 </p>
-<p align="center"><em>Artists — explore your library and discographies.</em></p>
+<p align="center"><em>Artists — profiles, biography, and discography.</em></p>
 
 <p align="center">
-  <img src="EMP/www/img/image6.png" alt="Lyrics page">
+  <img src="EMP/www/img/image6.png?v=0.4.3" alt="Lyrics view">
 </p>
 <p align="center"><em>Lyrics — follow along with synced or plain lyrics.</em></p>
+
+<p align="center">
+  <img src="EMP/www/img/image8.png?v=0.4.3" alt="Lyrics view in light theme">
+</p>
+<p align="center"><em>Lyrics in light theme — the same Now Playing experience in light appearance.</em></p>
+
+<p align="center">
+  <img src="EMP/www/img/image9.png?v=0.4.3" alt="Queue drawer">
+</p>
+<p align="center"><em>Queue — see what’s playing and what’s up next.</em></p>
 
 ## Why EMP?
 
