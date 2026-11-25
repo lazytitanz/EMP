@@ -313,6 +313,7 @@ namespace EMP.Forms
             if (webView.CoreWebView2 is null)
             {
                 ListenStatsCoordinator.FlushSync();
+                HomeStore.FlushSync();
                 sessionSaved = true;
                 return;
             }
@@ -331,6 +332,7 @@ namespace EMP.Forms
             }
 
             ListenStatsCoordinator.FlushSync();
+            HomeStore.FlushSync();
             sessionSaved = true;
             BeginInvoke(Close);
         }

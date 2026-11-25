@@ -116,6 +116,7 @@ function applyTransportPosition(position, durationHint) {
     ? Math.min(Math.max(0, position), duration)
     : Math.max(0, position);
   elapsedEl.textContent = formatTime(clamped);
+  syncHomeResumeProgress();
   if (duration > 0) {
     seekBar.value = String(Math.round((clamped / duration) * 1000));
   } else {
@@ -310,7 +311,12 @@ const queueDrawerStatus = document.getElementById("queueDrawerStatus");
 const SESSION_KEY = "emp.playback";
 const LIKED_PLAYLIST_ID = "pl_liked";
 const LIKED_PLAYLIST_NAME = "Liked Songs";
-const HOME_QUICK_SIZE = 6;
+const HOME_NEW_LIMIT = 5;
+const HOME_UP_NEXT_LIMIT = 4;
+const HOME_TOP_LIMIT = 5;
+const HOME_TOP_REFRESH_MS = 2 * 60 * 1000;
+const HOME_HISTORY_PAGE_MAX = 120;
+const HOME_ADDED_PAGE_MAX = 200;
 const SIDEBAR_MIN = 200;
 const SIDEBAR_MAX = 420;
 const SIDEBAR_COLLAPSED = 72;
@@ -337,7 +343,7 @@ const DEVICE_DRAWER_EXIT_MS = 280;
 const QUEUE_DRAWER_LIMIT = 100;
 const QUEUE_ROW_HEIGHT = 60;
 const QUEUE_VIRTUAL_OVERSCAN = 8;
-const QUEUE_SOURCE_KINDS = ["album", "playlist", "smart", "artist", "recents", "library", "songs", "mix"];
+const QUEUE_SOURCE_KINDS = ["album", "playlist", "smart", "artist", "recents", "library", "songs", "mix", "homeTop"];
 const SONGS_SORT_OPTIONS = [
   { id: "title", label: "Title" },
   { id: "artist", label: "Artist" },
@@ -501,6 +507,33 @@ let songsFilterTimer = 0;
 let songsResultIds = [];
 let sessionSaveFailed = false;
 
+// Home page state (pure model in home-model.js; persisted by the host in home.json).
+const HomeModel = window.EmpHomeModel || null;
+let homeDoc = HomeModel ? HomeModel.normalize(window.__emp?.home) : null;
+let homePinsEditing = false;
+let homeArtistIndex = null;
+let homeDerivedAlbums = { key: "", entries: [] };
+let homeAdditionsCache = { key: "", groups: [] };
+let homeSummaryCache = { key: "", stats: null };
+let homeTop = { month: "", tracks: [], coverageStartDate: null, receivedAt: 0 };
+let homeTopRequestId = 0;
+let homeTopStale = true;
+let homeRefreshTimer = 0;
+let homeDayTimer = 0;
+let homeRenderedCols = 0;
+let homeStatsVersion = 0;
+let libraryDateAddedBaseline = 0;
+let overflowPinTarget = null;
+let homeLastPlaying = null;
+let homeNowSignatureRendered = "";
+let libraryAlbumFolders = {};
+let libraryStatusTimer = 0;
+let libraryScanState = {
+  scanning: window.__emp?.libraryScan?.scanning === true,
+  failed: window.__emp?.libraryScan?.failed === true,
+  completedAt: Math.max(0, Number(window.__emp?.libraryScan?.completedAt) || 0)
+};
+
 // Local listening statistics (durable store owned by the C# host).
 const LISTEN_STATS_TICK_MS = 400;
 const LISTEN_STATS_POST_MS = 2000;
@@ -519,6 +552,8 @@ function createListenSessionToken() {
 function createListenOccurrence(trackId, durationSec) {
   return {
     trackId,
+    // Where the play came from, captured now so later queue changes cannot re-attribute it.
+    source: listenSourceForTrack(trackId),
     listenMs: 0,
     sentListenMs: 0,
     dayListenMs: {},
@@ -551,6 +586,7 @@ function maybeQualifyListen(occ) {
     occ.playCounted = true;
     occ.lastPlayedAt = Date.now();
     bumpListenStatsLocal(occ.trackId, occ.lastPlayedAt);
+    noteHomeQualifiedPlay(occ.source, occ.lastPlayedAt);
   }
 }
 
@@ -623,6 +659,8 @@ function applyListenStats(detail) {
   state.listenStats = next;
   listenStatsLoaded = true;
   listenStatsStale = false;
+  homeStatsVersion += 1;
+  scheduleHomeRefresh({ immediate: true });
   if (state.view === "songs") {
     refreshSongsResults({ preserveScroll: true });
   }
@@ -715,6 +753,7 @@ function setPersonalizedMixes(enabled) {
   if (state.settingsOpen || state.view === "settings") {
     const toggle = settingsRoot().querySelector('[data-setting="personalizedMixes"]');
     toggle?.setAttribute("aria-checked", next ? "true" : "false");
+    rerenderHomeSettings('[data-setting="personalizedMixes"]');
   }
   if (!next) {
     if (state.view === "mix" || state.view === "mixes") {
@@ -785,21 +824,6 @@ function mixesShelfSection(mixes) {
       <div class="shelf-row">${shown.map(mixCard).join("")}</div>
     </section>
   `;
-}
-
-function albumsForHomeShelf(recentItems) {
-  const recentAlbumIds = new Set();
-  for (const item of recentItems) {
-    if (item?.kind === "album" && item.album?.id) {
-      recentAlbumIds.add(item.album.id);
-    }
-  }
-  const ranked = albumsByRecency(state.library.albums);
-  if (ranked.length <= recentAlbumIds.size + 2) {
-    return ranked;
-  }
-  const preferred = ranked.filter((album) => !recentAlbumIds.has(album.id));
-  return preferred.length >= Math.min(4, ranked.length) ? preferred : ranked;
 }
 
 function playMix(mixId, startId) {
@@ -2327,6 +2351,7 @@ function startRemoteClock() {
       const duration = playbackDuration() || 1;
       const position = Math.min(playbackPosition(), duration);
       elapsedEl.textContent = formatTime(position);
+      syncHomeResumeProgress();
       seekBar.value = String(Math.round((position / duration) * 1000));
       updateSlider(seekBar);
       syncLyricsPosition();
@@ -2590,6 +2615,8 @@ function queueSourceLabel(source) {
       return "All tracks";
     case "mix":
       return mixById(source.id)?.title ?? "";
+    case "homeTop":
+      return "Most played this month";
     default:
       return "";
   }
@@ -3298,27 +3325,6 @@ function recentPlaylists(limit = MAX_RECENTS) {
     .slice(0, limit);
 }
 
-function recentHomeItems(limit = MAX_RECENTS) {
-  const items = [];
-  for (const entry of state.recentHome) {
-    if (items.length >= limit) {
-      break;
-    }
-    if (entry.kind === "album") {
-      const album = albumById(entry.id);
-      if (album) {
-        items.push({ kind: "album", album });
-      }
-    } else if (entry.kind === "playlist") {
-      const playlist = playlistById(entry.id);
-      if (playlist && !isLikedPlaylist(playlist)) {
-        items.push({ kind: "playlist", playlist });
-      }
-    }
-  }
-  return items;
-}
-
 function playlistsForMenu(query) {
   const needle = String(query ?? "").trim().toLowerCase();
   const rank = new Map(state.recentPlaylistIds.map((id, index) => [id, index]));
@@ -3352,38 +3358,6 @@ function albumsByRecency(list) {
 
     return compareText(left.title, right.title);
   });
-}
-
-/** Newest first by EMP first-seen date (max track dateAdded on the album). */
-function albumDateAdded(album) {
-  if (!album?.trackIds?.length) {
-    return 0;
-  }
-  let newest = 0;
-  for (const id of album.trackIds) {
-    const added = Number(trackById(id)?.dateAdded) || 0;
-    if (added > newest) {
-      newest = added;
-    }
-  }
-  return newest;
-}
-
-function albumsByDateAdded(list = allAlbums()) {
-  return [...list]
-    .map((album) => ({ album, dateAdded: albumDateAdded(album) }))
-    .filter((entry) => entry.dateAdded > 0)
-    .sort((left, right) => {
-      if (left.dateAdded !== right.dateAdded) {
-        return right.dateAdded - left.dateAdded;
-      }
-      const title = compareText(left.album.title, right.album.title);
-      if (title !== 0) {
-        return title;
-      }
-      return compareText(left.album.artist, right.album.artist);
-    })
-    .map((entry) => entry.album);
 }
 
 function sortAlbums(list) {
@@ -5556,6 +5530,9 @@ function navigate(entry, { push = true } = {}) {
 
 function render(entry) {
   renderSeq += 1;
+  if (entry.view !== state.view) {
+    homePinsEditing = false;
+  }
   const prevAmbient = state.view === "nowPlaying" || state.view === "lyrics";
   const nextAmbient = entry.view === "nowPlaying" || entry.view === "lyrics";
   if (prevAmbient && !nextAmbient) {
@@ -5611,7 +5588,11 @@ function render(entry) {
   syncRecentsChips();
   syncSidebarSortUi();
 
-  topSearch.classList.toggle("d-none", entry.view !== "search");
+  topSearch.classList.toggle("d-none", entry.view !== "search" && entry.view !== "home");
+  syncTopHomeActions(entry.view);
+  if (entry.view === "home" && document.activeElement !== searchInput) {
+    searchInput.value = "";
+  }
   if (entry.view === "search") {
     searchInput.value = state.query;
     if (focusSearchOnRender) {
@@ -5644,6 +5625,12 @@ function render(entry) {
   } else if (entry.view === "playlists") {
     applyNavStageAccent("#2a1a3a");
     renderPlaylistsLibrary();
+  } else if (entry.view === "history") {
+    applyNavStageAccent("#1f2433");
+    renderListeningHistory();
+  } else if (entry.view === "added") {
+    applyNavStageAccent("#1f2a24");
+    renderLibraryAdditions();
   } else if (entry.view === "album") {
     renderAlbum(entry.albumId);
   } else if (entry.view === "playlist") {
@@ -6004,100 +5991,1129 @@ function renderPlaylistsLibrary() {
   `;
 }
 
-function quickCard(album) {
-  const playing = isSidebarAlbumPlaying(album.id);
-  return `
-    <div class="quick-card-wrap${playing ? " is-playing" : ""}">
-      <button class="quick-card" type="button" data-open-album="${album.id}">
-        <span class="quick-cover-wrap">
-          ${coverMarkup(album, "playlist-cover")}
-        </span>
-        ${playing ? nowEqMarkup("now-eq quick-eq") : ""}
-        <span class="quick-title">${escapeHtml(album.title)}</span>
-      </button>
-      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" data-play-album="${album.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(album.title)}">
-        <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
-      </button>
-    </div>
-  `;
+// ---------------------------------------------------------------------------
+// Home — pins, listening history, mixes, additions, monthly ranking, footer.
+// Model + persistence: home-model.js (pure) and HomeStore.cs (home.json).
+// ---------------------------------------------------------------------------
+
+const HOME_KIND_LABELS = Object.freeze({ album: "Album", playlist: "Playlist", artist: "Artist", mix: "Mix" });
+const HOME_SECTION_HINTS = Object.freeze({
+  continue: "Resume where you left off and see what's up next.",
+  pinned: "Albums, artists, playlists, and mixes you pin.",
+  jumpBackIn: "Music you've played recently.",
+  mixes: "Mixes made from your library and listening.",
+  newInLibrary: "Music added after EMP began tracking your library.",
+  mostPlayed: "Your top tracks this calendar month."
+});
+
+function homeReady() {
+  return Boolean(HomeModel && homeDoc);
 }
 
-function quickPlaylistCard(playlist) {
-  const playing = isSidebarPlaylistPlaying(playlist.id);
-  return `
-    <div class="quick-card-wrap${playing ? " is-playing" : ""}">
-      <button class="quick-card" type="button" data-open-playlist="${playlist.id}">
-        <span class="quick-cover-wrap">
-          ${playlistCoverMarkup(playlist, "playlist-cover")}
-        </span>
-        ${playing ? nowEqMarkup("now-eq quick-eq") : ""}
-        <span class="quick-title">${escapeHtml(playlist.name)}</span>
-      </button>
-      <button class="play-fab quick-play-fab${playing ? " is-playing" : ""}" type="button" data-play-playlist="${playlist.id}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${escapeHtml(playlist.name)}">
-        <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}"></i>
-      </button>
-    </div>
-  `;
-}
-
-function homeQuickItems() {
-  const items = [];
-  const seenAlbums = new Set();
-  const seenPlaylists = new Set();
-  const liked = likedPlaylistWithSongs();
-  if (liked) {
-    items.push({ kind: "playlist", playlist: liked });
-    seenPlaylists.add(liked.id);
+/** Sends the Home document to the host, which debounces the write to home.json. */
+function commitHome() {
+  if (!homeReady()) {
+    return;
   }
+  try {
+    window.chrome?.webview?.postMessage({ type: "homeSave", home: homeDoc });
+  } catch (error) {
+    console.error("EMP could not save Home preferences.", error);
+  }
+}
 
-  for (const item of recentHomeItems(MAX_RECENTS)) {
-    if (items.length >= HOME_QUICK_SIZE) {
+function seedHomePins() {
+  if (homeReady() && HomeModel.seedDefaultPins(homeDoc, { likedAvailable: Boolean(likedPlaylistWithSongs()) })) {
+    commitHome();
+  }
+}
+
+function announceHome(message) {
+  let region = document.getElementById("homeLiveRegion");
+  if (!region) {
+    region = document.createElement("div");
+    region.id = "homeLiveRegion";
+    region.className = "visually-hidden";
+    region.setAttribute("role", "status");
+    region.setAttribute("aria-live", "polite");
+    document.body.appendChild(region);
+  }
+  region.textContent = "";
+  window.setTimeout(() => {
+    region.textContent = message;
+  }, 30);
+}
+
+function showHomeToast(title, message, icon = "bi-pin-angle-fill") {
+  const host = ensureSonoraToastHost();
+  host.querySelectorAll(".meta-toast--home").forEach((toast) => toast.remove());
+  const toast = document.createElement("div");
+  toast.className = "meta-toast meta-toast--home";
+  toast.setAttribute("role", "status");
+  toast.innerHTML = `
+    <i class="bi ${icon}" aria-hidden="true"></i>
+    <div class="meta-toast-body">
+      <div class="meta-toast-title">${escapeHtml(title)}</div>
+      ${message ? `<div class="meta-toast-msg">${escapeHtml(message)}</div>` : ""}
+    </div>`;
+  host.appendChild(toast);
+  window.setTimeout(() => toast.remove(), 3600);
+}
+
+function homeArtistByName(name) {
+  if (!homeArtistIndex) {
+    homeArtistIndex = new Map(catalogArtists().map((artist) => [String(artist.name ?? "").toLowerCase(), artist]));
+  }
+  return homeArtistIndex.get(String(name ?? "").toLowerCase()) || null;
+}
+
+function isHomeArtistPlaying(name) {
+  return state.queueSource?.kind === "artist"
+    && String(state.queueSource.id ?? "").toLowerCase() === String(name ?? "").toLowerCase()
+    && Boolean(currentTrack())
+    && state.playing;
+}
+
+function isHomeTargetPlaying(target) {
+  switch (target?.kind) {
+    case "album":
+      return isSidebarAlbumPlaying(target.id);
+    case "playlist":
+      return isSidebarPlaylistPlaying(target.id);
+    case "mix":
+      return isMixQueuePlaying(target.id);
+    case "artist":
+      return isHomeArtistPlaying(target.id);
+    default:
+      return false;
+  }
+}
+
+function homeTargetFromOpener(element) {
+  const data = element?.dataset;
+  if (!data) {
+    return null;
+  }
+  if (data.openAlbum) {
+    return { kind: "album", id: data.openAlbum };
+  }
+  if (data.openPlaylist) {
+    return { kind: "playlist", id: data.openPlaylist };
+  }
+  if (data.openMix) {
+    return { kind: "mix", id: data.openMix };
+  }
+  if (data.openArtist) {
+    return { kind: "artist", id: data.openArtist };
+  }
+  return null;
+}
+
+/** Resolves a pin or history entry against the live library; null when unavailable. */
+/** Resolves a pin or history entry against the live library; null when unavailable. */
+function resolveHomeItem(item) {
+  if (!item) {
+    return null;
+  }
+  const withSub = (resolved) => ({
+    ...resolved,
+    sub: resolved.meta ? `${resolved.typeLabel} · ${resolved.meta}` : resolved.typeLabel
+  });
+  if (item.kind === "album") {
+    const album = albumById(item.id);
+    if (!album) {
+      return null;
+    }
+    const id = escapeHtml(album.id);
+    return withSub({
+      kind: "album",
+      id: album.id,
+      title: album.title,
+      typeLabel: album.isSingle ? "Single" : "Album",
+      meta: album.artist || "",
+      cover: (className) => coverMarkup(album, className),
+      openAttr: `data-open-album="${id}"`,
+      playAttr: `data-play-album="${id}"`,
+      playable: Boolean(album.trackIds?.length)
+    });
+  }
+  if (item.kind === "playlist") {
+    const playlist = playlistById(item.id);
+    if (!playlist) {
+      return null;
+    }
+    const id = escapeHtml(playlist.id);
+    const count = playlistTracks(playlist).length;
+    return withSub({
+      kind: "playlist",
+      id: playlist.id,
+      title: playlist.name,
+      typeLabel: playlistKindLabel(playlist),
+      meta: songLabel(count),
+      cover: (className) => playlistCoverMarkup(playlist, className),
+      openAttr: `data-open-playlist="${id}"`,
+      playAttr: `data-play-playlist="${id}"`,
+      playable: count > 0
+    });
+  }
+  if (item.kind === "artist") {
+    const artist = homeArtistByName(item.id);
+    if (!artist?.name) {
+      return null;
+    }
+    const name = escapeHtml(artist.name);
+    const releases = artist.albums || [];
+    const albums = releases.filter((album) => !album.isSingle).length;
+    const meta = albums
+      ? `${albums} ${albums === 1 ? "album" : "albums"}`
+      : `${releases.length} ${releases.length === 1 ? "single" : "singles"}`;
+    return withSub({
+      kind: "artist",
+      id: artist.name,
+      title: artist.name,
+      typeLabel: "Artist",
+      meta: releases.length ? meta : "",
+      cover: (className) => coverMarkup(artist, className),
+      openAttr: `data-open-artist="${name}"`,
+      playAttr: `data-play-artist="${name}"`,
+      playable: true,
+      round: true
+    });
+  }
+  if (item.kind === "mix") {
+    if (state.personalizedMixes === false) {
+      return null;
+    }
+    const mix = mixById(item.id);
+    if (!mix) {
+      return null;
+    }
+    const id = escapeHtml(mix.id);
+    return withSub({
+      kind: "mix",
+      id: mix.id,
+      title: mix.title,
+      typeLabel: "Mix",
+      meta: "",
+      cover: (className) => mixCoverMarkup(mix, className),
+      openAttr: `data-open-mix="${id}"`,
+      playAttr: `data-play-mix="${id}"`,
+      playable: mixTracks(mix).length > 0
+    });
+  }
+  return null;
+}
+
+function homePlayFabMarkup(item, playing, className) {
+  if (!item.playable) {
+    return "";
+  }
+  const label = `${playing ? "Pause" : "Play"} ${escapeHtml(item.title)}`;
+  return `
+    <button class="${className}${playing ? " is-playing" : ""}" type="button" ${item.playAttr} title="${playing ? "Pause" : "Play"}" aria-label="${label}">
+      <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}" aria-hidden="true"></i>
+    </button>`;
+}
+
+// --- Pinned ---------------------------------------------------------------
+
+function homePinTile(pin) {
+  const item = resolveHomeItem(pin);
+  if (!item) {
+    return "";
+  }
+  const playing = isHomeTargetPlaying(item);
+  return `
+    <div class="quick-card-wrap home-pin${playing ? " is-playing" : ""}${item.round ? " is-round" : ""}" role="listitem">
+      <button class="quick-card" type="button" ${item.openAttr}>
+        <span class="quick-cover-wrap">${item.cover("playlist-cover")}</span>
+        ${playing ? nowEqMarkup("now-eq quick-eq") : ""}
+        <span class="home-pin-text">
+          <span class="quick-title">${escapeHtml(item.title)}</span>
+          <span class="home-pin-type">${escapeHtml(item.sub)}</span>
+        </span>
+      </button>
+      ${homePlayFabMarkup(item, playing, "play-fab quick-play-fab")}
+    </div>`;
+}
+
+function homePinEditTile(pin, index, count) {
+  const item = resolveHomeItem(pin);
+  const key = escapeHtml(HomeModel.pinKey(pin));
+  const kindLabel = HOME_KIND_LABELS[pin.kind] || "Item";
+  const name = item ? item.title : (pin.label || `${kindLabel} not found`);
+  const sub = item ? item.typeLabel : `${kindLabel} • Unavailable`;
+  const label = escapeHtml(name);
+  return `
+    <div class="home-pin home-pin--editing${item ? "" : " is-unavailable"}${item?.round ? " is-round" : ""}" role="listitem">
+      <span class="quick-cover-wrap" aria-hidden="true">
+        ${item ? item.cover("playlist-cover") : `<span class="home-pin-missing"><i class="bi bi-slash-circle"></i></span>`}
+      </span>
+      <span class="home-pin-text">
+        <span class="quick-title">${label}</span>
+        <span class="home-pin-type">${escapeHtml(sub)}</span>
+      </span>
+      <span class="home-pin-tools">
+        <button class="home-pin-tool" type="button" data-home-action="pin-move" data-pin-key="${key}" data-delta="-1" aria-label="Move ${label} earlier" title="Move earlier"${index === 0 ? " disabled" : ""}>
+          <i class="bi bi-chevron-left" aria-hidden="true"></i>
+        </button>
+        <button class="home-pin-tool" type="button" data-home-action="pin-move" data-pin-key="${key}" data-delta="1" aria-label="Move ${label} later" title="Move later"${index === count - 1 ? " disabled" : ""}>
+          <i class="bi bi-chevron-right" aria-hidden="true"></i>
+        </button>
+        <button class="home-pin-tool home-pin-remove" type="button" data-home-action="pin-remove" data-pin-key="${key}" aria-label="Unpin ${label}" title="Unpin">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </span>
+    </div>`;
+}
+
+function homePinsStatusText() {
+  const count = homeDoc.pins.length;
+  const max = HomeModel.MAX_PINS;
+  const unavailable = homeDoc.pins.filter((pin) => !resolveHomeItem(pin)).length;
+  let text = count >= max
+    ? `${count} of ${max} pinned. You've reached the limit, so unpin something to make room.`
+    : `${count} of ${max} pinned. Add more with Pin to Home on an album, artist, playlist, or mix.`;
+  if (unavailable) {
+    text += ` ${unavailable === 1 ? "1 unavailable item stays" : `${unavailable} unavailable items stay`} until you remove it.`;
+  }
+  return text;
+}
+
+function homePinnedSection() {
+  const pins = homeDoc.pins;
+  const editing = homePinsEditing;
+  const toggle = pins.length || editing
+    ? `<button class="see-all home-pins-toggle" type="button" data-home-action="${editing ? "pins-done" : "pins-edit"}" aria-expanded="${editing ? "true" : "false"}">${editing ? "Done" : "Edit pins"}</button>`
+    : "";
+  let body;
+  if (editing) {
+    body = `
+      <p class="home-quiet home-pins-status">${escapeHtml(homePinsStatusText())}</p>
+      ${pins.length
+        ? `<div class="quick-grid home-pins home-pins--editing" role="list" aria-label="Pinned items">${pins.map((pin, index) => homePinEditTile(pin, index, pins.length)).join("")}</div>`
+        : ""}`;
+  } else {
+    const tiles = pins.map(homePinTile).filter(Boolean);
+    if (tiles.length) {
+      body = `<div class="quick-grid home-pins" role="list" aria-label="Pinned items">${tiles.join("")}</div>`;
+    } else if (pins.length) {
+      body = `<p class="home-quiet">Your pinned items aren't available right now.</p>`;
+    } else {
+      body = `<p class="home-quiet">Pin albums, artists, playlists, and mixes here for quick access. Look for Pin to Home on their pages.</p>`;
+    }
+  }
+  return `
+    <section class="home-section home-pinned" aria-labelledby="homePinnedTitle">
+      <div class="section-head">
+        <h2 id="homePinnedTitle">Pinned</h2>
+        ${toggle}
+      </div>
+      ${body}
+    </section>`;
+}
+
+// --- Jump back in / Listening history -----------------------------------------
+
+/** Album times derived from per-track lastPlayedAt (qualified plays); cached per stats version. */
+function homeDerivedAlbumHistory() {
+  const key = `${homeStatsVersion}|${libraryContentFingerprint}|${state.library.tracks.length}`;
+  if (homeDerivedAlbums.key === key) {
+    return homeDerivedAlbums.entries;
+  }
+  const byAlbum = new Map();
+  for (const [trackId, stats] of Object.entries(state.listenStats || {})) {
+    const at = Number(stats?.lastPlayedAt) || 0;
+    if (at <= 0) {
+      continue;
+    }
+    const albumId = trackById(trackId)?.albumId;
+    if (albumId && at > (byAlbum.get(albumId) || 0)) {
+      byAlbum.set(albumId, at);
+    }
+  }
+  homeDerivedAlbums = { key, entries: [...byAlbum].map(([id, at]) => ({ id, at })) };
+  return homeDerivedAlbums.entries;
+}
+
+function homeHistoryEntries() {
+  return homeReady() ? HomeModel.mergeHistory(homeDoc.history, homeDerivedAlbumHistory()) : [];
+}
+
+function homeHistoryCard(row, now) {
+  const { item, entry } = row;
+  const playing = isHomeTargetPlaying(item);
+  const title = escapeHtml(item.title);
+  const when = HomeModel.relativeDay(entry.at, now);
+  const coverClass = item.round ? "media-cover artist-cover" : "media-cover";
+  return `
+    <article class="media-card home-history-card${playing ? " is-playing" : ""}${item.round ? " is-round" : ""}">
+      <div class="media-cover-wrap">
+        <button class="media-card-open media-card-open--cover" type="button" ${item.openAttr} aria-label="Open ${title}">
+          ${item.cover(coverClass)}
+        </button>
+        ${homePlayFabMarkup(item, playing, "play-fab")}
+      </div>
+      <button class="media-card-open media-card-open--meta" type="button" ${item.openAttr}>
+        <span class="media-title">${title}</span>
+      </button>
+      <div class="media-sub">${escapeHtml(item.sub)}</div>
+      <div class="media-sub home-card-when"><time datetime="${new Date(entry.at).toISOString()}">${escapeHtml(when)}</time></div>
+    </article>`;
+}
+
+function homeJumpBackInSection(cols) {
+  const rows = HomeModel.pickJumpBackIn(homeHistoryEntries(), {
+    limit: Math.max(2, cols),
+    isPinned: (entry) => HomeModel.isPinned(homeDoc, entry),
+    resolve: resolveHomeItem
+  });
+  if (!rows.length) {
+    return "";
+  }
+  const now = Date.now();
+  return `
+    <section class="home-section home-jump" aria-labelledby="homeJumpTitle">
+      <div class="section-head">
+        <h2 id="homeJumpTitle">Jump back in</h2>
+        <button class="see-all" type="button" data-nav="history">History</button>
+      </div>
+      <div class="shelf-row">${rows.map((row) => homeHistoryCard(row, now)).join("")}</div>
+    </section>`;
+}
+
+function renderListeningHistory() {
+  homeArtistIndex = null;
+  const now = Date.now();
+  const rows = [];
+  for (const entry of homeHistoryEntries()) {
+    if (rows.length >= HOME_HISTORY_PAGE_MAX) {
       break;
     }
-    if (item.kind === "album") {
-      if (seenAlbums.has(item.album.id)) {
-        continue;
-      }
-      items.push(item);
-      seenAlbums.add(item.album.id);
-    } else if (item.kind === "playlist") {
-      if (seenPlaylists.has(item.playlist.id)) {
-        continue;
-      }
-      items.push(item);
-      seenPlaylists.add(item.playlist.id);
+    const item = resolveHomeItem(entry);
+    if (item) {
+      rows.push({ entry, item });
     }
   }
+  const body = rows.length
+    ? `<div class="card-grid history-grid">${rows.map((row) => homeHistoryCard(row, now)).join("")}</div>`
+    : `<p class="home-quiet history-empty">Albums, artists, playlists, and mixes you play will appear here.</p>`;
+  viewArea.innerHTML = `
+    <div class="history-page">
+      <h1 class="greeting">Listening history</h1>
+      <p class="collection-stat">Most recent first. A play counts once you've listened past the usual play threshold.</p>
+      ${body}
+    </div>`;
+}
 
-  if (items.length < HOME_QUICK_SIZE) {
-    for (const album of albumsByRecency(allAlbums())) {
-      if (items.length >= HOME_QUICK_SIZE) {
-        break;
-      }
-      if (seenAlbums.has(album.id)) {
-        continue;
-      }
-      items.push({ kind: "album", album });
-      seenAlbums.add(album.id);
+// --- New in your library -----------------------------------------------------
+
+function homeAdditionGroups(limit) {
+  const now = Date.now();
+  const key = `${libraryContentFingerprint}|${state.library.tracks.length}|${libraryDateAddedBaseline}|${HomeModel.localDayKey(now)}|${limit}`;
+  if (homeAdditionsCache.key === key) {
+    return homeAdditionsCache.groups;
+  }
+  const groups = HomeModel.groupNewAdditions(allAlbums(), {
+    dateAddedOf: (id) => trackById(id)?.dateAdded,
+    baselineAt: libraryDateAddedBaseline,
+    now,
+    limit
+  });
+  homeAdditionsCache = { key, groups };
+  return groups;
+}
+
+function trackCountLabel(count) {
+  return `${count} ${count === 1 ? "track" : "tracks"}`;
+}
+
+function homeAdditionRow(entry) {
+  const album = entry.album;
+  const playing = isSidebarAlbumPlaying(album.id);
+  const title = escapeHtml(album.title);
+  const detail = entry.kind === "updated"
+    ? `+${entry.newTrackCount} new · ${trackCountLabel(entry.trackCount)}`
+    : trackCountLabel(entry.trackCount);
+  return `
+    <li class="home-list-row home-list-row--lg${playing ? " is-playing" : ""}" data-album-id="${escapeHtml(album.id)}">
+      <button class="home-list-main" type="button" data-open-album="${escapeHtml(album.id)}">
+        <span class="home-list-art">${coverMarkup(album, "home-list-cover")}</span>
+        <span class="home-list-text">
+          <span class="home-list-title">${title}</span>
+          <span class="home-list-sub">${escapeHtml(album.artist || "")}</span>
+        </span>
+      </button>
+      <span class="home-list-meta">${escapeHtml(detail)}</span>
+      <button class="home-list-play" type="button" data-play-album="${escapeHtml(album.id)}" title="${playing ? "Pause" : "Play"}" aria-label="${playing ? "Pause" : "Play"} ${title}">
+        <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}" aria-hidden="true"></i>
+      </button>
+    </li>`;
+}
+
+/** "3 albums", "2 singles" or "4 releases" for a group of additions. */
+function homeReleaseCountLabel(entries) {
+  const singles = entries.filter((entry) => entry.album?.isSingle).length;
+  const count = entries.length;
+  if (singles === count) {
+    return `${count} ${count === 1 ? "single" : "singles"}`;
+  }
+  if (singles === 0) {
+    return `${count} ${count === 1 ? "album" : "albums"}`;
+  }
+  return `${count} releases`;
+}
+
+function homeAdditionGroupsMarkup(groups, headingLevel = "h3") {
+  return groups.map((group) => {
+    const folders = new Set(group.entries.map((entry) => libraryAlbumFolders[entry.album.id] || ""));
+    const folder = folders.size === 1 ? [...folders][0] : "";
+    const parts = [group.label, homeReleaseCountLabel(group.entries), folder].filter(Boolean);
+    return `
+      <div class="home-list-group">
+        <${headingLevel} class="home-list-heading">${parts.map((part) => `<span>${escapeHtml(part)}</span>`).join("")}</${headingLevel}>
+        <ul class="home-list">${group.entries.map(homeAdditionRow).join("")}</ul>
+      </div>`;
+  }).join("");
+}
+
+function homeNewInLibrarySection() {
+  const groups = homeAdditionGroups(HOME_NEW_LIMIT);
+  if (!groups.length) {
+    return "";
+  }
+  return `
+    <section class="home-section home-panel home-new" aria-labelledby="homeNewTitle">
+      <div class="home-panel-head">
+        <h2 id="homeNewTitle">New in your library</h2>
+        <button class="see-all" type="button" data-nav="added">See all</button>
+      </div>
+      ${homeAdditionGroupsMarkup(groups)}
+    </section>`;
+}
+
+function renderLibraryAdditions() {
+  const groups = homeReady() ? homeAdditionGroups(HOME_ADDED_PAGE_MAX) : [];
+  const body = groups.length
+    ? `<div class="additions-list">${homeAdditionGroupsMarkup(groups, "h2")}</div>`
+    : `<p class="home-quiet">Music you add after EMP began tracking your library will appear here. Your original library isn't listed as new.</p>`;
+  viewArea.innerHTML = `
+    <div class="additions-page home-page-list">
+      <h1 class="greeting">New in your library</h1>
+      ${groups.total ? `<p class="collection-stat">${groups.total} ${groups.total === 1 ? "release" : "releases"} added or updated</p>` : ""}
+      ${body}
+    </div>`;
+}
+
+// --- Most played this month --------------------------------------------------
+
+function homeTopRows() {
+  if (!homeReady() || homeTop.month !== HomeModel.monthKey(Date.now())) {
+    return [];
+  }
+  return homeTop.tracks
+    .map((row) => ({ track: trackById(row.trackId), plays: row.playCount }))
+    .filter((row) => row.track && row.plays > 0)
+    .slice(0, HOME_TOP_LIMIT);
+}
+
+function homeCoverageNote() {
+  if (!homeTop.coverageStartDate) {
+    return "";
+  }
+  const [year, month, day] = homeTop.coverageStartDate.split("-").map(Number);
+  const date = new Date(year, (month || 1) - 1, day || 1);
+  const label = date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return `<p class="home-panel-note">Since ${escapeHtml(label)}, when EMP began recording daily listening.</p>`;
+}
+
+function homeMostPlayedSection() {
+  const rows = homeTopRows();
+  if (!rows.length) {
+    return "";
+  }
+  const currentId = currentTrack()?.id;
+  return `
+    <section class="home-section home-panel home-top" aria-labelledby="homeTopTitle">
+      <div class="home-panel-head">
+        <h2 id="homeTopTitle">Most played this month</h2>
+        <button class="home-pill-btn home-pill-btn--sm" type="button" data-home-action="top-play-all">Play these</button>
+      </div>
+      ${homeCoverageNote()}
+      <ol class="home-list home-rank-list">
+        ${rows.map((row, index) => {
+          const title = escapeHtml(row.track.title);
+          const artist = escapeHtml(row.track.artist || "");
+          const album = albumById(row.track.albumId);
+          const plays = `${row.plays} ${row.plays === 1 ? "play" : "plays"}`;
+          return `
+            <li class="home-list-row home-list-row--lg home-rank-row${row.track.id === currentId ? " is-current" : ""}" data-track-id="${escapeHtml(row.track.id)}">
+              <span class="home-rank" aria-hidden="true">${index + 1}</span>
+              <button class="home-list-main" type="button" data-home-action="top-play" data-track-id="${escapeHtml(row.track.id)}" aria-label="Play ${title} by ${artist}, number ${index + 1}, ${plays}">
+                <span class="home-list-art">${coverMarkup(album || { title: row.track.album, color: "#282828" }, "home-list-cover")}</span>
+                <span class="home-list-text">
+                  <span class="home-list-title">${title}</span>
+                  <span class="home-list-sub">${artist}</span>
+                </span>
+              </button>
+              <span class="home-list-meta">${plays}</span>
+            </li>`;
+        }).join("")}
+      </ol>
+    </section>`;
+}
+
+function homeTopQueueIds() {
+  return homeTopRows().map((row) => row.track.id);
+}
+
+function playHomeTop(startId) {
+  const ids = homeTopQueueIds();
+  if (!ids.length) {
+    return;
+  }
+  if (!startId && queueMatchesIds(ids) && currentTrack() && state.queueSource?.kind === "homeTop") {
+    togglePlay();
+    return;
+  }
+  playTrack(startId && ids.includes(startId) ? startId : ids[0], ids, { source: { kind: "homeTop" } });
+}
+
+/** Requests the calendar-month ranking; responses for older requests or months are ignored. */
+function ensureHomeTopTracks({ force = false } = {}) {
+  if (!homeReady() || !HomeModel.sectionVisible(homeDoc, "mostPlayed")) {
+    return;
+  }
+  const month = HomeModel.monthKey(Date.now());
+  const fresh = homeTop.month === month
+    && !homeTopStale
+    && Date.now() - homeTop.receivedAt < HOME_TOP_REFRESH_MS;
+  if ((fresh && !force) || !window.chrome?.webview?.postMessage) {
+    return;
+  }
+  homeTopRequestId += 1;
+  window.chrome.webview.postMessage({
+    type: "homeTopTracksRequest",
+    requestId: homeTopRequestId,
+    month,
+    limit: HOME_TOP_LIMIT
+  });
+}
+
+function applyHomeTopTracks(detail) {
+  if (!homeReady()) {
+    return;
+  }
+  const currentMonth = HomeModel.monthKey(Date.now());
+  if (!HomeModel.acceptTopTracksResponse(detail, { latestRequestId: homeTopRequestId, currentMonth })) {
+    return;
+  }
+  homeTop = {
+    month: detail.month,
+    tracks: detail.tracks
+      .filter((row) => row && typeof row.trackId === "string")
+      .map((row) => ({ trackId: row.trackId, playCount: Math.max(0, Number(row.playCount) || 0) })),
+    coverageStartDate: typeof detail.coverageStartDate === "string" ? detail.coverageStartDate : null,
+    receivedAt: Date.now()
+  };
+  homeTopStale = false;
+  // Only patch Home when it is the live view; otherwise the data waits for the next render.
+  if (state.view === "home") {
+    refreshHomeSection("mostPlayed");
+  }
+}
+
+// --- Playback hooks ----------------------------------------------------------
+
+/** Queue source for a listen, captured when it begins; null for tracks the user inserted. */
+function listenSourceForTrack(trackId) {
+  const current = currentQueueEntry();
+  const entry = current?.trackId === trackId
+    ? current
+    : (QueueModel?.upcomingEntries?.(state)?.[0]?.trackId === trackId ? QueueModel.upcomingEntries(state)[0] : null);
+  if (entry?.origin === "user") {
+    return null;
+  }
+  const source = normalizeQueueSource(state.queueSource);
+  return source && typeof source.id === "string" ? source : null;
+}
+
+function noteHomeQualifiedPlay(source, at) {
+  homeStatsVersion += 1;
+  homeTopStale = true;
+  if (homeReady() && HomeModel.recordPlay(homeDoc, source, at)) {
+    commitHome();
+  }
+  scheduleHomeRefresh({ topTracks: true });
+}
+
+function scheduleHomeRefresh({ topTracks = false, immediate = false } = {}) {
+  if (topTracks) {
+    homeTopStale = true;
+  }
+  window.clearTimeout(homeRefreshTimer);
+  // Wait for the listen-stats post so the host ranking includes the new play.
+  homeRefreshTimer = window.setTimeout(() => {
+    homeRefreshTimer = 0;
+    if (state.view !== "home") {
+      return;
+    }
+    refreshHomeSection("jumpBackIn");
+    if (homeTopStale) {
+      ensureHomeTopTracks({ force: true });
+    }
+  }, immediate ? 0 : LISTEN_STATS_POST_MS + 1500);
+}
+
+/** Midnight refresh keeps relative dates honest and rolls the monthly ranking over. */
+function scheduleHomeDayRollover() {
+  window.clearTimeout(homeDayTimer);
+  const now = new Date();
+  const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5).getTime();
+  homeDayTimer = window.setTimeout(() => {
+    homeDayTimer = 0;
+    homeTopStale = true;
+    if (state.view === "home") {
+      refreshHomeSections();
+      ensureHomeTopTracks({ force: true });
+    }
+    scheduleHomeDayRollover();
+  }, Math.min(nextMidnight - now.getTime(), 24 * 60 * 60 * 1000));
+}
+
+// --- Footer -------------------------------------------------------------------
+
+function formatLibraryDuration(seconds) {
+  const totalMinutes = Math.round(Math.max(0, Number(seconds) || 0) / 60);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const plural = (value, one, many) => `${value} ${value === 1 ? one : many}`;
+  if (days > 0) {
+    return hours ? `${plural(days, "day", "days")}, ${plural(hours, "hr", "hrs")}` : plural(days, "day", "days");
+  }
+  if (hours > 0) {
+    return minutes ? `${plural(hours, "hr", "hrs")}, ${minutes} min` : plural(hours, "hr", "hrs");
+  }
+  return `${minutes} min`;
+}
+
+function homeLibrarySummary() {
+  const folders = musicFolders().length;
+  const key = `${libraryContentFingerprint}|${state.library.tracks.length}|${state.library.albums.length}|${state.library.singles.length}|${folders}`;
+  if (homeSummaryCache.key === key) {
+    return homeSummaryCache.stats;
+  }
+  let seconds = 0;
+  for (const track of state.library.tracks) {
+    seconds += Math.max(0, Number(track.duration) || 0);
+  }
+  const stats = {
+    tracks: state.library.tracks.length,
+    albums: state.library.albums.length,
+    singles: state.library.singles.length,
+    artists: catalogArtists().length,
+    seconds,
+    folders
+  };
+  homeSummaryCache = { key, stats };
+  return stats;
+}
+
+function homeFooterMarkup() {
+  const stats = homeLibrarySummary();
+  const count = (value, one, many) => `${value.toLocaleString()} ${value === 1 ? one : many}`;
+  const parts = [
+    count(stats.tracks, "track", "tracks"),
+    count(stats.albums, "album", "albums"),
+    stats.singles ? count(stats.singles, "single", "singles") : "",
+    count(stats.artists, "artist", "artists"),
+    stats.seconds > 0 ? `${formatLibraryDuration(stats.seconds)} of music` : "",
+    `Watching ${count(stats.folders, "folder", "folders")}`
+  ].filter(Boolean);
+  const canRescan = stats.folders > 0 && Boolean(window.chrome?.webview);
+  return `
+    <footer class="home-footer" aria-label="Library summary">
+      <p class="home-footer-stats">${parts.map((part) => `<span>${escapeHtml(part)}</span>`).join("")}</p>
+      <div class="home-footer-actions">
+        <button class="home-text-action" type="button" data-home-action="customize">Customize Home</button>
+        ${canRescan ? `<button class="home-text-action" type="button" data-home-action="rescan">Rescan library</button>` : ""}
+      </div>
+    </footer>`;
+}
+
+// --- Layout -------------------------------------------------------------------
+
+function homeSectionMarkup(id, cols) {
+  switch (id) {
+    case "continue":
+      return homeContinueSection();
+    case "pinned":
+      return homePinnedSection();
+    case "jumpBackIn":
+      return homeJumpBackInSection(cols);
+    case "mixes":
+      return state.personalizedMixes !== false ? mixesShelfSection(ensurePersonalizedMixes()) : "";
+    case "newInLibrary":
+      return homeNewInLibrarySection();
+    case "mostPlayed":
+      return homeMostPlayedSection();
+    default:
+      return "";
+  }
+}
+
+// --- Continue listening: resume card + Up next ----------------------------------
+
+function homeQueueSourceTag(source) {
+  switch (source?.kind) {
+    case "album":
+      return "Album";
+    case "playlist":
+    case "smart":
+      return "Playlist";
+    case "mix":
+      return "Mix";
+    case "artist":
+      return "Artist";
+    case "homeTop":
+      return "Top tracks";
+    case "songs":
+    case "library":
+      return "Library";
+    case "recents":
+      return "Recents";
+    default:
+      return "";
+  }
+}
+
+function homeResumeEyebrow(track) {
+  if (state.playing) {
+    return "Now playing";
+  }
+  const pausedAt = homeReady() ? HomeModel.pausedAtFor(homeDoc, track.id) : 0;
+  return pausedAt
+    ? `Pick up where you left off · Paused ${HomeModel.relativeTime(pausedAt, Date.now())}`
+    : "Pick up where you left off";
+}
+
+function homeResumeProgress(track) {
+  const duration = playbackDuration() || track?.duration || 0;
+  // While paused after a restart the live position is 0 until Sonora cues; use the restored point.
+  const raw = state.playing ? playbackPosition() : sessionPersistPosition();
+  const position = Math.max(0, Math.min(Number(raw) || 0, duration || Infinity));
+  return {
+    position,
+    duration,
+    percent: duration > 0 ? Math.min(100, (position / duration) * 100) : 0
+  };
+}
+
+function homeResumeCardMarkup(track) {
+  const album = albumById(track.albumId);
+  const playing = state.playing;
+  const progress = homeResumeProgress(track);
+  const title = escapeHtml(track.title);
+  const artist = escapeHtml(track.artist || "");
+  const albumTitle = escapeHtml(album?.title || track.album || "");
+  const metaParts = [];
+  if (artist) {
+    metaParts.push(`<button class="inline-link" type="button" data-open-artist="${artist}">${artist}</button>`);
+  }
+  if (album) {
+    metaParts.push(`from <button class="inline-link" type="button" data-open-album="${escapeHtml(album.id)}">${albumTitle}</button>`);
+  }
+  if (track.trackNumber > 0) {
+    metaParts.push(`track ${track.trackNumber}`);
+  }
+  const art = coverMarkup(album || { title: track.album, color: "#282828", coverUrl: track.coverUrl }, "home-resume-cover");
+  return `
+    <article class="home-resume${playing ? " is-playing" : ""}" aria-labelledby="homeResumeTitle">
+      ${album
+        ? `<button class="home-resume-art" type="button" data-open-album="${escapeHtml(album.id)}" aria-label="Open ${albumTitle}">${art}</button>`
+        : `<span class="home-resume-art">${art}</span>`}
+      <div class="home-resume-body">
+        <p class="home-eyebrow" data-home-resume-eyebrow>${escapeHtml(homeResumeEyebrow(track))}</p>
+        <h2 class="home-resume-title" id="homeResumeTitle">${title}</h2>
+        <p class="home-resume-meta">${metaParts.join(" · ")}</p>
+        <div class="home-resume-progress">
+          <span class="home-resume-time" data-home-resume-elapsed>${formatTime(progress.position)}</span>
+          <span class="home-resume-bar" aria-hidden="true"><span class="home-resume-fill" data-home-resume-fill style="width: ${progress.percent.toFixed(2)}%"></span></span>
+          <span class="home-resume-time" data-home-resume-duration>${formatTime(progress.duration)}</span>
+        </div>
+        <div class="home-resume-actions">
+          <button class="home-resume-primary" type="button" data-home-action="resume-toggle">
+            <i class="bi ${playing ? "bi-pause-fill" : "bi-play-fill"}" aria-hidden="true"></i>
+            <span>${playing ? "Pause" : "Resume"}</span>
+          </button>
+          ${album ? `<button class="home-pill-btn" type="button" data-home-action="resume-album-start" data-album-id="${escapeHtml(album.id)}">Play album from start</button>` : ""}
+        </div>
+      </div>
+    </article>`;
+}
+
+function homeUpNextMarkup() {
+  const entries = upcomingQueueEntries().slice(0, HOME_UP_NEXT_LIMIT);
+  const sourceTag = homeQueueSourceTag(state.queueSource);
+  const rows = entries.map((entry) => {
+    const track = trackById(entry.trackId);
+    if (!track) {
+      return "";
+    }
+    const album = albumById(track.albumId);
+    const title = escapeHtml(track.title);
+    const artist = escapeHtml(track.artist || "");
+    const tag = entry.origin === "user" ? "Queued" : sourceTag;
+    return `
+      <li class="home-list-row home-upnext-row">
+        <button class="home-list-main" type="button" data-home-action="upnext-play" data-track-id="${escapeHtml(track.id)}" data-entry-uid="${escapeHtml(entry.uid || "")}" aria-label="Play ${title} by ${artist}">
+          <span class="home-list-art">${coverMarkup(album || { title: track.album, color: "#282828" }, "home-list-cover")}</span>
+          <span class="home-list-text">
+            <span class="home-list-title">${title}</span>
+            <span class="home-list-sub">${artist}</span>
+          </span>
+        </button>
+        ${tag ? `<span class="home-upnext-tag">${escapeHtml(tag)}</span>` : ""}
+      </li>`;
+  }).filter(Boolean);
+  return `
+    <section class="home-panel home-upnext" aria-labelledby="homeUpNextTitle">
+      <div class="home-panel-head">
+        <h2 id="homeUpNextTitle">Up next</h2>
+        <button class="see-all" type="button" data-home-action="open-queue">Open queue</button>
+      </div>
+      ${rows.length
+        ? `<ol class="home-list">${rows.join("")}</ol>`
+        : `<p class="home-quiet">Nothing else is queued. Songs you add with Play next appear here.</p>`}
+    </section>`;
+}
+
+function homeContinueSection() {
+  const track = currentTrack();
+  if (!track) {
+    return "";
+  }
+  return `
+    <section class="home-section home-continue" aria-label="Continue listening">
+      <div class="home-continue-grid">
+        ${homeResumeCardMarkup(track)}
+        ${homeUpNextMarkup()}
+      </div>
+    </section>`;
+}
+
+function homeNowSignature() {
+  const track = currentTrack();
+  if (!track) {
+    return "none";
+  }
+  const upcoming = upcomingQueueEntries().slice(0, HOME_UP_NEXT_LIMIT).map((entry) => `${entry.uid}:${entry.trackId}:${entry.origin}`).join(",");
+  const pausedAt = homeReady() ? HomeModel.pausedAtFor(homeDoc, track.id) : 0;
+  return `${track.id}|${state.playing}|${state.queueSource?.kind}:${state.queueSource?.id}|${pausedAt}|${upcoming}`;
+}
+
+/** Records pause moments so the resume card can say when playback stopped. */
+function trackHomePause() {
+  const track = currentTrack();
+  if (homeLastPlaying === true && !state.playing && track && homeReady()
+    && HomeModel.setResumePoint(homeDoc, track.id, Date.now())) {
+    commitHome();
+  }
+  homeLastPlaying = Boolean(state.playing);
+}
+
+/** Re-renders Continue listening only when what it shows changed (track, play state, queue). */
+function syncHomeNowCards() {
+  trackHomePause();
+  if (state.view !== "home" || !homeReady() || !HomeModel.sectionVisible(homeDoc, "continue")) {
+    return;
+  }
+  const signature = homeNowSignature();
+  if (signature === homeNowSignatureRendered) {
+    return;
+  }
+  homeNowSignatureRendered = signature;
+  refreshHomeSection("continue");
+}
+
+/** Position ticks: move the resume bar and times without re-rendering. */
+function syncHomeResumeProgress() {
+  if (state.view !== "home") {
+    return;
+  }
+  const fill = viewArea.querySelector("[data-home-resume-fill]");
+  if (!fill) {
+    return;
+  }
+  const progress = homeResumeProgress(currentTrack());
+  fill.style.width = `${progress.percent.toFixed(2)}%`;
+  const elapsed = viewArea.querySelector("[data-home-resume-elapsed]");
+  const duration = viewArea.querySelector("[data-home-resume-duration]");
+  if (elapsed) {
+    elapsed.textContent = formatTime(progress.position);
+  }
+  if (duration) {
+    duration.textContent = formatTime(progress.duration);
+  }
+}
+
+// --- Top bar: library status + Shuffle library ----------------------------------
+
+function applyLibraryScanStatus(detail) {
+  libraryScanState = {
+    scanning: detail?.scanning === true,
+    failed: detail?.failed === true,
+    completedAt: Math.max(0, Number(detail?.completedAt) || 0)
+  };
+  syncLibraryStatus();
+}
+
+function syncLibraryStatus() {
+  const status = document.getElementById("libraryStatus");
+  const text = document.getElementById("libraryStatusText");
+  if (!status || !text) {
+    return;
+  }
+  let label = "";
+  let tone = "";
+  if (libraryScanState.scanning) {
+    label = "Scanning library…";
+    tone = "is-scanning";
+  } else if (libraryScanState.failed) {
+    label = "Last library scan didn't finish";
+    tone = "is-error";
+  } else if (libraryScanState.completedAt > 0) {
+    label = `Library up to date · scanned ${HomeModel ? HomeModel.relativeTime(libraryScanState.completedAt, Date.now()) : "recently"}`;
+    tone = "is-ok";
+  }
+  status.hidden = !label;
+  status.classList.remove("is-scanning", "is-error", "is-ok");
+  if (tone) {
+    status.classList.add(tone);
+  }
+  text.textContent = label;
+}
+
+function syncTopHomeActions(view = state.view) {
+  const actions = document.getElementById("topHomeActions");
+  if (!actions) {
+    return;
+  }
+  actions.hidden = view !== "home";
+  const shuffle = actions.querySelector("[data-shuffle-library]");
+  if (shuffle) {
+    shuffle.disabled = !state.library.tracks.length;
+  }
+  if (view === "home") {
+    syncLibraryStatus();
+    if (!libraryStatusTimer) {
+      libraryStatusTimer = window.setInterval(() => {
+        if (state.view === "home") {
+          syncLibraryStatus();
+          const eyebrow = viewArea.querySelector("[data-home-resume-eyebrow]");
+          const track = currentTrack();
+          if (eyebrow && track) {
+            eyebrow.textContent = homeResumeEyebrow(track);
+          }
+        }
+      }, 30 * 1000);
     }
   }
-
-  return items;
 }
 
-function renderQuickCard(item) {
-  if (item.kind === "playlist") {
-    return quickPlaylistCard(item.playlist);
+function focusTopSearch() {
+  if (state.view !== "home" && state.view !== "search") {
+    navigate({ view: "search", query: state.query });
   }
-  return quickCard(item.album);
+  searchInput.focus();
+  searchInput.select();
 }
 
-function shelfCard(item, subtitleMode) {
-  if (item?.kind === "playlist") {
-    return playlistCard(item.playlist);
+function homeSectionsMarkup(cols) {
+  homeArtistIndex = null;
+  const markup = {};
+  for (const section of homeDoc.sections) {
+    if (section.visible) {
+      markup[section.id] = homeSectionMarkup(section.id, cols);
+    }
   }
-  const album = item?.kind === "album" ? item.album : item;
-  return albumCard(album, { subtitleMode });
+  const blocks = HomeModel.layoutBlocks(homeDoc, (id) => Boolean(markup[id]));
+  return blocks.map((block) => {
+    if (block.type === "pair") {
+      return `
+        <div class="home-block home-pair">
+          ${block.ids.map((id) => `<div class="home-pair-cell" data-home-section="${id}">${markup[id]}</div>`).join("")}
+        </div>`;
+    }
+    const id = block.ids[0];
+    return `<div class="home-block" data-home-section="${id}">${markup[id]}</div>`;
+  }).join("");
+}
+
+function homeFocusSelector(element) {
+  if (!(element instanceof Element) || !viewArea.contains(element)) {
+    return "";
+  }
+  const attrs = ["data-home-action", "data-pin-key", "data-delta", "data-track-id", "data-open-album", "data-open-playlist",
+    "data-open-mix", "data-open-artist", "data-play-album", "data-play-playlist", "data-play-mix", "data-play-artist", "data-nav"];
+  const parts = attrs
+    .filter((name) => element.hasAttribute(name))
+    .map((name) => `[${name}="${CSS.escape(element.getAttribute(name) || "")}"]`);
+  return parts.length ? `${element.tagName.toLowerCase()}${parts.join("")}` : "";
+}
+
+function restoreHomeFocus(selector, fallbackSelector = "") {
+  if (!selector && !fallbackSelector) {
+    return;
+  }
+  const target = (selector && viewArea.querySelector(selector)) || (fallbackSelector && viewArea.querySelector(fallbackSelector));
+  if (target && !target.disabled) {
+    target.focus({ preventScroll: true });
+  } else if (target?.disabled) {
+    target.closest(".home-pin")?.querySelector(".home-pin-tool:not(:disabled)")?.focus({ preventScroll: true });
+  }
+}
+
+/** Re-renders the section stack only (greeting and footer stay mounted). */
+function refreshHomeSections({ focusSelector, fallbackSelector } = {}) {
+  if (state.view !== "home" || !homeReady()) {
+    return;
+  }
+  const container = viewArea.querySelector("[data-home-sections]");
+  if (!container) {
+    renderHome();
+    return;
+  }
+  const selector = focusSelector ?? homeFocusSelector(document.activeElement);
+  const cols = homeShelfColumns();
+  homeRenderedCols = cols;
+  container.innerHTML = homeSectionsMarkup(cols);
+  syncHomeLayout();
+  syncCoverImages(container);
+  restoreHomeFocus(selector, fallbackSelector);
+}
+
+/** Patches one section in place; falls back to the stack when its presence (and so pairing) changes. */
+function refreshHomeSection(id, { focusSelector, fallbackSelector } = {}) {
+  if (state.view !== "home" || !homeReady()) {
+    return;
+  }
+  const cell = viewArea.querySelector(`[data-home-section="${id}"]`);
+  homeArtistIndex = null;
+  const html = HomeModel.sectionVisible(homeDoc, id) ? homeSectionMarkup(id, homeRenderedCols || homeShelfColumns()) : "";
+  if (Boolean(cell) !== Boolean(html)) {
+    refreshHomeSections({ focusSelector, fallbackSelector });
+    return;
+  }
+  if (!cell) {
+    return;
+  }
+  const selector = focusSelector ?? homeFocusSelector(document.activeElement);
+  cell.innerHTML = html;
+  syncHomeLayout();
+  syncCoverImages(cell);
+  restoreHomeFocus(selector, fallbackSelector);
 }
 
 function homeShelfColumns() {
@@ -6121,65 +7137,315 @@ function syncHomeLayout() {
     const total = Number(shelf.dataset.total || 0);
     btn.hidden = total <= cols;
   });
-  return cols;
-}
-
-function shelfSection(title, items, filter, { subtitleMode = "type", shelf = "" } = {}) {
-  if (!items.length) {
-    return "";
+  // Jump back in fills exactly one row; re-pick entries when the column count changes.
+  if (state.view === "home" && homeRenderedCols && cols !== homeRenderedCols) {
+    homeRenderedCols = cols;
+    refreshHomeSection("jumpBackIn");
   }
-
-  const cols = homeShelfColumns();
-  const shown = items.slice(0, HOME_SHELF_SIZE);
-  const showAll = items.length > cols;
-  const shelfClass = shelf ? ` home-shelf-${shelf}` : "";
-  const shelfAttr = shelf ? ` data-shelf="${shelf}"` : "";
-  return `
-    <section class="home-shelf${shelfClass}"${shelfAttr} data-total="${items.length}">
-      <div class="section-head">
-        <button class="section-title-btn" type="button" data-nav="albums" data-filter="${filter}">
-          <h2>${title}</h2>
-        </button>
-        ${items.length > 2 ? `<button class="see-all" type="button" data-nav="albums" data-filter="${filter}"${showAll ? "" : " hidden"}>See all</button>` : ""}
-      </div>
-      <div class="shelf-row">${shown.map((item) => shelfCard(item, subtitleMode)).join("")}</div>
-    </section>
-  `;
+  return cols;
 }
 
 function renderHome() {
   const { tracks } = state.library;
+  syncTopHomeActions("home");
   if (!tracks.length) {
     renderEmpty();
     return;
   }
 
-  const quick = homeQuickItems();
-  const recents = recentHomeItems();
   syncHomeArtworkWash();
-
-  const canShuffleLibrary = tracks.length > 0;
-  const mixes = state.personalizedMixes !== false ? ensurePersonalizedMixes() : [];
-  const homeAlbums = albumsForHomeShelf(recents);
-  const recentlyAdded = albumsByDateAdded();
-  viewArea.innerHTML = `
-    <div class="home-page">
+  const greetingRow = `
       <div class="home-greeting-row">
         <h1 class="greeting">${greeting()}</h1>
-        <button class="home-shuffle-library" type="button" data-shuffle-library${canShuffleLibrary ? "" : " disabled"} aria-label="Shuffle Library"${canShuffleLibrary ? "" : " title=\"No playable songs\""}>
-          <i class="bi bi-shuffle" aria-hidden="true"></i>
-          <span>Shuffle Library</span>
-        </button>
-      </div>
-      ${quick.length ? `<div class="quick-grid">${quick.map(renderQuickCard).join("")}</div>` : ""}
-      ${recents.length > HOME_QUICK_SIZE ? shelfSection("Recently played", recents, "all", { subtitleMode: "artist", shelf: "recent" }) : ""}
-      ${shelfSection("Recently added", recentlyAdded, "all", { subtitleMode: "artist" })}
-      ${mixesShelfSection(mixes)}
-      ${shelfSection("Albums", homeAlbums, "albums", { subtitleMode: "artist" })}
+      </div>`;
+
+  if (!homeReady()) {
+    viewArea.innerHTML = `<div class="home-page">${greetingRow}</div>`;
+    return;
+  }
+
+  seedHomePins();
+  // Jump back in needs per-track play times; stats otherwise load lazily (Songs, mixes).
+  if (!listenStatsLoaded) {
+    ensureListenStatsForSongs();
+  }
+  const cols = homeShelfColumns();
+  homeRenderedCols = cols;
+  homeNowSignatureRendered = homeNowSignature();
+  document.documentElement.style.setProperty("--home-cols", String(cols));
+  viewArea.innerHTML = `
+    <div class="home-page">
+      ${greetingRow}
+      <div class="home-sections" data-home-sections>${homeSectionsMarkup(cols)}</div>
+      ${homeFooterMarkup()}
     </div>
   `;
   syncHomeLayout();
   syncCoverImages(viewArea);
+  ensureHomeTopTracks();
+  scheduleHomeDayRollover();
+}
+
+// --- Pin + customization actions ---------------------------------------------------
+
+function homePinTargetForOverflow({ album = false } = {}) {
+  if (album) {
+    const record = albumById(state.albumId);
+    return record ? { kind: "album", id: record.id, label: record.title } : null;
+  }
+  const playlist = playlistById(state.playlistId);
+  return playlist ? { kind: "playlist", id: playlist.id, label: playlist.name } : null;
+}
+
+function homePinToggleMarkup(target) {
+  if (!homeReady() || !target?.id) {
+    return "";
+  }
+  const pinned = HomeModel.isPinned(homeDoc, target);
+  const label = pinned ? "Unpin from Home" : "Pin to Home";
+  return `
+    <button class="collection-more collection-pin${pinned ? " is-pinned" : ""}" type="button" data-home-pin-toggle data-pin-kind="${escapeHtml(target.kind)}" data-pin-id="${escapeHtml(target.id)}" data-pin-label="${escapeHtml(target.label || target.id)}" aria-label="${label}" title="${label}">
+      <i class="bi ${pinned ? "bi-pin-angle-fill" : "bi-pin-angle"}" aria-hidden="true"></i>
+    </button>`;
+}
+
+function syncHomePinToggles() {
+  if (!homeReady()) {
+    return;
+  }
+  document.querySelectorAll("[data-home-pin-toggle]").forEach((button) => {
+    const pinned = HomeModel.isPinned(homeDoc, { kind: button.dataset.pinKind, id: button.dataset.pinId });
+    const label = pinned ? "Unpin from Home" : "Pin to Home";
+    button.classList.toggle("is-pinned", pinned);
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    const icon = button.querySelector("i");
+    if (icon) {
+      icon.className = `bi ${pinned ? "bi-pin-angle-fill" : "bi-pin-angle"}`;
+    }
+  });
+}
+
+function toggleHomePin(target) {
+  if (!homeReady() || !target?.id) {
+    return;
+  }
+  const name = target.label || target.id;
+  if (HomeModel.isPinned(homeDoc, target)) {
+    HomeModel.removePin(homeDoc, target);
+    showHomeToast("Unpinned from Home", name, "bi-pin-angle");
+  } else {
+    const result = HomeModel.addPin(homeDoc, target);
+    if (!result.ok) {
+      if (result.reason === "limit") {
+        showHomeToast("Pin limit reached", `Home holds up to ${HomeModel.MAX_PINS} pins. Unpin something to make room.`, "bi-exclamation-circle");
+      }
+      return;
+    }
+    showHomeToast("Pinned to Home", name);
+  }
+  commitHome();
+  syncHomePinToggles();
+  if (state.view === "home") {
+    refreshHomeSections();
+  }
+}
+
+function refreshHomePinLabels() {
+  let changed = false;
+  for (const pin of homeDoc.pins) {
+    const item = resolveHomeItem(pin);
+    if (item && item.title && pin.label !== item.title) {
+      pin.label = String(item.title).slice(0, 200);
+      changed = true;
+    }
+  }
+  if (changed) {
+    commitHome();
+  }
+}
+
+function renderHomeSettingsSection() {
+  if (!homeReady()) {
+    return `<section class="settings-group" data-home-settings><h2>Home</h2><p class="settings-desc">Home preferences are unavailable.</p></section>`;
+  }
+  const mixesOff = state.personalizedMixes === false;
+  const rows = homeDoc.sections.map((section, index) => {
+    const label = HomeModel.SECTION_LABELS[section.id];
+    const hint = section.id === "mixes" && mixesOff
+      ? "Turn on Personalized mixes to show mixes."
+      : HOME_SECTION_HINTS[section.id];
+    return `
+      <li class="settings-row home-settings-row" data-home-settings-row="${section.id}">
+        <div class="settings-copy">
+          <span class="settings-label">${escapeHtml(label)}</span>
+          <span class="settings-desc">${escapeHtml(hint)}</span>
+        </div>
+        <div class="home-settings-controls">
+          <button class="home-settings-move" type="button" data-home-action="section-move" data-section-id="${section.id}" data-delta="-1" aria-label="Move ${escapeHtml(label)} up" title="Move up"${index === 0 ? " disabled" : ""}>
+            <i class="bi bi-arrow-up" aria-hidden="true"></i>
+          </button>
+          <button class="home-settings-move" type="button" data-home-action="section-move" data-section-id="${section.id}" data-delta="1" aria-label="Move ${escapeHtml(label)} down" title="Move down"${index === homeDoc.sections.length - 1 ? " disabled" : ""}>
+            <i class="bi bi-arrow-down" aria-hidden="true"></i>
+          </button>
+          <button class="emp-switch" type="button" role="switch" aria-checked="${section.visible ? "true" : "false"}" aria-label="Show ${escapeHtml(label)} on Home" data-home-action="section-toggle" data-section-id="${section.id}"></button>
+        </div>
+      </li>`;
+  }).join("");
+  return `
+    <section class="settings-group" data-home-settings>
+      <h2>Home</h2>
+      <div class="settings-row" data-setting-row="personalizedMixes">
+        <div class="settings-copy">
+          <span class="settings-label">Personalized mixes</span>
+          <span class="settings-desc">Create music mixes from your library and listening habits.</span>
+        </div>
+        ${settingSwitch("personalizedMixes", state.personalizedMixes !== false, "Personalized mixes")}
+      </div>
+      <div class="settings-folder-head">
+        <span class="settings-label">Sections</span>
+        <span class="settings-desc">Show, hide, and reorder Home sections. The greeting and library summary always stay.</span>
+      </div>
+      <ol class="home-settings-list">${rows}</ol>
+      <div class="settings-row">
+        <div class="settings-copy">
+          <span class="settings-label">Default layout</span>
+          <span class="settings-desc">Restores section order and visibility. Your pins and listening history are kept.</span>
+        </div>
+        <button class="eq-reset" type="button" data-home-action="layout-restore"${HomeModel.isDefaultLayout(homeDoc) ? " disabled" : ""}>Restore default</button>
+      </div>
+    </section>`;
+}
+
+function rerenderHomeSettings(focusSelector) {
+  const group = settingsRoot().querySelector("[data-home-settings]");
+  if (!group) {
+    return;
+  }
+  group.outerHTML = renderHomeSettingsSection();
+  const next = focusSelector ? settingsRoot().querySelector(focusSelector) : null;
+  if (next && !next.disabled) {
+    next.focus();
+  } else if (next?.disabled) {
+    next.closest(".home-settings-controls")?.querySelector("button:not(:disabled)")?.focus();
+  } else {
+    settingsRoot().querySelector("[data-home-action='layout-restore']:not(:disabled), [data-home-action='section-toggle']")?.focus();
+  }
+}
+
+function applyHomeLayoutChange(focusSelector) {
+  commitHome();
+  rerenderHomeSettings(focusSelector);
+  // Home sits under the settings overlay; keep it current.
+  if (state.view === "home") {
+    refreshHomeSections({ focusSelector: "" });
+    ensureHomeTopTracks();
+  }
+}
+
+function handleHomeAction(button) {
+  const action = button.dataset.homeAction;
+  const key = button.dataset.pinKey || "";
+  const pin = homeReady() ? homeDoc.pins.find((item) => HomeModel.pinKey(item) === key) : null;
+  switch (action) {
+    case "pins-edit":
+      homePinsEditing = true;
+      refreshHomePinLabels();
+      refreshHomeSection("pinned", { focusSelector: "[data-home-action='pins-done']" });
+      announceHome(`Editing pins. ${homePinsStatusText()}`);
+      return true;
+    case "pins-done":
+      homePinsEditing = false;
+      refreshHomeSection("pinned", { focusSelector: "[data-home-action='pins-edit']", fallbackSelector: "#homePinnedTitle" });
+      announceHome("Finished editing pins.");
+      return true;
+    case "pin-move": {
+      if (!pin) {
+        return true;
+      }
+      const delta = Number(button.dataset.delta) || 0;
+      if (HomeModel.movePin(homeDoc, pin, delta)) {
+        commitHome();
+        const position = homeDoc.pins.findIndex((item) => HomeModel.pinKey(item) === key) + 1;
+        refreshHomeSection("pinned", { focusSelector: homeFocusSelector(button) });
+        announceHome(`Moved to position ${position} of ${homeDoc.pins.length}.`);
+      }
+      return true;
+    }
+    case "pin-remove": {
+      if (!pin) {
+        return true;
+      }
+      const index = homeDoc.pins.indexOf(pin);
+      HomeModel.removePin(homeDoc, pin);
+      commitHome();
+      const neighbour = homeDoc.pins[Math.min(index, homeDoc.pins.length - 1)];
+      const focus = neighbour
+        ? `[data-home-action="pin-remove"][data-pin-key="${CSS.escape(HomeModel.pinKey(neighbour))}"]`
+        : "[data-home-action='pins-done']";
+      refreshHomeSections({ focusSelector: focus });
+      syncHomePinToggles();
+      announceHome(`Unpinned ${pin.label || "item"}. ${homePinsStatusText()}`);
+      return true;
+    }
+    case "resume-toggle":
+      togglePlay();
+      return true;
+    case "resume-album-start":
+      if (albumById(button.dataset.albumId)) {
+        playAlbum(button.dataset.albumId);
+      }
+      return true;
+    case "upnext-play":
+      playQueuedTrack(button.dataset.trackId, false, button.dataset.entryUid || "");
+      return true;
+    case "open-queue":
+      openQueueDrawer();
+      return true;
+    case "top-play":
+      playHomeTop(button.dataset.trackId);
+      return true;
+    case "top-play-all":
+      playHomeTop(null);
+      return true;
+    case "customize":
+      openSettingsOverlay("home");
+      return true;
+    case "rescan":
+      openSettingsOverlay("library");
+      window.requestAnimationFrame(() => {
+        const rescan = rescanButton();
+        if (rescan && !rescan.disabled) {
+          startRescan(rescan);
+        }
+      });
+      return true;
+    case "section-toggle": {
+      const id = button.dataset.sectionId;
+      if (homeReady() && HomeModel.setSectionVisible(homeDoc, id, !HomeModel.sectionVisible(homeDoc, id))) {
+        applyHomeLayoutChange(`[data-home-action="section-toggle"][data-section-id="${id}"]`);
+      }
+      return true;
+    }
+    case "section-move": {
+      const id = button.dataset.sectionId;
+      const delta = Number(button.dataset.delta) || 0;
+      if (homeReady() && HomeModel.moveSection(homeDoc, id, delta)) {
+        applyHomeLayoutChange(`[data-home-action="section-move"][data-section-id="${id}"][data-delta="${delta}"]`);
+        announceHome(`${HomeModel.SECTION_LABELS[id]} moved ${delta < 0 ? "up" : "down"}.`);
+      }
+      return true;
+    }
+    case "layout-restore":
+      if (homeReady()) {
+        HomeModel.restoreDefaultLayout(homeDoc);
+        applyHomeLayoutChange("");
+        announceHome("Home layout restored. Pins and listening history were kept.");
+      }
+      return true;
+    default:
+      return false;
+  }
 }
 
 function catalogAlbums() {
@@ -7709,13 +8975,6 @@ function renderGeneralSettingsSection() {
         </div>
         ${settingSwitch("closeMinimizes", state.closeMinimizes, "Close button minimizes EMP")}
       </div>
-      <div class="settings-row" data-setting-row="personalizedMixes">
-        <div class="settings-copy">
-          <span class="settings-label">Personalized mixes</span>
-          <span class="settings-desc">Create music mixes from your library and listening habits.</span>
-        </div>
-        ${settingSwitch("personalizedMixes", state.personalizedMixes !== false, "Personalized mixes")}
-      </div>
     </section>`;
 }
 
@@ -7986,6 +9245,8 @@ function renderSettingsSectionContent(sectionId) {
   switch (section) {
     case "general":
       return renderGeneralSettingsSection();
+    case "home":
+      return renderHomeSettingsSection();
     case "library":
       return renderLibrarySettingsGroup();
     case "appearance":
@@ -8653,7 +9914,7 @@ function renderMix(mixId) {
             </div>
           </div>
         </div>
-        ${tracks.length ? collectionActionsMarkup(mix.title, `data-play-mix="${escapeHtml(mix.id)}"`) : ""}
+        ${tracks.length ? collectionActionsMarkup(mix.title, `data-play-mix="${escapeHtml(mix.id)}"`, { pin: { kind: "mix", id: mix.id, label: mix.title } }) : ""}
         ${tracks.length
           ? ""
           : `<p class="text-secondary">This mix has no playable tracks right now.</p>`}
@@ -8737,7 +9998,7 @@ function renderArtist(name) {
             <div class="artist-hero__meta artist-profile" data-artist-profile aria-live="polite"></div>
             <div class="artist-hero__library">${libraryBits.join("")}</div>
             <div class="artist-hero__actions">
-              ${tracks.length ? collectionActionsMarkup(name, `data-play-artist="${escapeHtml(name)}"`) : ""}
+              ${tracks.length ? collectionActionsMarkup(name, `data-play-artist="${escapeHtml(name)}"`, { pin: { kind: "artist", id: name, label: name } }) : ""}
               <div class="artist-photo-controls">
                 <button type="button" class="artist-photo-btn" data-artist-image-pick="${escapeHtml(name)}">Add photo</button>
                 <button type="button" class="artist-photo-btn" data-artist-image-clear="${escapeHtml(name)}" hidden>Remove photo</button>
@@ -10163,7 +11424,7 @@ function openQueueSourceView(source = state.queueSource) {
     navigate({ view: "songs" });
     return;
   }
-  if (source.kind === "recents") {
+  if (source.kind === "recents" || source.kind === "homeTop") {
     navigate({ view: "home" });
   }
 }
@@ -10630,68 +11891,68 @@ function syncSidebarPlaying() {
 }
 
 function syncHomePlaying() {
+  syncHomeNowCards();
   if (state.view !== "home" || !viewArea) {
     return;
   }
 
-  viewArea.querySelectorAll(".quick-card-wrap").forEach((wrap) => {
-    const openAlbum = wrap.querySelector("[data-open-album]");
-    const openPlaylist = wrap.querySelector("[data-open-playlist]");
+  viewArea.querySelectorAll(".home-page .quick-card-wrap").forEach((wrap) => {
+    const card = wrap.querySelector(".quick-card");
+    const playing = isHomeTargetPlaying(homeTargetFromOpener(card));
     const fab = wrap.querySelector(".quick-play-fab");
-    let playing = false;
-    if (openAlbum) {
-      playing = isSidebarAlbumPlaying(openAlbum.dataset.openAlbum);
-    } else if (openPlaylist) {
-      playing = isSidebarPlaylistPlaying(openPlaylist.dataset.openPlaylist);
-    }
-
     wrap.classList.toggle("is-playing", playing);
     if (fab) {
       fab.classList.toggle("is-playing", playing);
-      fab.innerHTML = playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
+      fab.innerHTML = playing ? '<i class="bi bi-pause-fill" aria-hidden="true"></i>' : '<i class="bi bi-play-fill" aria-hidden="true"></i>';
       fab.title = playing ? "Pause" : "Play";
       const label = wrap.querySelector(".quick-title")?.textContent || "";
       fab.setAttribute("aria-label", `${playing ? "Pause" : "Play"} ${label}`);
     }
 
-    let eq = wrap.querySelector(".quick-eq");
+    const eq = wrap.querySelector(".quick-eq");
     if (playing && !eq) {
-      const card = wrap.querySelector(".quick-card");
-      const title = card?.querySelector(".quick-title");
-      if (card && title) {
-        title.insertAdjacentHTML("beforebegin", nowEqMarkup("now-eq quick-eq"));
-      }
+      const anchor = card?.querySelector(".home-pin-text") || card?.querySelector(".quick-title");
+      anchor?.insertAdjacentHTML("beforebegin", nowEqMarkup("now-eq quick-eq"));
     } else if (!playing && eq) {
       eq.remove();
     }
   });
 
-  viewArea.querySelectorAll(".home-shelf .media-card").forEach((card) => {
-    let playing = false;
-    let label = "";
-    if (card.dataset.openAlbum) {
-      playing = isSidebarAlbumPlaying(card.dataset.openAlbum);
-      label = card.querySelector(".media-title")?.textContent || "";
-    } else if (card.dataset.openPlaylist) {
-      playing = isSidebarPlaylistPlaying(card.dataset.openPlaylist);
-      label = card.querySelector(".media-title")?.textContent || "";
-    } else if (card.dataset.openMix) {
-      playing = isMixQueuePlaying(card.dataset.openMix);
-      label = card.querySelector(".media-title")?.textContent || "";
-    } else {
+  viewArea.querySelectorAll(".home-page .media-card").forEach((card) => {
+    const opener = card.querySelector(".media-card-open");
+    const target = homeTargetFromOpener(opener);
+    if (!target) {
       return;
     }
-
+    const playing = isHomeTargetPlaying(target);
+    const label = card.querySelector(".media-title")?.textContent || "";
     const fab = card.querySelector(".play-fab");
     card.classList.toggle("is-playing", playing);
     if (fab) {
       fab.classList.toggle("is-playing", playing);
-      fab.innerHTML = playing ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
+      fab.innerHTML = playing ? '<i class="bi bi-pause-fill" aria-hidden="true"></i>' : '<i class="bi bi-play-fill" aria-hidden="true"></i>';
       fab.title = playing ? "Pause" : "Play";
       if (label) {
         fab.setAttribute("aria-label", `${playing ? "Pause" : "Play"} ${label}`);
       }
     }
+  });
+
+  viewArea.querySelectorAll(".home-page .home-list-row[data-album-id]").forEach((row) => {
+    const playing = isSidebarAlbumPlaying(row.dataset.albumId);
+    row.classList.toggle("is-playing", playing);
+    const play = row.querySelector(".home-list-play");
+    if (play) {
+      const title = row.querySelector(".home-list-title")?.textContent || "";
+      play.innerHTML = playing ? '<i class="bi bi-pause-fill" aria-hidden="true"></i>' : '<i class="bi bi-play-fill" aria-hidden="true"></i>';
+      play.title = playing ? "Pause" : "Play";
+      play.setAttribute("aria-label", `${playing ? "Pause" : "Play"} ${title}`);
+    }
+  });
+
+  const currentId = currentTrack()?.id;
+  viewArea.querySelectorAll(".home-page .home-rank-row[data-track-id]").forEach((row) => {
+    row.classList.toggle("is-current", row.dataset.trackId === currentId);
   });
 }
 
@@ -11932,7 +13193,7 @@ function updatePlaylistDetails(playlistId, name, description) {
   refreshAfterPlaylistChange(playlist.id);
 }
 
-function collectionActionsMarkup(label, playAttrs, { more = false, albumMore = false } = {}) {
+function collectionActionsMarkup(label, playAttrs, { more = false, albumMore = false, pin = null } = {}) {
   return `
     <div class="album-actions">
       <button class="play-fab-lg" type="button" ${playAttrs} aria-label="Play ${escapeHtml(label)}">
@@ -11941,6 +13202,7 @@ function collectionActionsMarkup(label, playAttrs, { more = false, albumMore = f
       <button class="collection-shuffle" type="button" data-collection-shuffle aria-label="Enable shuffle" title="Shuffle">
         <i class="bi bi-shuffle"></i>
       </button>
+      ${pin ? homePinToggleMarkup(pin) : ""}
       ${more ? `
         <button class="collection-more" type="button" data-playlist-more aria-label="More options" title="More">
           <i class="bi bi-three-dots"></i>
@@ -12255,6 +13517,7 @@ function handleSonoraHostEvent(detail) {
     if (wasPlaying === state.playing) {
       const duration = playbackDuration() || currentTrack()?.duration || 0;
       elapsedEl.textContent = formatTime(Math.min(state.sonoraPosition, duration || state.sonoraPosition));
+      syncHomeResumeProgress();
       if (duration > 0) {
         seekBar.value = String(Math.round((state.sonoraPosition / duration) * 1000));
         updateSlider(seekBar);
@@ -12492,6 +13755,14 @@ function bindLibrary(library) {
     pendingRescanId = "";
   }
 
+  if (!failed && library.albumFolders && typeof library.albumFolders === "object") {
+    libraryAlbumFolders = library.albumFolders;
+  }
+
+  if (!failed && library.dateAddedBaseline !== undefined) {
+    libraryDateAddedBaseline = Math.max(0, Number(library.dateAddedBaseline) || 0);
+  }
+
   if (!failed && !unchanged) {
     const previousTracks = captureActiveTracks();
     state.library = {
@@ -12694,6 +13965,10 @@ function ensureOverflowRoot() {
   overflowRoot.hidden = true;
   overflowRoot.innerHTML = `
     <div class="ctx-menu" role="menu">
+      <button class="ctx-item" type="button" data-home-pin-menu hidden>
+        <i class="bi bi-pin-angle"></i>
+        <span>Pin to Home</span>
+      </button>
       <button class="ctx-item" type="button" data-playlist-edit>
         <i class="bi bi-pencil"></i>
         <span>Name &amp; details</span>
@@ -12733,6 +14008,11 @@ function ensureOverflowRoot() {
     event.stopPropagation();
     if (event.target === overflowRoot) {
       closeOverflowMenu();
+      return;
+    }
+    if (event.target.closest("[data-home-pin-menu]")) {
+      closeOverflowMenu();
+      toggleHomePin(overflowPinTarget);
       return;
     }
     if (event.target.closest("[data-playlist-edit]")) {
@@ -12805,6 +14085,14 @@ function openOverflowMenu(anchor, { album = false } = {}) {
   }
   if (albumEditBtn) {
     albumEditBtn.hidden = !album;
+  }
+  const pinItem = root.querySelector("[data-home-pin-menu]");
+  overflowPinTarget = homeReady() ? homePinTargetForOverflow({ album }) : null;
+  if (pinItem) {
+    const pinned = Boolean(overflowPinTarget) && HomeModel.isPinned(homeDoc, overflowPinTarget);
+    pinItem.hidden = !overflowPinTarget;
+    pinItem.querySelector("span").textContent = pinned ? "Unpin from Home" : "Pin to Home";
+    pinItem.querySelector("i").className = `bi ${pinned ? "bi-pin-angle-fill" : "bi-pin-angle"}`;
   }
   root.querySelector("[data-smart-edit-rules]").hidden = !smart;
   root.querySelector("[data-smart-refresh]").hidden = !smart;
@@ -13486,6 +14774,25 @@ document.body.addEventListener("click", (event) => {
     return;
   }
 
+  const homeActionButton = event.target.closest("[data-home-action]");
+  if (homeActionButton && !homeActionButton.disabled) {
+    event.preventDefault();
+    if (handleHomeAction(homeActionButton)) {
+      return;
+    }
+  }
+
+  const homePinToggle = event.target.closest("[data-home-pin-toggle]");
+  if (homePinToggle) {
+    event.preventDefault();
+    toggleHomePin({
+      kind: homePinToggle.dataset.pinKind,
+      id: homePinToggle.dataset.pinId,
+      label: homePinToggle.dataset.pinLabel
+    });
+    return;
+  }
+
   const shuffleLibraryButton = event.target.closest("[data-shuffle-library]");
   if (shuffleLibraryButton) {
     event.preventDefault();
@@ -14049,7 +15356,8 @@ document.body.addEventListener("click", (event) => {
     const albumId = playAlbumButton.dataset.playAlbum;
     const canToggle = playAlbumButton.classList.contains("play-fab-lg")
       || playAlbumButton.classList.contains("play-fab")
-      || playAlbumButton.classList.contains("quick-play-fab");
+      || playAlbumButton.classList.contains("quick-play-fab")
+      || playAlbumButton.classList.contains("home-list-play");
     if (canToggle && queueMatchesIds(albumQueueIds(albumById(albumId)))) {
       togglePlay();
     } else {
@@ -14674,6 +15982,12 @@ function scheduleSearchRender({ immediate = false } = {}) {
 }
 
 searchInput.addEventListener("input", () => {
+  if (state.view !== "search") {
+    // Typing in the Home top bar opens Search with the query.
+    state.query = searchInput.value;
+    navigate({ view: "search", query: state.query });
+    return;
+  }
   state.query = searchInput.value;
   const entry = { view: "search", query: state.query };
   historyStack[historyIndex] = entry;
@@ -15095,6 +16409,7 @@ seekBar.addEventListener("input", () => {
   state.seeking = true;
   const duration = playbackDuration() || currentTrack()?.duration || 0;
   elapsedEl.textContent = formatTime((Number(seekBar.value) / 1000) * duration);
+  syncHomeResumeProgress();
   updateSlider(seekBar);
 });
 
@@ -15325,12 +16640,18 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.code === "KeyK") {
+    event.preventDefault();
+    focusTopSearch();
+    return;
+  }
+
   if (event.code === "Slash" && !event.ctrlKey && !event.altKey && !event.metaKey) {
     if (event.target === searchInput) {
       return;
     }
     event.preventDefault();
-    if (state.view !== "search") {
+    if (state.view !== "search" && state.view !== "home") {
       navigate({ view: "search", query: state.query });
     }
     searchInput.focus();
@@ -15532,6 +16853,8 @@ window.addEventListener("emp-window-state", (event) => applyHostWindowState(even
 window.addEventListener("emp-cast", (event) => handleCastMessage(event.detail));
 window.addEventListener("emp-listen-stats", (event) => applyListenStats(event.detail));
 window.addEventListener("emp-listen-insights", (event) => applyListeningInsights(event.detail));
+window.addEventListener("emp-home-top-tracks", (event) => applyHomeTopTracks(event.detail));
+window.addEventListener("emp-library-scan", (event) => applyLibraryScanStatus(event.detail));
 
 document.addEventListener("input", (event) => {
   if (event.target?.id !== "songsFilterInput") {

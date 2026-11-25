@@ -17,6 +17,7 @@ describe("settings overlay nav", () => {
     const ids = SECTIONS.flatMap((group) => group.items.map((item) => item.id));
     assert.deepEqual(ids, [
       "general",
+      "home",
       "library",
       "appearance",
       "playback",
@@ -27,6 +28,7 @@ describe("settings overlay nav", () => {
       "updates",
       "about"
     ]);
+    assert.equal(SECTION_META.home.title, "Home");
     assert.equal(DEFAULT_SECTION, "general");
     assert.equal(SECTION_META.playback.title, "Playback");
     assert.equal(SECTION_META.appearance.title, "Appearance");

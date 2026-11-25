@@ -308,6 +308,17 @@ namespace EMP.Hosting
                     {
                         HandleListenInsightsRequest(document.RootElement);
                     }
+                    else if (kind == "homeSave")
+                    {
+                        if (document.RootElement.TryGetProperty("home", out JsonElement home))
+                        {
+                            HomeStore.Update(home);
+                        }
+                    }
+                    else if (kind == "homeTopTracksRequest")
+                    {
+                        HandleHomeTopTracksRequest(document.RootElement);
+                    }
                     else if (kind == "updates")
                     {
                         UpdateCoordinator.HandleMessage(document.RootElement);
@@ -351,6 +362,7 @@ namespace EMP.Hosting
             lyrics = null;
             sonoraPlayback = null;
             ListenStatsCoordinator.FlushSync();
+            HomeStore.FlushSync();
             LibraryMediaIndex.Clear();
             hostView = null;
             pageLoaded = false;
@@ -519,6 +531,58 @@ namespace EMP.Hosting
                         ShowGenericEmpty = true
                     });
                 }
+            });
+        }
+
+        private static void HandleHomeTopTracksRequest(JsonElement message)
+        {
+            long requestId = ReadInt64(message, "requestId");
+            string? monthKey = ReadString(message, "month");
+            if (hostView is null || hostView.IsDisposed || !HomeTopTracks.TryParseMonth(monthKey, out int year, out int month))
+            {
+                return;
+            }
+
+            int limit = (int)Math.Clamp(ReadInt64(message, "limit"), 0, HomeTopTracks.MaxLimit);
+            MusicLibrary? library = currentLibrary ?? lastCompleteCache?.Library;
+            HashSet<string>? libraryIds = library?.Tracks is { Count: > 0 } tracks
+                ? new HashSet<string>(tracks.Select(static track => track.Id), StringComparer.OrdinalIgnoreCase)
+                : null;
+
+            _ = Task.Run(() =>
+            {
+                HomeTopTracksResult result;
+                try
+                {
+                    result = HomeTopTracks.Build(year, month, libraryIds, limit > 0 ? limit : HomeTopTracks.DefaultLimit);
+                }
+                catch (Exception)
+                {
+                    return;
+                }
+
+                var payload = new
+                {
+                    type = "homeTopTracks",
+                    requestId,
+                    month = result.Month,
+                    startDate = result.StartDate,
+                    endDate = result.EndDate,
+                    coverageStartDate = result.CoverageStartDate,
+                    tracks = result.Tracks.Select(static row => new { trackId = row.TrackId, playCount = row.PlayCount }).ToList()
+                };
+                string json = JsonSerializer.Serialize(payload, JsonOptions);
+                PostToUi(() =>
+                {
+                    try
+                    {
+                        hostView?.CoreWebView2?.PostWebMessageAsJson(json);
+                    }
+                    catch (Exception)
+                    {
+                        // WebView may already be tearing down.
+                    }
+                });
             });
         }
 
@@ -734,6 +798,7 @@ namespace EMP.Hosting
 
         private static void RunLibraryScan(int scanGeneration, string scanArtworkRoot)
         {
+            PostToUi(() => PostLibraryScanStatus(scanning: true, failed: false));
             IReadOnlyList<string> folders = AppSettingsStore.ResolvedMusicFolders();
             LibraryScanResult result;
             try
@@ -782,6 +847,8 @@ namespace EMP.Hosting
 
             IReadOnlyList<string> requestIds = ScanCoordinator.TakeCompletionRequestIds();
             bool hasManualRefresh = requestIds.Count > 0;
+            // Sent for every finished scan, including unchanged ones (which post no library message).
+            PostLibraryScanStatus(scanning: false, failed: result.Failed);
 
             if (result.Failed)
             {
@@ -855,6 +922,66 @@ namespace EMP.Hosting
             });
         }
 
+        private static long lastScanCompletedAt;
+
+        private static void PostLibraryScanStatus(bool scanning, bool failed)
+        {
+            if (!scanning && !failed)
+            {
+                lastScanCompletedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+
+            try
+            {
+                hostView?.CoreWebView2?.PostWebMessageAsJson(JsonSerializer.Serialize(
+                    new
+                    {
+                        type = "libraryScanStatus",
+                        scanning,
+                        failed,
+                        completedAt = lastScanCompletedAt
+                    },
+                    JsonOptions));
+            }
+            catch (Exception)
+            {
+                // WebView may be tearing down.
+            }
+        }
+
+        /// <summary>
+        /// Album id → watched folder holding its first track, shown with "~" for the user profile.
+        /// Lets Home group new additions by folder without exposing full file paths.
+        /// </summary>
+        internal static Dictionary<string, string> BuildAlbumFolders(MusicLibrary library, string? userProfile = null)
+        {
+            Dictionary<string, string> result = new(StringComparer.OrdinalIgnoreCase);
+            string profile = (userProfile ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)).TrimEnd('\\', '/');
+            foreach (AlbumInfo album in library.Albums.Concat(library.Singles))
+            {
+                string? firstTrack = album.TrackIds.FirstOrDefault();
+                if (string.IsNullOrWhiteSpace(album.Id)
+                    || firstTrack is null
+                    || !library.Locations.TryGetValue(firstTrack, out LibraryMediaLocation? location)
+                    || string.IsNullOrWhiteSpace(location.RootPath))
+                {
+                    continue;
+                }
+
+                string root = location.RootPath.TrimEnd('\\', '/');
+                if (profile.Length > 0
+                    && (root.Equals(profile, StringComparison.OrdinalIgnoreCase)
+                        || root.StartsWith(profile + "\\", StringComparison.OrdinalIgnoreCase)))
+                {
+                    root = "~" + root[profile.Length..];
+                }
+
+                result[album.Id] = root.Replace('\\', '/');
+            }
+
+            return result;
+        }
+
         private static LibraryMessage ToLibraryMessage(MusicLibrary library, string fingerprint, string? requestId)
         {
             return new LibraryMessage
@@ -866,7 +993,9 @@ namespace EMP.Hosting
                 Folders = library.Folders,
                 Albums = library.Albums,
                 Singles = library.Singles,
-                Tracks = library.Tracks
+                Tracks = library.Tracks,
+                DateAddedBaseline = TrackDateStore.CurrentBaselineAt,
+                AlbumFolders = BuildAlbumFolders(library)
             };
         }
 
@@ -964,6 +1093,16 @@ namespace EMP.Hosting
                       window.dispatchEvent(new CustomEvent('emp-listen-insights', { detail: message }));
                       return;
                     }
+                    if (message.type === 'homeTopTracks') {
+                      window.dispatchEvent(new CustomEvent('emp-home-top-tracks', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'libraryScanStatus') {
+                      window.__emp = window.__emp || {};
+                      window.__emp.libraryScan = message;
+                      window.dispatchEvent(new CustomEvent('emp-library-scan', { detail: message }));
+                      return;
+                    }
                     if (message.type === 'updateStatus') {
                       window.dispatchEvent(new CustomEvent('emp-update-status', { detail: message }));
                       return;
@@ -984,7 +1123,8 @@ namespace EMP.Hosting
                 }
                 """;
 
-            string playlistsBootstrap = PlaylistStore.DocumentCreatedAssignment();
+            string playlistsBootstrap = PlaylistStore.DocumentCreatedAssignment()
+                + HomeStore.DocumentCreatedAssignment();
             if (startupCache is null)
             {
                 return bridge + playlistsBootstrap;
@@ -2171,6 +2311,12 @@ namespace EMP.Hosting
             public required IReadOnlyList<AlbumInfo> Singles { get; init; }
 
             public required IReadOnlyList<TrackInfo> Tracks { get; init; }
+
+            /// <summary>Unix ms of the initial library baseline (0 = unknown); see TrackDateStore.</summary>
+            public long DateAddedBaseline { get; init; }
+
+            /// <summary>Album id → display path of its watched folder ("~/Music").</summary>
+            public IReadOnlyDictionary<string, string>? AlbumFolders { get; init; }
         }
 
         private sealed class AppSettingsMessage

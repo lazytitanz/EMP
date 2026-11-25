@@ -3254,15 +3254,6 @@ input[type="range"].slider.settings-duration-slider {
   margin: 20px 0 14px;
 }
 
-.home-page .home-shelf-recent .section-head {
-  margin-top: 8px;
-}
-
-.home-page .home-shelf-recent .section-head h2 {
-  font-size: 1.45rem;
-  letter-spacing: -0.02em;
-}
-
 .section-title-btn {
   border: 0;
   background: transparent;
@@ -10556,5 +10547,1011 @@ html[data-emp-theme="light"] .li-skeleton {
 
   .settings-nav-item {
     white-space: nowrap;
+  }
+}
+
+/* ==========================================================================
+   Home redesign: continue listening, pins, Jump back in, panels, footer.
+   Scoped to .home-page, the Home top-bar actions and Home-only views;
+   shared card styles are untouched.
+   ========================================================================== */
+
+.home-page {
+  --home-panel-bg: var(--emp-surface);
+  --home-panel-radius: 10px;
+  --home-pill-border: color-mix(in srgb, var(--emp-text) 26%, transparent);
+}
+
+html[data-emp-theme="light"] .home-page {
+  --home-panel-bg: var(--emp-surface-raised);
+}
+
+.home-page .greeting {
+  font-size: clamp(1.8rem, 2.6vw, 2.2rem);
+  font-weight: 800;
+  letter-spacing: -0.025em;
+}
+
+.home-greeting-row {
+  margin: 8px 0 20px;
+}
+
+.home-sections {
+  display: flex;
+  flex-direction: column;
+}
+
+.home-page .home-section .section-head {
+  margin: 28px 0 14px;
+}
+
+.home-page .home-section .section-head h2,
+.home-panel-head h2 {
+  font-size: 1.3rem;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+
+.home-page .home-block:first-child .home-section .section-head {
+  margin-top: 4px;
+}
+
+.home-quiet {
+  margin: 0 0 20px;
+  color: var(--emp-text-secondary);
+  font-size: 0.875rem;
+  line-height: 1.45;
+  max-width: 62ch;
+}
+
+.home-text-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: none;
+  padding: 4px 0;
+  border-radius: 4px;
+  color: var(--emp-text-secondary);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.home-text-action:hover {
+  color: var(--emp-text);
+}
+
+.home-text-action:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: 3px;
+  color: var(--emp-text);
+}
+
+.home-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 18px;
+  border: 1px solid var(--home-pill-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--emp-text);
+  font-size: 0.92rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.home-pill-btn:hover {
+  border-color: var(--emp-text);
+  background: var(--emp-row-hover);
+}
+
+.home-pill-btn:focus-visible {
+  outline: 2px solid var(--emp-focus-ring);
+  outline-offset: 2px;
+}
+
+.home-pill-btn--sm {
+  min-height: 32px;
+  padding: 0 14px;
+  font-size: 0.8rem;
+}
+
+/* Raised panels (resume, Up next, New in your library, Most played). */
+.home-panel,
+.home-resume {
+  background: var(--home-panel-bg);
+  border: 1px solid var(--emp-surface-border);
+  border-radius: var(--home-panel-radius);
+  box-shadow: var(--emp-card-shadow);
+}
+
+.home-panel {
+  padding: 18px 20px 16px;
+  min-width: 0;
+}
+
+.home-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  min-height: 32px;
+}
+
+.home-panel-head .see-all {
+  color: var(--emp-text-secondary);
+  font-size: 0.8rem;
+  font-weight: 700;
+  background: none;
+  border: 0;
+  padding: 4px 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.home-panel-head .see-all:hover {
+  color: var(--emp-text);
+}
+
+.home-panel-head .see-all:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: 3px;
+}
+
+.home-panel-note {
+  margin: -6px 0 10px;
+  color: var(--emp-text-muted);
+  font-size: 0.78rem;
+}
+
+/* --- Continue listening ---------------------------------------------------- */
+
+.home-continue {
+  margin-bottom: 8px;
+}
+
+.home-continue-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+@container home (min-width: 900px) {
+  .home-continue-grid {
+    grid-template-columns: minmax(0, 1.75fr) minmax(0, 1fr);
+  }
+}
+
+.home-resume {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 24px 20px;
+  min-width: 0;
+}
+
+.home-resume-art {
+  flex: 0 0 auto;
+  width: 168px;
+  height: 168px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: transparent;
+  box-shadow: var(--emp-art-shadow);
+  cursor: pointer;
+}
+
+.home-resume-art:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: 3px;
+}
+
+.home-resume-cover {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.home-resume-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.home-eyebrow {
+  margin: 0 0 6px;
+  color: var(--emp-text-secondary);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-resume.is-playing .home-eyebrow {
+  color: var(--emp-accent-readable);
+}
+
+.home-resume-title {
+  margin: 0 0 8px;
+  font-size: clamp(1.5rem, 2.4vw, 1.95rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-resume-meta {
+  margin: 0 0 14px;
+  color: var(--emp-text-secondary);
+  font-size: 0.92rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-resume-meta .inline-link {
+  color: inherit;
+}
+
+.home-resume-meta .inline-link[data-open-album] {
+  color: var(--emp-text);
+}
+
+.home-resume-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.home-resume-time {
+  color: var(--emp-text-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.home-resume-bar {
+  position: relative;
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--emp-slider-track);
+  overflow: hidden;
+}
+
+.home-resume-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: 2px;
+  background: var(--emp-accent);
+}
+
+.home-resume-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.home-resume-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 22px 0 18px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--emp-play-control-bg);
+  color: var(--emp-play-control-fg);
+  font-size: 0.95rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: var(--emp-fab-shadow);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+
+.home-resume-primary:hover {
+  background: var(--emp-accent-hover);
+  transform: scale(1.02);
+}
+
+.home-resume-primary:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: 2px;
+}
+
+.home-resume-primary i {
+  font-size: 1.05rem;
+}
+
+@container home (max-width: 560px) {
+  .home-resume {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .home-resume-art {
+    width: 120px;
+    height: 120px;
+  }
+}
+
+.home-upnext .home-list-row {
+  min-height: 60px;
+}
+
+.home-upnext-tag {
+  flex-shrink: 0;
+  color: var(--emp-text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* --- Pinned ------------------------------------------------------------ */
+
+.home-page .home-pins {
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+@container home (min-width: 1100px) {
+  .home-page .home-pins {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.home-page .home-pins .quick-card {
+  min-height: 64px;
+  height: 64px;
+  border-radius: 6px;
+}
+
+.home-page .home-pins .quick-cover-wrap,
+.home-page .home-pins .quick-card .playlist-cover {
+  width: 64px;
+  height: 64px;
+}
+
+.home-page .home-pins .quick-cover-wrap {
+  border-radius: 6px 0 0 6px;
+}
+
+.home-pin-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-right: 52px;
+}
+
+.home-pin-text .quick-title {
+  flex: 0 0 auto;
+  padding-right: 0;
+  font-size: 0.92rem;
+}
+
+.home-pin-type {
+  color: var(--emp-text-secondary);
+  font-size: 0.76rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-pin--editing {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 64px;
+  padding-right: 8px;
+  border-radius: 6px;
+  border: 1px dashed var(--emp-border);
+  background: transparent;
+  color: var(--emp-text);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.home-pin--editing .quick-cover-wrap {
+  box-shadow: none;
+}
+
+.home-pin--editing .playlist-cover {
+  width: 64px;
+  height: 64px;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 0;
+}
+
+.home-pin--editing .home-pin-text {
+  padding-right: 0;
+}
+
+.home-pin--editing .quick-title {
+  font-weight: 700;
+}
+
+.home-pin--editing.is-unavailable .quick-title,
+.home-pin--editing.is-unavailable .home-pin-type {
+  color: var(--emp-text-muted);
+}
+
+.home-pin-missing {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  background: var(--emp-control-fill);
+  color: var(--emp-text-muted);
+  font-size: 1.2rem;
+}
+
+.home-pin-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.home-pin-tool {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--emp-icon);
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.home-pin-tool:hover:not(:disabled) {
+  color: var(--emp-icon-hover);
+  background: var(--emp-control-fill);
+}
+
+.home-pin-tool:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: -2px;
+  color: var(--emp-icon-hover);
+}
+
+.home-pin-tool:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+
+.home-pins-status {
+  margin-bottom: 12px;
+}
+
+/* --- Jump back in: flush artwork, no card chrome ------------------------ */
+
+.home-page .home-jump .shelf-row {
+  /* Room for focus rings inside the one-row clip. */
+  padding: 3px;
+  margin: -3px -3px 9px;
+  column-gap: 20px;
+}
+
+.home-page .home-jump .media-card,
+.home-page .home-jump .media-card:hover,
+.home-page .home-jump .media-card:focus-within {
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.home-page .home-jump .media-cover-wrap {
+  margin-bottom: 10px;
+}
+
+.home-page .home-jump .media-title {
+  font-size: 0.92rem;
+}
+
+.home-card-when {
+  color: var(--emp-text-muted);
+  font-size: 0.76rem;
+}
+
+/* --- Lower pair ------------------------------------------------------------ */
+
+.home-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 28px;
+  align-items: stretch;
+}
+
+@container home (min-width: 820px) {
+  .home-pair {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.home-pair-cell > .home-panel {
+  height: 100%;
+}
+
+.home-block:not(.home-pair) > .home-panel {
+  margin-top: 28px;
+}
+
+.home-list-group + .home-list-group {
+  margin-top: 12px;
+}
+
+.home-list-heading {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 0 0 6px;
+  color: var(--emp-text-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.home-list-heading span:not(:last-child)::after {
+  content: "\00b7";
+  margin: 0 6px;
+}
+
+.home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.home-list-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 0 8px 0 4px;
+  margin: 0 -4px;
+  border-radius: 6px;
+  transition: background 0.15s ease;
+}
+
+.home-list-row--lg {
+  min-height: 64px;
+}
+
+.home-list-row:hover,
+.home-list-row:focus-within {
+  background: var(--emp-row-hover);
+}
+
+.home-list-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.home-list-main:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: 2px;
+}
+
+.home-list-art {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.home-list-row--lg .home-list-art {
+  width: 48px;
+  height: 48px;
+}
+
+.home-rank-row .home-list-art {
+  width: 44px;
+  height: 44px;
+}
+
+.home-list-cover {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.home-list-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.home-list-title,
+.home-list-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-list-title {
+  color: var(--emp-text);
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.home-list-sub {
+  color: var(--emp-text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.3;
+}
+
+.home-list-row.is-playing .home-list-title,
+.home-rank-row.is-current .home-list-title {
+  color: var(--emp-accent-readable);
+}
+
+.home-list-meta {
+  flex-shrink: 0;
+  color: var(--emp-text-secondary);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Play sits over the track count on hover so counts stay right-aligned. */
+.home-list-play {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  background: var(--emp-accent);
+  color: var(--emp-accent-contrast);
+  font-size: 1rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.home-list-play .bi-play-fill {
+  margin-left: 2px;
+}
+
+.home-list-row:hover .home-list-play,
+.home-list-row.is-playing .home-list-play,
+.home-list-play:focus-visible {
+  opacity: 1;
+}
+
+.home-list-row:has(.home-list-play):hover .home-list-meta,
+.home-list-row:has(.home-list-play:focus-visible) .home-list-meta,
+.home-list-row.is-playing:has(.home-list-play) .home-list-meta {
+  visibility: hidden;
+}
+
+.home-list-play:hover {
+  background: var(--emp-accent-hover);
+}
+
+.home-list-play:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: 2px;
+}
+
+.home-rank {
+  flex: 0 0 22px;
+  color: var(--emp-text-secondary);
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.home-rank-row.is-current .home-rank {
+  color: var(--emp-accent-readable);
+}
+
+/* --- Footer ------------------------------------------------------------ */
+
+.home-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 24px;
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--emp-divider);
+}
+
+.home-footer-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  margin: 0;
+  color: var(--emp-text-secondary);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+
+.home-footer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+}
+
+.home-footer-actions .home-text-action {
+  color: var(--emp-text);
+}
+
+/* --- Top bar on Home: search hint, library status, Shuffle library ------- */
+
+.top-search-kbd {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 1px 6px;
+  border: 1px solid var(--emp-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--emp-text-muted);
+  font-family: inherit;
+  font-size: 0.7rem;
+  pointer-events: none;
+}
+
+.top-search input:focus ~ .top-search-kbd,
+.top-search input:not(:placeholder-shown) ~ .top-search-kbd {
+  display: none;
+}
+
+.top-search input {
+  padding-right: 64px;
+}
+
+.top-home-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: auto;
+  min-width: 0;
+}
+
+.top-home-actions[hidden] {
+  display: none;
+}
+
+.library-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--emp-text-secondary);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.library-status[hidden] {
+  display: none;
+}
+
+.library-status-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--emp-text-muted);
+}
+
+.library-status.is-ok .library-status-dot {
+  background: #1db954;
+}
+
+.library-status.is-error .library-status-dot {
+  background: #e5534b;
+}
+
+.library-status.is-scanning .library-status-dot {
+  background: var(--emp-accent);
+  animation: library-status-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes library-status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.top-shuffle-library {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-height: 40px;
+  padding: 0 18px;
+  border: 1px solid color-mix(in srgb, var(--emp-text) 26%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--emp-bg) 60%, transparent);
+  color: var(--emp-text);
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.top-shuffle-library:hover:not(:disabled) {
+  border-color: var(--emp-text);
+}
+
+.top-shuffle-library:focus-visible {
+  outline: 2px solid var(--emp-focus-ring);
+  outline-offset: 2px;
+}
+
+.top-shuffle-library:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+@media (max-width: 1080px) {
+  .library-status {
+    display: none;
+  }
+}
+
+/* --- Listening history / New in your library pages ---------------------- */
+
+.history-page,
+.additions-page {
+  padding-top: calc(var(--top-bar-height) + 8px);
+  padding-bottom: 28px;
+}
+
+.history-page > .greeting,
+.additions-page > .greeting {
+  margin: 4px 0 6px;
+}
+
+.history-page .collection-stat,
+.additions-page .collection-stat {
+  margin-bottom: 20px;
+}
+
+.additions-list {
+  max-width: 760px;
+}
+
+.additions-list .home-list-group + .home-list-group {
+  margin-top: 18px;
+}
+
+/* --- Pin toggle on artist / mix pages ---------------------------------- */
+
+.collection-pin {
+  font-size: 1.3rem;
+}
+
+.collection-pin.is-pinned {
+  color: var(--emp-accent-readable);
+}
+
+.artist-page .artist-hero[data-has-photo="true"] .collection-pin {
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.artist-page .artist-hero[data-has-photo="true"] .collection-pin:hover,
+.artist-page .artist-hero[data-has-photo="true"] .collection-pin.is-pinned {
+  color: #fff;
+}
+
+/* --- Settings > Home ----------------------------------------------------- */
+
+.home-settings-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+}
+
+.home-settings-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.home-settings-move {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--emp-icon);
+  cursor: pointer;
+}
+
+.home-settings-move:hover:not(:disabled) {
+  color: var(--emp-icon-hover);
+  background: var(--emp-control-fill);
+}
+
+.home-settings-move:focus-visible {
+  outline: 2px solid var(--emp-text);
+  outline-offset: 1px;
+}
+
+.home-settings-move:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+
+.home-settings-controls .emp-switch {
+  margin-left: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-text-action,
+  .home-pill-btn,
+  .home-resume-primary,
+  .home-pin-tool,
+  .home-list-row,
+  .home-list-play,
+  .home-settings-move,
+  .top-shuffle-library {
+    transition: none;
+  }
+
+  .home-resume-primary:hover {
+    transform: none;
+  }
+
+  .library-status.is-scanning .library-status-dot {
+    animation: none;
   }
 }

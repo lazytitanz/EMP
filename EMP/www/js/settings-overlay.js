@@ -4,6 +4,7 @@
       group: "GENERAL",
       items: Object.freeze([
         Object.freeze({ id: "general", label: "General", icon: "bi-display" }),
+        Object.freeze({ id: "home", label: "Home", icon: "bi-house" }),
         Object.freeze({ id: "library", label: "Library", icon: "bi-folder2" }),
         Object.freeze({ id: "appearance", label: "Appearance", icon: "bi-palette" }),
         Object.freeze({ id: "playback", label: "Playback", icon: "bi-play-fill" }),
@@ -33,7 +34,8 @@
   ]);
 
   const SECTION_META = Object.freeze({
-    general: Object.freeze({ title: "General", description: "Startup, window behaviour, and home mixes." }),
+    general: Object.freeze({ title: "General", description: "Startup and window behaviour." }),
+    home: Object.freeze({ title: "Home", description: "Choose what appears on your Home page and in what order." }),
     library: Object.freeze({ title: "Library", description: "Music folders EMP scans for your collection." }),
     appearance: Object.freeze({ title: "Appearance", description: "Customize how EMP looks and feels." }),
     playback: Object.freeze({ title: "Playback", description: "Control how EMP plays your music." }),
