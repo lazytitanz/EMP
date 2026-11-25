@@ -60,6 +60,15 @@ namespace EMP.Library
 
         public bool IsSingle { get; init; }
 
+        /// <summary>
+        /// MusicBrainz primary release type from tags ("album", "single", "ep", "broadcast",
+        /// "other"); null when untagged, unsupported or conflicting. Never inferred from track count.
+        /// </summary>
+        public string? ReleaseType { get; init; }
+
+        /// <summary>MusicBrainz secondary types from tags (compilation, live, soundtrack…).</summary>
+        public IReadOnlyList<string> ReleaseSecondaryTypes { get; init; } = [];
+
         public IReadOnlyList<string> TrackIds { get; init; } = [];
     }
 

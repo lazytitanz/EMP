@@ -2179,6 +2179,22 @@ namespace EMP.Library
                 : profile with { Image = profile.Image with { Url = url } };
         }
 
+        /// <summary>When this artist's metadata was last fetched and cached (shown as "updated"), or null.</summary>
+        public static DateTimeOffset? TryGetCachedAt(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return null;
+            }
+
+            return TryReadArtistCache(Normalize(name), out CachedArtist? cached, ignoreExpiry: true)
+                && cached is not null
+                && !cached.ConfirmedEmpty
+                && cached.CachedAt > DateTimeOffset.MinValue
+                ? cached.CachedAt
+                : null;
+        }
+
         private static bool TryReadArtistCache(string key, out CachedArtist? cached, bool ignoreExpiry = false)
         {
             cached = null;

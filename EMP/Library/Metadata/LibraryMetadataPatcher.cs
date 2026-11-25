@@ -247,6 +247,8 @@ namespace EMP.Library.Metadata
                     TrackCount = albumTracks.Count,
                     Year = album.Year,
                     IsSingle = album.IsSingle,
+                    ReleaseType = album.ReleaseType,
+                    ReleaseSecondaryTypes = album.ReleaseSecondaryTypes,
                     TrackIds = albumTracks.Select(track => track.Id).ToArray()
                 });
             }

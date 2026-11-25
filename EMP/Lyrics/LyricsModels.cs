@@ -32,6 +32,14 @@ namespace EMP.Lyrics
         public double Duration { get; init; }
     }
 
+    /// <summary>Where lyrics came from; local sources win over LRCLIB.</summary>
+    internal enum LyricsSource
+    {
+        Lrclib,
+        LocalFile,
+        Embedded
+    }
+
     internal enum LyricsStatus
     {
         Found,
@@ -54,6 +62,11 @@ namespace EMP.Lyrics
         public string? PlainLyrics { get; init; }
 
         public bool Instrumental { get; init; }
+
+        public LyricsSource Source { get; init; } = LyricsSource.Lrclib;
+
+        /// <summary>Display name for a local sidecar file (e.g. "Lullaby.lrc"); null otherwise.</summary>
+        public string? SourceName { get; init; }
 
         public bool HasSyncedLyrics => !string.IsNullOrWhiteSpace(SyncedLyrics);
 

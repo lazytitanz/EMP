@@ -37,7 +37,8 @@ namespace EMP.Library
 
     internal static class LibraryCacheStore
     {
-        public const int SchemaVersion = 3;
+        // 4: albums carry tag-based ReleaseType / ReleaseSecondaryTypes (one-time rescan).
+        public const int SchemaVersion = 4;
 
         private static string? filePathOverride;
 
@@ -182,6 +183,8 @@ namespace EMP.Library
                 Append(hash, album.TrackCount.ToString());
                 Append(hash, album.Year?.ToString() ?? "");
                 Append(hash, album.IsSingle ? "1" : "0");
+                Append(hash, album.ReleaseType ?? "");
+                Append(hash, string.Join('\u001f', album.ReleaseSecondaryTypes ?? []));
                 Append(hash, string.Join('\u001f', album.TrackIds));
             }
 

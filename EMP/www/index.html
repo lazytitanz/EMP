@@ -12,7 +12,7 @@
   <script src="js/artist-profile.js?v=8"></script>
   <link rel="stylesheet" href="lib/bootstrap/5.3.8/bootstrap.min.css">
   <link rel="stylesheet" href="lib/bootstrap-icons/1.13.1/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="css/player.css?v=147">
+  <link rel="stylesheet" href="css/player.css?v=160">
   <link rel="stylesheet" href="css/metadata-editor.css?v=4">
 </head>
 <body>
@@ -42,52 +42,43 @@
         <span class="brand-mark" aria-hidden="true"><img src="img/emp-icon-512.png" alt=""></span>
         <span class="brand-name">EMP</span>
         <button class="icon-btn brand-collapse-btn" type="button" id="sidebarCollapseBtn" aria-label="Collapse sidebar" aria-expanded="true" aria-controls="sidebar" data-bs-toggle="tooltip" data-bs-title="Collapse sidebar">
-          <i class="bi bi-chevron-bar-left"></i>
+          <i class="bi bi-layout-sidebar-inset" aria-hidden="true"></i>
         </button>
       </div>
 
       <nav class="nav-stack" aria-label="Primary">
         <button class="nav-item active" type="button" data-nav="home" data-sidebar-rail-tooltip="Home" aria-label="Home" aria-current="page">
-          <i class="bi bi-house-fill"></i>
+          <i class="bi bi-house-fill" aria-hidden="true"></i>
           <span class="nav-label">Home</span>
         </button>
-        <button class="nav-item" type="button" data-nav="songs" data-sidebar-rail-tooltip="All Songs" aria-label="All Songs">
-          <i class="bi bi-music-note-beamed"></i>
-          <span class="nav-label">All Songs</span>
+        <button class="nav-item" type="button" data-nav="songs" data-sidebar-rail-tooltip="Songs" aria-label="Songs">
+          <i class="bi bi-music-note-beamed" aria-hidden="true"></i>
+          <span class="nav-label">Songs</span>
+          <span class="nav-count" id="songsNavCount" aria-hidden="true"></span>
         </button>
         <button class="nav-item" type="button" data-nav="search" data-sidebar-rail-tooltip="Search" aria-label="Search">
-          <i class="bi bi-search"></i>
+          <i class="bi bi-search" aria-hidden="true"></i>
           <span class="nav-label">Search</span>
-        </button>
-        <button class="nav-item" type="button" data-nav="settings" data-sidebar-rail-tooltip="Settings" aria-label="Settings">
-          <i class="bi bi-gear"></i>
-          <span class="nav-label">Settings</span>
         </button>
       </nav>
 
-      <div class="library-panel">
+      <section class="library-panel" aria-labelledby="libraryTitleLabel">
         <div class="library-header">
-          <button class="library-title-btn" type="button" data-nav="albums" id="libraryTitleBtn" data-sidebar-rail-tooltip="Library" aria-label="Library">
-            <i class="bi bi-collection-play"></i>
-            <span class="nav-label">Library</span>
+          <button class="library-title-btn" type="button" data-nav="albums" id="libraryTitleBtn" aria-label="Library">
+            <i class="bi bi-collection-play" aria-hidden="true"></i>
+            <span class="nav-label" id="libraryTitleLabel">Library</span>
           </button>
-          <div class="library-header-actions">
-            <button class="icon-btn" type="button" id="createPlaylistBtn" aria-label="Create…" data-bs-toggle="tooltip" data-bs-title="Create…" aria-haspopup="menu" aria-expanded="false">
-              <i class="bi bi-plus-lg"></i>
-            </button>
-            <button class="icon-btn" type="button" id="refreshBtn" aria-label="Refresh library" data-bs-toggle="tooltip" data-bs-title="Refresh library">
-              <i class="bi bi-arrow-clockwise"></i>
-            </button>
-          </div>
+          <button class="icon-btn library-add-btn" type="button" id="createPlaylistBtn" aria-label="Create playlist or add music folder" data-bs-toggle="tooltip" data-bs-title="Create or add" aria-haspopup="menu" aria-expanded="false">
+            <i class="bi bi-plus-lg" aria-hidden="true"></i>
+          </button>
         </div>
 
         <div class="library-panel-body">
-          <div class="library-chips-scroll" data-chips-scroll>
-            <div class="library-chips">
-              <button class="chip active" type="button" data-recents-filter="albums">Albums</button>
-              <button class="chip" type="button" data-recents-filter="tracks">Tracks</button>
-              <button class="chip" type="button" data-recents-filter="playlists">Playlists</button>
-            </div>
+          <div class="sb-pills" role="group" aria-label="Show in library">
+            <button class="sb-pill" type="button" data-sidebar-filter="playlists" aria-pressed="false">Playlists</button>
+            <button class="sb-pill" type="button" data-sidebar-filter="albums" aria-pressed="false">Albums</button>
+            <button class="sb-pill" type="button" data-sidebar-filter="artists" aria-pressed="false">Artists</button>
+            <button class="sb-pill" type="button" data-sidebar-filter="folders" aria-pressed="false">Folders</button>
           </div>
 
           <div class="library-tools">
@@ -96,13 +87,24 @@
               <input type="search" id="librarySearch" placeholder="Filter library" aria-label="Filter library" autocomplete="off">
             </label>
             <button class="library-sort-btn" type="button" id="sidebarSortBtn" data-sidebar-sort aria-label="Sort library list">
-              <i class="bi bi-clock-history"></i>
               <span id="sidebarSortLabel">Recents</span>
+              <i class="bi bi-list-ul" aria-hidden="true"></i>
             </button>
           </div>
-
-          <ul class="playlist-list" id="libraryList"></ul>
         </div>
+
+        <button class="sb-rail-filter" type="button" id="sidebarRailFilter" hidden></button>
+        <ul class="playlist-list sb-list" id="libraryList" aria-label="Your library"></ul>
+      </section>
+
+      <div class="sidebar-footer">
+        <button class="icon-btn sb-rail-add" type="button" id="sidebarRailAddBtn" aria-label="Create playlist or add music folder" data-sidebar-rail-tooltip="Create or add" aria-haspopup="menu" aria-expanded="false">
+          <i class="bi bi-plus-lg" aria-hidden="true"></i>
+        </button>
+        <button class="nav-item" type="button" data-nav="settings" data-sidebar-rail-tooltip="Settings" aria-label="Settings">
+          <i class="bi bi-gear" aria-hidden="true"></i>
+          <span class="nav-label">Settings</span>
+        </button>
       </div>
 
       <div class="sidebar-resize" id="sidebarResize" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
@@ -141,13 +143,18 @@
         </div>
 
         <div class="top-home-actions" id="topHomeActions" hidden>
-          <span class="library-status" id="libraryStatus" role="status" hidden>
-            <span class="library-status-dot" aria-hidden="true"></span>
-            <span class="library-status-text" id="libraryStatusText"></span>
-          </span>
           <button class="top-shuffle-library" type="button" data-shuffle-library aria-label="Shuffle library">
             <i class="bi bi-shuffle" aria-hidden="true"></i>
             <span>Shuffle library</span>
+          </button>
+        </div>
+
+        <div class="top-trailing">
+          <button class="circle-btn lyrics-options-btn" type="button" id="lyricsOptionsBtn" aria-haspopup="dialog" aria-expanded="false" aria-controls="lyricsMenu" aria-label="Lyrics options" title="Lyrics options" hidden>
+            <i class="bi bi-sliders2" aria-hidden="true"></i>
+          </button>
+          <button class="circle-btn np-immersive-btn" type="button" id="npImmersiveBtn" data-np-immersive aria-pressed="false" aria-label="Enter immersive view" title="Immersive view (F)" aria-keyshortcuts="F" hidden>
+            <i class="bi bi-arrows-angle-expand" aria-hidden="true"></i>
           </button>
         </div>
       </header>
@@ -318,6 +325,9 @@
   <script src="js/now-playing-ambient.js?v=5"></script>
   <script src="js/playlist-persistence.js?v=1"></script>
   <script src="js/home-model.js?v=2"></script>
-  <script src="js/player.js?v=137"></script>
+  <script src="js/sidebar-model.js?v=1"></script>
+  <script src="js/lyrics-prefs.js?v=1"></script>
+  <script src="js/artist-overview.js?v=1"></script>
+  <script src="js/player.js?v=145"></script>
 </body>
 </html>

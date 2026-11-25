@@ -152,6 +152,33 @@ namespace EMP.Tests
             Assert.Equal("C:/Users/patrick/Music", WebUiHost.BuildAlbumFolders(library, @"C:\Users\pat")["a1"]);
         }
 
+        [Fact]
+        public void BuildAlbumRoots_CollectsEveryRootAcrossTracks_IncludingNestedFiles()
+        {
+            EMP.Library.MusicLibrary library = new()
+            {
+                Albums =
+                [
+                    new EMP.Library.AlbumInfo { Id = "a1", TrackIds = ["t1", "t2", "t3"] },
+                    new EMP.Library.AlbumInfo { Id = "a2", TrackIds = ["missing"] }
+                ],
+                Singles = [new EMP.Library.AlbumInfo { Id = "s1", TrackIds = ["t4"] }],
+                Locations = new Dictionary<string, EMP.Library.LibraryMediaLocation>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["t1"] = Location("t1", @"D:\Music\Artist\Album\01.flac", @"D:\Music"),
+                    ["t2"] = Location("t2", @"D:\Music\Artist\Album\CD2\02.flac", @"D:\music\"),
+                    ["t3"] = Location("t3", @"E:\Extra\03.flac", @"E:\Extra"),
+                    ["t4"] = Location("t4", @"D:\Music\Deep\Nested\Dir\x.mp3", @"D:\Music")
+                }
+            };
+
+            Dictionary<string, string[]> roots = WebUiHost.BuildAlbumRoots(library);
+
+            Assert.Equal([@"D:\Music", @"E:\Extra"], roots["a1"]);
+            Assert.Equal([@"D:\Music"], roots["s1"]);
+            Assert.False(roots.ContainsKey("a2"));
+        }
+
         private static EMP.Library.LibraryMediaLocation Location(string id, string fullPath, string root) => new()
         {
             TrackId = id,

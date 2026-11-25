@@ -34,9 +34,10 @@ namespace EMP.Tests
         }
 
         [Fact]
-        public void SchemaVersion_IsThree()
+        public void SchemaVersion_IsFour()
         {
-            Assert.Equal(3, LibraryCacheStore.SchemaVersion);
+            // 4: albums carry tag-based release types; older caches trigger one rescan.
+            Assert.Equal(4, LibraryCacheStore.SchemaVersion);
         }
 
         [Fact]

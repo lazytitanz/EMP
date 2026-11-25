@@ -250,12 +250,28 @@ namespace EMP.Hosting
                             HandleArtistImageClear(webView, name);
                         }
                     }
+                    else if (kind == "artistPhotoFocus")
+                    {
+                        string? name = ReadString(document.RootElement, "name");
+                        if (!string.IsNullOrWhiteSpace(name))
+                        {
+                            HandleArtistPhotoFocus(webView, name, document.RootElement);
+                        }
+                    }
+                    else if (kind == "revealTrackFile")
+                    {
+                        string? trackId = ReadString(document.RootElement, "trackId");
+                        if (!string.IsNullOrWhiteSpace(trackId))
+                        {
+                            HandleRevealTrackFile(webView, trackId);
+                        }
+                    }
                     else if (kind == "lyrics")
                     {
                         string? trackId = ReadString(document.RootElement, "trackId");
                         if (!string.IsNullOrWhiteSpace(trackId))
                         {
-                            _ = SendLyricsAsync(trackId);
+                            _ = SendLyricsAsync(trackId, refresh: ReadBool(document.RootElement, "refresh"));
                         }
                     }
                     else if (kind == "storage")
@@ -982,6 +998,46 @@ namespace EMP.Hosting
             return result;
         }
 
+        /// <summary>
+        /// Album id → full watched-folder roots holding any of its tracks (usually one). Watched
+        /// folders never nest, so a root covers every subdirectory beneath it; the sidebar's folder
+        /// view matches these against <see cref="MusicLibrary.Folders"/> paths.
+        /// </summary>
+        internal static Dictionary<string, string[]> BuildAlbumRoots(MusicLibrary library)
+        {
+            Dictionary<string, string[]> result = new(StringComparer.OrdinalIgnoreCase);
+            foreach (AlbumInfo album in library.Albums.Concat(library.Singles))
+            {
+                if (string.IsNullOrWhiteSpace(album.Id))
+                {
+                    continue;
+                }
+
+                List<string> roots = [];
+                foreach (string trackId in album.TrackIds)
+                {
+                    if (!library.Locations.TryGetValue(trackId, out LibraryMediaLocation? location)
+                        || string.IsNullOrWhiteSpace(location.RootPath))
+                    {
+                        continue;
+                    }
+
+                    string root = Path.TrimEndingDirectorySeparator(location.RootPath);
+                    if (!roots.Any(existing => MusicFolderPaths.EqualsPath(existing, root)))
+                    {
+                        roots.Add(root);
+                    }
+                }
+
+                if (roots.Count > 0)
+                {
+                    result[album.Id] = [.. roots];
+                }
+            }
+
+            return result;
+        }
+
         private static LibraryMessage ToLibraryMessage(MusicLibrary library, string fingerprint, string? requestId)
         {
             return new LibraryMessage
@@ -995,7 +1051,8 @@ namespace EMP.Hosting
                 Singles = library.Singles,
                 Tracks = library.Tracks,
                 DateAddedBaseline = TrackDateStore.CurrentBaselineAt,
-                AlbumFolders = BuildAlbumFolders(library)
+                AlbumFolders = BuildAlbumFolders(library),
+                AlbumRoots = BuildAlbumRoots(library)
             };
         }
 
@@ -1054,6 +1111,10 @@ namespace EMP.Hosting
                     }
                     if (message.type === 'artistImageResult') {
                       window.dispatchEvent(new CustomEvent('emp-artist-image-result', { detail: message }));
+                      return;
+                    }
+                    if (message.type === 'revealResult') {
+                      window.dispatchEvent(new CustomEvent('emp-reveal-result', { detail: message }));
                       return;
                     }
                     if (message.type === 'lyrics') {
@@ -1453,9 +1514,82 @@ namespace EMP.Hosting
             _ = SendArtistInfoAsync(webView, name);
         }
 
+/// <summary>Save (finite 0–1 x/y + the photo's key) or clear ("reset": true) a manual crop.</summary>
+        private static void HandleArtistPhotoFocus(WebView2 webView, string name, JsonElement message)
+        {
+            bool changed;
+            if (ReadBool(message, "reset"))
+            {
+                changed = ArtistPhotoFocusStore.Clear(name);
+            }
+            else
+            {
+                string? imageKey = ReadString(message, "imageKey");
+                double x = ReadDouble(message, "x", double.NaN);
+                double y = ReadDouble(message, "y", double.NaN);
+                changed = ArtistPhotoFocusStore.Set(name, imageKey, x, y);
+                if (!changed)
+                {
+                    PostArtistImageResult(webView, name, ok: false, "That crop could not be saved.");
+                    return;
+                }
+            }
+
+            if (changed)
+            {
+                _ = SendArtistInfoAsync(webView, name);
+            }
+        }
+
+        /// <summary>
+        /// "Show files in folder": the page sends a library track id, never a path. The path is
+        /// resolved from the host's own index, must be a fully qualified existing file, and is
+        /// revealed through the shell API — no command line is built. Read-only.
+        /// </summary>
+        private static void HandleRevealTrackFile(WebView2 webView, string trackId)
+        {
+            string? reason = null;
+            try
+            {
+                if (!LibraryMediaIndex.TryGet(trackId, out LibraryMediaLocation location)
+                    || string.IsNullOrWhiteSpace(location.FullPath)
+                    || !Path.IsPathFullyQualified(location.FullPath))
+                {
+                    reason = "missing";
+                }
+                else if (!ShellReveal.TryRevealFile(location.FullPath))
+                {
+                    reason = Directory.Exists(Path.GetDirectoryName(location.FullPath) ?? string.Empty)
+                        ? "failed"
+                        : "unavailable";
+                }
+            }
+            catch (Exception)
+            {
+                reason = "failed";
+            }
+
+            if (reason is null)
+            {
+                return;
+            }
+
+            try
+            {
+                string json = JsonSerializer.Serialize(new { type = "revealResult", trackId, ok = false, reason }, JsonOptions);
+                PostToUi(() => hostView?.CoreWebView2?.PostWebMessageAsJson(json));
+            }
+            catch (Exception)
+            {
+                // Optional feedback only.
+            }
+        }
+
         private static void HandleArtistImageClear(WebView2 webView, string name)
         {
             ArtistCustomImageStore.Clear(name);
+            // The custom photo is gone, so its manual crop no longer applies.
+            ArtistPhotoFocusStore.Clear(name);
             MusicBrainzClient.InvalidateMemory(name);
             PostArtistImageResult(webView, name, ok: true, null);
             _ = SendArtistInfoAsync(webView, name);
@@ -1511,8 +1645,16 @@ namespace EMP.Hosting
                     && !string.IsNullOrWhiteSpace(profile.Image.Url)
                     && ArtistImageCache.TryResolveExistingFile(profile.Image.FileName ?? profile.Image.Url, out _))
                 {
+                    // Content-hash file name: a different photo always has a different key.
+                    string? imageKey = ArtistImageCache.TryGetSafeRelativeFileName(profile.Image.FileName ?? profile.Image.Url, out string fileName)
+                        ? fileName
+                        : null;
+                    (double X, double Y)? focus = ArtistPhotoFocusStore.TryGet(profile.Name, imageKey);
                     image = new ArtistInfoImageMessage
                     {
+                        Key = imageKey,
+                        FocusX = focus?.X,
+                        FocusY = focus?.Y,
                         Url = profile.Image.Url,
                         Attribution = profile.Image.Attribution,
                         Author = profile.Image.Author,
@@ -1542,6 +1684,9 @@ namespace EMP.Hosting
                     Biography = profile.Biography,
                     WikipediaUrl = profile.WikipediaUrl,
                     WikipediaTitle = profile.WikipediaTitle,
+                    UpdatedAt = status == MusicBrainzClient.ArtistLookupStatus.Found
+                        ? MusicBrainzClient.TryGetCachedAt(profile.Name)?.ToUnixTimeMilliseconds()
+                        : null,
                     Image = image
                 }, JsonOptions);
 
@@ -1570,7 +1715,7 @@ namespace EMP.Hosting
             }
         }
 
-        private static async Task SendLyricsAsync(string trackId)
+        private static async Task SendLyricsAsync(string trackId, bool refresh = false)
         {
             LyricsMessage message;
             try
@@ -1586,15 +1731,28 @@ namespace EMP.Hosting
                 }
                 else
                 {
-                    LyricsResult result = await service.GetAsync(new LyricsLookup
+                    // Lyrics the user keeps on disk (sidecar .lrc, then embedded tags) win over LRCLIB.
+                    string fullPath = location.FullPath;
+                    LyricsResult? local = await Task.Run(() => LocalLyricsReader.TryRead(fullPath));
+                    if (local is not null)
                     {
-                        TrackId = location.TrackId,
-                        Title = location.Title,
-                        Artist = location.Artist,
-                        Album = location.Album,
-                        Duration = location.Duration
-                    });
-                    message = LyricsMessage.From(trackId, result);
+                        message = LyricsMessage.From(trackId, local);
+                    }
+                    else
+                    {
+                        LyricsLookup lookup = new()
+                        {
+                            TrackId = location.TrackId,
+                            Title = location.Title,
+                            Artist = location.Artist,
+                            Album = location.Album,
+                            Duration = location.Duration
+                        };
+                        LyricsResult result = refresh
+                            ? await service.RefreshAsync(lookup)
+                            : await service.GetAsync(lookup);
+                        message = LyricsMessage.From(trackId, result);
+                    }
                 }
             }
             catch (Exception)
@@ -2317,6 +2475,9 @@ namespace EMP.Hosting
 
             /// <summary>Album id → display path of its watched folder ("~/Music").</summary>
             public IReadOnlyDictionary<string, string>? AlbumFolders { get; init; }
+
+            /// <summary>Album id → full watched-folder roots (sidebar folder view).</summary>
+            public IReadOnlyDictionary<string, string[]>? AlbumRoots { get; init; }
         }
 
         private sealed class AppSettingsMessage
@@ -2377,10 +2538,21 @@ namespace EMP.Hosting
             public string? WikipediaTitle { get; init; }
 
             public ArtistInfoImageMessage? Image { get; init; }
+
+            /// <summary>Unix ms when the cached metadata was fetched ("updated Nov 12").</summary>
+            public long? UpdatedAt { get; init; }
         }
 
         private sealed class ArtistInfoImageMessage
         {
+            /// <summary>Stable photo identity (artist-art cache file name, a content hash).</summary>
+            public string? Key { get; init; }
+
+            /// <summary>Saved manual focal point (0–1), only when it belongs to this exact photo.</summary>
+            public double? FocusX { get; init; }
+
+            public double? FocusY { get; init; }
+
             public string? Url { get; init; }
 
             public string? Attribution { get; init; }
@@ -2427,6 +2599,11 @@ namespace EMP.Hosting
 
             public bool Retryable { get; init; }
 
+            /// <summary>"lrclib", "file" (sidecar .lrc) or "embedded" (file tags).</summary>
+            public string? Source { get; init; }
+
+            public string? SourceName { get; init; }
+
             public static LyricsMessage Unavailable(string trackId, bool retryable) => new()
             {
                 TrackId = trackId,
@@ -2447,7 +2624,14 @@ namespace EMP.Hosting
                     Synced = result.SyncedLyrics is not null,
                     SyncedLyrics = result.SyncedLyrics,
                     PlainLyrics = result.PlainLyrics,
-                    Instrumental = result.Instrumental
+                    Instrumental = result.Instrumental,
+                    Source = result.Source switch
+                    {
+                        LyricsSource.LocalFile => "file",
+                        LyricsSource.Embedded => "embedded",
+                        _ => "lrclib"
+                    },
+                    SourceName = result.SourceName
                 };
             }
         }

@@ -75,6 +75,23 @@ namespace EMP.Lyrics
             }
         }
 
+/// <summary>Forgets a track's cached lookup so the next request searches LRCLIB again.</summary>
+        public void Delete(string trackId)
+        {
+            try
+            {
+                string path = PathFor(trackId);
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch (Exception)
+            {
+                // A stale cache entry is harmless; the user can retry.
+            }
+        }
+
         public async Task WriteAsync(
             LyricsLookup lookup,
             LyricsResult result,

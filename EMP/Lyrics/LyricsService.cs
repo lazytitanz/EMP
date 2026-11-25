@@ -40,6 +40,26 @@ namespace EMP.Lyrics
             return entry.Value;
         }
 
+/// <summary>
+        /// "Search again": drops the cached LRCLIB result (and any failure cooldown) for this track,
+        /// then looks it up fresh. Shares an already-running lookup like <see cref="GetAsync"/>.
+        /// </summary>
+        public Task<LyricsResult> RefreshAsync(LyricsLookup lookup)
+        {
+            if (Volatile.Read(ref disposed) != 0)
+            {
+                return Task.FromResult(LyricsResult.Failed);
+            }
+
+            if (!inFlight.ContainsKey(lookup.TrackId))
+            {
+                cache.Delete(lookup.TrackId);
+                recentFailures.TryRemove(lookup.TrackId, out _);
+            }
+
+            return GetAsync(lookup);
+        }
+
         public void Dispose()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0)

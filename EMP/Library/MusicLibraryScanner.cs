@@ -178,6 +178,7 @@ namespace EMP.Library
                     .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
                     ?? albumFiles[0].AlbumHint;
                 int? year = albumFiles.Select(file => file.Year).FirstOrDefault(value => value is > 0);
+                ReleaseClassification release = ReleaseTypeTags.Combine(albumFiles.Select(file => file.Release));
                 string? previousCoverUrl = null;
                 _ = previousCoverUrlsByAlbumId?.TryGetValue(albumId, out previousCoverUrl);
                 string? coverUrl = ExtractArtwork(albumId, albumFiles, artworkRoot, previousCoverUrl);
@@ -192,6 +193,8 @@ namespace EMP.Library
                     TrackCount = albumFiles.Count,
                     Year = year,
                     IsSingle = isSingle,
+                    ReleaseType = release.Primary,
+                    ReleaseSecondaryTypes = release.Secondary,
                     TrackIds = albumFiles.Select(file => CreateId(file.FullPath)).ToArray()
                 };
 
@@ -327,6 +330,7 @@ namespace EMP.Library
             byte[]? pictureData = null;
             string? pictureMime = null;
             ReplayGainInfo replayGain = default;
+            ReleaseClassification release = ReleaseClassification.Unknown;
             string format = NormalizeFormat(Path.GetExtension(path));
 
             try
@@ -382,6 +386,7 @@ namespace EMP.Library
                     pictureMime = picture.MimeType;
                 }
 
+                release = ReleaseTypeTags.Normalize(ReleaseTypeTags.Read(file));
                 replayGain = ReplayGainParser.FromTagLib(
                     file.Tag.ReplayGainTrackGain,
                     file.Tag.ReplayGainTrackPeak,
@@ -411,6 +416,7 @@ namespace EMP.Library
                 AlbumArtist = albumArtist,
                 Genre = genre,
                 Format = format,
+                Release = release,
                 TrackNumber = trackNumber,
                 DurationSeconds = duration,
                 Year = year,
@@ -623,6 +629,8 @@ namespace EMP.Library
             public string? Genre { get; init; }
 
             public string? Format { get; init; }
+
+            public ReleaseClassification Release { get; init; } = ReleaseClassification.Unknown;
 
             public required int TrackNumber { get; init; }
 

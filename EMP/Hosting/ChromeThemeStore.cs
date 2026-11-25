@@ -52,8 +52,11 @@ namespace EMP.Hosting
             Theme = theme == "light" ? "light" : "dark";
             if (Theme == "light")
             {
-                // Match Light --emp-bg canvas so the 8-DIP gutter blends with the shell.
-                FormColor = Color.FromArgb(238, 240, 243);
+                // The 8-DIP resize gutter is painted with FormColor and sits against the page body,
+                // whose Light background is --emp-black (#E4E6EC), not the panel --emp-bg. Matching
+                // the body keeps the gutter invisible (as black does in Dark).
+                FormColor = Color.FromArgb(228, 230, 236);
+                // Pre-paint WebView fill stays the panel canvas to avoid a flash before CSS loads.
                 WebViewColor = Color.FromArgb(238, 240, 243);
             }
             else
